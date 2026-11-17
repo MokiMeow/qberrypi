@@ -14,6 +14,9 @@ use qb_panel::drain::{Drain, NameKind, QUEUE_MAX, Stills};
 use qb_panel::rows::changed_rows;
 use qb_panel::{Blocking, LaneWords, Painter, Share, TimeOfDay};
 
+mod os_common;
+use os_common::traffic::{ADS, Sim};
+
 /// The bytes in a row of the RGB565 frame.
 const ROW_BYTES: usize = 960;
 /// The most rows a write may change.
@@ -24,147 +27,10 @@ const FRAME_ROWS_AVG_MAX: f64 = 48.0;
 const FPS: usize = 8;
 /// How long the traffic runs, in seconds.
 const SECONDS: usize = 150;
-/// The share of queries that are ads, as the mockup's traffic has them.
-const AD_SHARE: f64 = 0.44;
 /// When Wi-Fi joins in the boot run, in seconds, as the mockup's `boot()` has it.
 const JOIN_SECS: usize = 4;
 /// When the first query of the boot run comes, in seconds from the start, as the mockup's `boot()` has it.
 const FIRST_QUERY_SECS: f64 = 6.5;
-
-/// The public ad names of the mockup's traffic.
-const ADS: [&str; 16] = [
-    "doubleclick.net",
-    "googlesyndication.com",
-    "adnxs.com",
-    "criteo.com",
-    "taboola.com",
-    "outbrain.com",
-    "moatads.com",
-    "adsrvr.org",
-    "pubmatic.com",
-    "scorecardresearch.com",
-    "amazon-adsystem.com",
-    "rubiconproject.com",
-    "app-measurement.com",
-    "ads.yahoo.com",
-    "casalemedia.com",
-    "openx.net",
-];
-
-/// Ordinary sites, all under example.org.
-const SITES: [&str; 16] = [
-    "www", "mail", "api", "cdn", "static", "login", "video", "images", "docs", "files", "news",
-    "music", "maps", "shop", "chat", "time",
-];
-
-/// The mulberry32 generator, as the mockup's `rng`.
-struct Rng(u32);
-
-impl Rng {
-    /// The next number in 0 to 1, 1 not included.
-    fn next(&mut self) -> f64 {
-        self.0 = self.0.wrapping_add(0x6D2B_79F5);
-        let mut t = self.0;
-        t = (t ^ (t >> 15)).wrapping_mul(t | 1);
-        t ^= t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61));
-        f64::from(t ^ (t >> 14)) / 4_294_967_296.0
-    }
-}
-
-/// A query of the traffic.
-struct Query {
-    /// The name asked for.
-    name: String,
-    /// Whether it is an ad, one the lists have.
-    ad: bool,
-}
-
-/// The mockup's fake traffic: bursty Poisson arrivals, from `common.js` `Sim`.
-struct Sim {
-    /// The random numbers.
-    rng: Rng,
-    /// The time of day, in seconds.
-    clock: f64,
-    /// Whether blocking is paused: ads are answered then.
-    paused: bool,
-    /// Queries so far today.
-    queries: u32,
-    /// Queries blocked among them.
-    blocked: u32,
-    /// Seconds until the next query.
-    next: f64,
-    /// Queries left in the burst under way.
-    burst: u32,
-}
-
-impl Sim {
-    /// The traffic of a seed, starting at 10:21 with the day's figures of the mockup's stills.
-    fn new(seed: u32, paused: bool) -> Self {
-        Self {
-            rng: Rng(seed),
-            clock: f64::from(10 * 3600 + 21 * 60),
-            paused,
-            queries: 10_818,
-            blocked: 4_780,
-            next: 0.4,
-            burst: 0,
-        }
-    }
-
-    /// One query.
-    fn generate(&mut self) -> Query {
-        let ad = self.rng.next() < AD_SHARE;
-        let pick = (self.rng.next() * 16.0) as usize;
-        let name = if ad {
-            ADS[pick % 16].to_string()
-        } else {
-            format!("{}.example.org", SITES[pick % 16])
-        };
-        // The mockup also picks a client and an answer time; the generator keeps them in step.
-        self.rng.next();
-        if !ad {
-            self.rng.next();
-        }
-        Query { name, ad }
-    }
-
-    /// Moves `dt` seconds on and gives the queries that arrived.
-    fn step(&mut self, dt: f64) -> Vec<Query> {
-        self.clock += dt;
-        let mut out = vec![];
-        self.next -= dt;
-        while self.next <= 0.0 {
-            let query = self.generate();
-            self.queries += 1;
-            self.blocked += u32::from(query.ad && !self.paused);
-            out.push(query);
-            if self.burst > 0 {
-                self.burst -= 1;
-                self.next += 0.2 + self.rng.next() * 0.4;
-            } else {
-                if self.rng.next() < 0.18 {
-                    self.burst = 1 + (self.rng.next() * 3.0) as u32;
-                }
-                self.next += 0.6 - (1.0 - self.rng.next()).ln() * 1.6;
-            }
-        }
-        out
-    }
-
-    /// The share of today's queries that were blocked.
-    fn percent(&self) -> Option<Share> {
-        Share::of(u64::from(self.blocked), u64::from(self.queries))
-    }
-
-    /// The time of day.
-    fn time(&self) -> TimeOfDay {
-        let minutes = (self.clock / 60.0) as u32;
-        TimeOfDay {
-            hour: u8::try_from(minutes / 60 % 24).unwrap_or(0),
-            minute: u8::try_from(minutes % 60).unwrap_or(0),
-        }
-    }
-}
 
 /// What a run measured.
 struct Measured {

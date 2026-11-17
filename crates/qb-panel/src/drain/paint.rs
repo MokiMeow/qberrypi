@@ -14,23 +14,23 @@
 //! whatever the scene.
 
 use crate::drain::look::{
-    ADVANCE_EM, ALERT, ALERT_FIELD, ALERT_INK, ALERT_LAST_DY, ALERT_STUB_H, ALERT_STUB_PX,
-    ALERT_STUB_RIM, ALERT_STUB_TEXT, ALERT_STUB_TEXT_DY, ALERT_STUB_TRACKING,
-    ALERT_SUBJECT_LEADING, ALERT_SUBJECT_PX, ALERT_TEXT_DX, ALERT_TITLE_DX, ALERT_TITLE_DY,
-    ALERT_TITLE_PX, ALERT_WHO_LIFT, ALERT_WHO_PX, Area, BLUE, BLUE_DEEP, BLUE_DK, BLUE_MD,
-    BLUE_NIGHT, CLOCK_BASELINE, CLOCK_PX, CLOCK_X, COUNT_BASELINE, COUNT_PX, COUNT_SEPARATOR_EM,
-    COUNT_X, DOOR, DRIP_DX, DRIP_TIP_R, DRIP_W, DROP_DX, DROP_DY, DROP_FALL, FLIP_EDGE_RY,
-    FLIP_FACE_R, FUNNEL_CELLS, FUNNEL_CENTRES, G1, G2, G3, G4, GATE_BOTTOM, GATE_FILL_FOOT,
-    GATE_FILL_STEP, GATE_PAUSED, GATE_PAUSED_STROKE, GATE_TOP, GROUND, KEY, KEY_BIG_DY, KEY_BIG_ON,
-    KEY_BIG_PX, KEY_LABEL, KEY_LABEL_DY, KEY_LABEL_OPEN, KEY_LABEL_PX, KEY_LABEL_TRACKING,
-    KEY_STROKE, LABEL, LABEL_BASELINE, LABEL_PX, LABEL_TRACKING, LABEL_X, LANE_CELLS, LANE_H,
-    LANE_Y, LETTER_BASELINE_DY, LETTER_DX, LETTER_PX, OUTLINE_PX, PERCENT_BASELINE, PERCENT_PX,
-    PERCENT_X, POOL_H, PUDDLE_H, RAIL_BOTTOM, RAIL_TOP, SAG_DY, SAG_LETTER_BASELINE_DY,
-    SLUMP_DRIP_EXTRA, SLUMP_H, SPOUT_DROP, SPOUT_DROP_R, TEAR_R, TILE_DX, TILE_W, WHITE,
-    WORDS_BASELINE, WORDS_PITCH, WORDS_PX, WORDS_X, cell_x,
+    ADVANCE_EM, ASK_FIELD, ASK_KEY_H, ASK_KEY_LABEL_DY, ASK_KEY_LABEL_PX, ASK_KEY_PITCH,
+    ASK_KEY_STROKE, ASK_KEY_VALUE_DY, ASK_KEY_VALUE_PX, ASK_KEY_W, ASK_KEY_X0, ASK_KEY_Y, ASK_KEYS,
+    ASK_LINE_PX, ASK_LINE_X, ASK_LINES, ASK_TITLE, ASK_TITLE_BASELINE, ASK_TITLE_PX, ASK_TITLE_X,
+    Area, BLUE, BLUE_DEEP, BLUE_DK, BLUE_MD, BLUE_NIGHT, CLOCK_BASELINE, CLOCK_PX, CLOCK_X,
+    COUNT_BASELINE, COUNT_PX, COUNT_SEPARATOR_EM, COUNT_X, DOOR, DRIP_DX, DRIP_TIP_R, DRIP_W,
+    DROP_DX, DROP_DY, DROP_FALL, FLIP_EDGE_RY, FLIP_FACE_R, FUNNEL_CELLS, FUNNEL_CENTRES, G1, G2,
+    G3, G4, GATE_BOTTOM, GATE_FILL_FOOT, GATE_FILL_STEP, GATE_PAUSED, GATE_PAUSED_STROKE, GATE_TOP,
+    GROUND, HOME_BASELINE, HOME_PX, HOME_WORD, HOME_X, KEY, KEY_BIG_DY, KEY_BIG_ON, KEY_BIG_PX,
+    KEY_LABEL, KEY_LABEL_DY, KEY_LABEL_OPEN, KEY_LABEL_PX, KEY_LABEL_TRACKING, KEY_STROKE, LABEL,
+    LABEL_BASELINE, LABEL_PX, LABEL_TRACKING, LABEL_X, LANE_CELLS, LANE_H, LANE_Y,
+    LETTER_BASELINE_DY, LETTER_DX, LETTER_PX, OUTLINE_PX, PERCENT_BASELINE, PERCENT_PX, PERCENT_X,
+    POOL_H, PUDDLE_H, RAIL_BOTTOM, RAIL_TOP, SAG_DY, SAG_LETTER_BASELINE_DY, SLUMP_DRIP_EXTRA,
+    SLUMP_H, SPOUT_DROP, SPOUT_DROP_R, TEAR_R, TILE_DX, TILE_W, WHITE, WORDS_BASELINE, WORDS_PITCH,
+    WORDS_PX, WORDS_X, cell_x,
 };
 use crate::drain::stamps;
-use crate::drain::{AlertCard, Drain, Flip, FunnelCell, Melt, Shade, Stills, Tile, TileStyle};
+use crate::drain::{Drain, Flip, FunnelCell, Melt, Shade, Stills, Tile, TileStyle};
 use crate::format::{self, DASH};
 use crate::geometry::{Anchor, HEIGHT, Rgb, TextSlot, WIDTH, Weight};
 use crate::rgb565::convert_into;
@@ -490,8 +490,9 @@ fn dirty_rows(old: &Shown, now: &Scene<'_>) -> Dirty {
         let top = refill_top(old.stills.gate_fill.max(now.stills.gate_fill));
         dirty.mark(top.floor() as i32, GATE_FILL_FOOT.ceil() as i32);
     }
-    if old.stills.alert != now.stills.alert {
-        dirty.mark_area(ALERT_FIELD);
+    if old.stills.gate_ask != now.stills.gate_ask {
+        // The ask opens and closes over the whole field: one write of its 240 rows, like a pause toggle's.
+        dirty.mark_area(ASK_FIELD);
     }
     if old.stills.count != now.stills.count {
         dirty.mark_text(COUNT_BASELINE, COUNT_PX);
@@ -538,12 +539,7 @@ fn percent_text(percent: Option<Share>) -> String {
 
 /// The time of day as the left column sets it: `10:21`, or `--:--` where it is not set or not a time.
 fn clock_text(clock: Option<TimeOfDay>) -> String {
-    match clock {
-        Some(TimeOfDay { hour, minute }) if hour < 24 && minute < 60 => {
-            format!("{hour:02}:{minute:02}")
-        }
-        _ => "--:--".to_string(),
-    }
+    format::clock(clock)
 }
 
 /// The left column: the percentage, its label, the clock and the key.
@@ -726,82 +722,75 @@ fn draw_words(canvas: &mut Canvas<'_>, glyphs: &mut GlyphCache, words: LaneWords
     }
 }
 
-/// The alert's takeover: the field cleared, the card in its colour, its title, subject and who in ink,
-/// and the stub at its foot, hollow, with `TAP TO DISMISS`.
-fn draw_alert(canvas: &mut Canvas<'_>, glyphs: &mut GlyphCache, card: &AlertCard) {
-    let Area { x, y, w, h } = ALERT;
+/// `HOME`, in the lane's first four cells and in grey 2, one capital to a cell: it stands over the cells a name
+/// never reaches (`look::LANE_END`), so nothing is cleared for it.
+fn draw_home(canvas: &mut Canvas<'_>, glyphs: &mut GlyphCache) {
+    if !canvas.sees_text(HOME_BASELINE, HOME_PX) {
+        return;
+    }
+    let mut utf8 = [0; 4];
+    for (i, c) in HOME_WORD.chars().enumerate() {
+        let x = HOME_X + i as f32 * WORDS_PITCH;
+        let one = slot(x, HOME_BASELINE, Anchor::Middle, HOME_PX, G2);
+        canvas.text(glyphs, &one, c.encode_utf8(&mut utf8));
+    }
+}
+
+/// The gate ask (`drawGateAsk`): the field cleared to black, `OPEN THE GATE` and what the choices do, and three
+/// open keys, `5 MIN`, `30 MIN` and `1 HOUR`, each a white frame with `OPEN` small over its time.
+fn draw_gate_ask(canvas: &mut Canvas<'_>, glyphs: &mut GlyphCache) {
     if !canvas.meets(
-        ALERT_FIELD.y.floor() as i32,
-        (ALERT_FIELD.y + ALERT_FIELD.h).ceil() as i32,
+        ASK_FIELD.y.floor() as i32,
+        (ASK_FIELD.y + ASK_FIELD.h).ceil() as i32,
     ) {
         return;
     }
-    canvas.fill(ALERT_FIELD, GROUND);
-    let ground = if card.high { WHITE } else { BLUE };
-    canvas.fill(ALERT, ground);
-    let stub_top = y + h - ALERT_STUB_H;
-    canvas.fill(
-        Area::new(
-            x + ALERT_STUB_RIM,
-            stub_top,
-            w - 2.0 * ALERT_STUB_RIM,
-            ALERT_STUB_H - ALERT_STUB_RIM,
-        ),
-        GROUND,
-    );
-    for (line, dy) in card.title.iter().zip(ALERT_TITLE_DY) {
-        let title = slot(
-            x + ALERT_TITLE_DX,
-            y + dy,
-            Anchor::Start,
-            ALERT_TITLE_PX,
-            ALERT_INK,
-        );
-        canvas.tracked(glyphs, &title, 0.0, line);
-    }
-    // The last line stands on a fixed baseline, and the lines above it stand one leading higher each.
-    let who_lift = if card.who.is_empty() {
-        0.0
-    } else {
-        ALERT_WHO_LIFT
-    };
-    let lines = card.subject_lines().count();
-    let mut baseline =
-        y + ALERT_LAST_DY - who_lift - lines.saturating_sub(1) as f32 * ALERT_SUBJECT_LEADING;
-    for line in card.subject_lines() {
-        let subject = slot(
-            x + ALERT_TEXT_DX,
-            baseline,
-            Anchor::Start,
-            ALERT_SUBJECT_PX,
-            ALERT_INK,
-        );
-        canvas.tracked(glyphs, &subject, 0.0, line);
-        baseline += ALERT_SUBJECT_LEADING;
-    }
-    let who = TextSlot {
-        weight: Weight::Regular,
-        ..slot(
-            x + ALERT_TEXT_DX,
-            y + ALERT_LAST_DY,
-            Anchor::Start,
-            ALERT_WHO_PX,
-            ALERT_INK,
-        )
-    };
-    canvas.tracked(glyphs, &who, 0.0, &card.who);
-    let stub = slot(
-        x + w / 2.0,
-        y + ALERT_STUB_TEXT_DY,
-        Anchor::Middle,
-        ALERT_STUB_PX,
+    canvas.fill(ASK_FIELD, GROUND);
+    let title = slot(
+        ASK_TITLE_X,
+        ASK_TITLE_BASELINE,
+        Anchor::Start,
+        ASK_TITLE_PX,
         WHITE,
     );
-    canvas.tracked(glyphs, &stub, ALERT_STUB_TRACKING, ALERT_STUB_TEXT);
+    canvas.tracked(glyphs, &title, 0.0, ASK_TITLE);
+    for (line, baseline, ink) in ASK_LINES {
+        let line_slot = TextSlot {
+            weight: Weight::Regular,
+            ..slot(ASK_LINE_X, baseline, Anchor::Start, ASK_LINE_PX, ink)
+        };
+        canvas.tracked(glyphs, &line_slot, 0.0, line);
+    }
+    for (i, value) in ASK_KEYS.iter().enumerate() {
+        let key = Area::new(
+            ASK_KEY_X0 + i as f32 * ASK_KEY_PITCH,
+            ASK_KEY_Y,
+            ASK_KEY_W,
+            ASK_KEY_H,
+        );
+        canvas.frame(key, ASK_KEY_STROKE, WHITE);
+        let middle = key.x + key.w / 2.0;
+        let label = slot(
+            middle,
+            key.y + ASK_KEY_LABEL_DY,
+            Anchor::Middle,
+            ASK_KEY_LABEL_PX,
+            G1,
+        );
+        canvas.tracked(glyphs, &label, KEY_LABEL_TRACKING, KEY_LABEL_OPEN);
+        let big = slot(
+            middle,
+            key.y + ASK_KEY_VALUE_DY,
+            Anchor::Middle,
+            ASK_KEY_VALUE_PX,
+            WHITE,
+        );
+        canvas.tracked(glyphs, &big, 0.0, value);
+    }
 }
 
 /// Draws every layer of the scene that meets the canvas, in order: the left column, the funnel, the
-/// spout's drop, the count, the rails and the gate, the lane's tiles and words, and the alert on top.
+/// spout's drop, the count, the rails and the gate, the lane's tiles and words, `HOME`, and the gate ask on top.
 fn draw_scene(canvas: &mut Canvas<'_>, tools: &mut Tools, scene: &Scene<'_>) {
     draw_left_column(canvas, &mut tools.glyphs, scene.stills);
     draw_funnel(canvas, tools, scene.funnel);
@@ -821,8 +810,9 @@ fn draw_scene(canvas: &mut Canvas<'_>, tools: &mut Tools, scene: &Scene<'_>) {
     if let Some(words) = lane_words(scene.stills, scene.idle) {
         draw_words(canvas, &mut tools.glyphs, words);
     }
-    if let Some(card) = &scene.stills.alert {
-        draw_alert(canvas, &mut tools.glyphs, card);
+    draw_home(canvas, &mut tools.glyphs);
+    if scene.stills.gate_ask {
+        draw_gate_ask(canvas, &mut tools.glyphs);
     }
 }
 
@@ -859,7 +849,8 @@ impl Painter {
             rgb565: vec![0; WIDTH * HEIGHT * 2],
             shown: None,
             changed: false,
-            before: Vec::new(),
+            // Room for the whole frame at once, so that it never grows past what the spec counts (6.7).
+            before: Vec::with_capacity(WIDTH * HEIGHT * 2),
             tools: Tools {
                 dot: Stamp::new(-6, -6, &stamps::DOT),
                 face: Stamp::new(-6, -6, &stamps::FACE),
@@ -871,6 +862,15 @@ impl Painter {
                 glyphs: GlyphCache::new(),
             },
         }
+    }
+
+    /// The bytes of memory the painter holds, as `(frames, glyphs)`: the RGBA frame, the RGB565 frame and the
+    /// copy it is compared with, and what the glyphs it has rendered take (spec §6.7: about 1.2 MB of frames).
+    pub fn bytes(&self) -> (usize, usize) {
+        (
+            self.rgba.capacity() + self.rgb565.capacity() + self.before.capacity(),
+            self.tools.glyphs.bytes(),
+        )
     }
 
     /// Paints the scene and the figures, and returns the whole frame: 307,200 bytes of RGB565,
@@ -946,7 +946,6 @@ mod tests {
     use super::*;
     use crate::drain::look::{BLUE, G2, GROUND, WHITE};
     use crate::drain::{Fixture, NameKind, drain_fixture};
-    use crate::format::alert_card;
     use crate::rgb565::rgba_to_rgb565;
     use crate::state::LaneWords;
 
@@ -999,7 +998,9 @@ mod tests {
 
     #[test]
     fn a_scene_that_has_not_changed_repaints_nothing() {
-        let (mut painter, drain, stills) = painted(Fixture::Alert);
+        let (mut painter, drain, mut stills) = painted(Fixture::Normal);
+        stills.gate_ask = true;
+        painter.paint(&drain, &stills);
         let shown = painter.shown.as_ref().expect("it has painted");
         assert_eq!(
             dirty_rows(shown, &Scene::of(&drain, &stills))
@@ -1202,29 +1203,175 @@ mod tests {
     }
 
     #[test]
-    fn the_alert_clears_its_field_and_stands_on_the_floor() {
-        for (which, ground) in [(Fixture::Alert, WHITE), (Fixture::AlertLow, BLUE)] {
+    fn home_stands_in_the_first_four_cells_in_grey_two_and_no_name_shows_under_it() {
+        for which in Fixture::ALL {
             let (painter, _, _) = painted(which);
-            // The field round the card is black, and the funnel's dots do not show in it.
-            for (x, y) in [(120, 80), (124, 200), (479, 319), (300, 310), (476, 90)] {
-                assert_eq!(pixel(&painter, x, y), GROUND, "{x}, {y}");
+            // Rows 8 to 64 of x 0 to 96 hold nothing but `HOME`'s grey 2 (and its soft edges) on the ground.
+            let (mut lit, mut other) = (0, 0);
+            for y in 8..64 {
+                for x in 0..96 {
+                    let p = pixel(&painter, x, y);
+                    if p == G2 {
+                        lit += 1;
+                    } else if p != GROUND {
+                        // A soft edge is a grey between the ground and G2, never a blue or a white.
+                        assert!(
+                            p[0] == p[1] && p[1] == p[2] && p[0] < G2[0],
+                            "{which:?} {x},{y}"
+                        );
+                        other += 1;
+                    }
+                }
             }
-            // The card: its corners, and the rim round the black stub.
-            for (x, y) in [
-                (128, 80),
-                (471, 80),
-                (128, 303),
-                (471, 303),
-                (130, 280),
-                (300, 302),
-            ] {
-                assert_eq!(pixel(&painter, x, y), ground, "{x}, {y}");
+            assert!(
+                lit > 150 && other > 50,
+                "{which:?}: HOME is drawn ({lit}, {other})"
+            );
+            // The rails run on across it, and the gate column is at 96.
+            for x in [0, 50, 95] {
+                assert_eq!(pixel(&painter, x, 5), G4, "{which:?} the top rail");
+                assert_eq!(pixel(&painter, x, 65), G4, "{which:?} the bottom rail");
             }
-            // The stub is hollow, and the slab over it is solid.
-            assert_eq!(pixel(&painter, 140, 270), GROUND);
-            assert_eq!(pixel(&painter, 300, 259), ground);
-            assert_eq!(pixel(&painter, 300, 260), GROUND);
         }
+        // The letters stand in the lane's cells, centred on 12 + 24 * cell: each cell has ink, none of the
+        // gaps between the cells' 14.4 px letters is wider than the cell.
+        let (painter, _, _) = painted(Fixture::Normal);
+        for cell in 0..4_usize {
+            let ink = (cell * 24..cell * 24 + 24)
+                .flat_map(|x| (20..50).map(move |y| (x, y)))
+                .filter(|&(x, y)| pixel(&painter, x, y) != GROUND)
+                .count();
+            assert!(ink > 40, "cell {cell} has a letter ({ink})");
+        }
+    }
+
+    #[test]
+    fn the_gate_ask_clears_its_field_and_draws_three_open_keys() {
+        for which in [
+            Fixture::Normal,
+            Fixture::Paused,
+            Fixture::Quiet,
+            Fixture::Six,
+        ] {
+            let (_, drain, stills) = painted(which);
+            let mut painter = Painter::new();
+            let asking = Stills {
+                gate_ask: true,
+                ..stills
+            };
+            painter.paint(&drain, &asking);
+            // The field is black where nothing is set: the funnel's dots and the count do not show.
+            for (x, y) in [
+                (120, 80),
+                (124, 200),
+                (479, 319),
+                (300, 310),
+                (476, 90),
+                (300, 214),
+            ] {
+                assert_eq!(pixel(&painter, x, y), GROUND, "{which:?} {x}, {y}");
+            }
+            // Three keys, 110 by 80 at 128 + 117 i, y 224: a white frame of 4, black inside.
+            for i in 0..3 {
+                let x = 128 + 117 * i;
+                for (dx, dy) in [
+                    (0, 0),
+                    (109, 0),
+                    (0, 79),
+                    (109, 79),
+                    (3, 40),
+                    (106, 40),
+                    (55, 3),
+                ] {
+                    assert_eq!(
+                        pixel(&painter, x + dx, 224 + dy),
+                        WHITE,
+                        "{which:?} key {i} {dx},{dy}"
+                    );
+                }
+                for (dx, dy) in [(4, 4), (105, 75), (6, 40), (103, 70)] {
+                    assert_eq!(
+                        pixel(&painter, x + dx, 224 + dy),
+                        GROUND,
+                        "{which:?} key {i} {dx},{dy}"
+                    );
+                }
+            }
+            // The gap between two keys, and the margin right of the last, are black.
+            assert_eq!(pixel(&painter, 240, 260), GROUND);
+            assert_eq!(pixel(&painter, 475, 260), GROUND);
+            // The title is white, the lines grey: both are somewhere in their rows.
+            let has = |rows: std::ops::Range<usize>, ink: Rgb| {
+                rows.flat_map(|y| (140..470).map(move |x| (x, y)))
+                    .any(|(x, y)| pixel(&painter, x, y) == ink)
+            };
+            assert!(has(95..130, WHITE), "{which:?}: the title");
+            assert!(has(145..163, G1), "{which:?}: the first line");
+            assert!(has(195..211, G2), "{which:?}: the last line");
+            // What is left of the field stays the Drain's: the gate, the key and the left column.
+            let (plain, _, _) = painted(which);
+            for (x, y) in [(100, 100), (100, 300), (10, 230), (40, 100), (60, 190)] {
+                assert_eq!(
+                    pixel(&painter, x, y),
+                    pixel(&plain, x, y),
+                    "{which:?} {x}, {y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_gate_ask_opens_and_closes_in_one_write_of_its_field_and_the_drain_runs_under_it() {
+        let (mut painter, mut drain, stills) = painted(Fixture::Normal);
+        let asking = Stills {
+            gate_ask: true,
+            ..stills.clone()
+        };
+        // Opening and closing: the field's rows, 80 to 320 (the outer rows are black either way), in one write
+        // that is far over the 80 rows of a write within a screen: the one large write the ask is allowed.
+        let rows = |changed: Option<(usize, usize)>| {
+            let (first, last) = changed.expect("the field changed");
+            assert!(first >= 80 && last <= 320, "{first} to {last}");
+            last - first
+        };
+        assert!(rows(changed_between(&mut painter, &drain, &asking)) > 200);
+        let open = painter.rgba().to_vec();
+        assert!(rows(changed_between(&mut painter, &drain, &stills)) > 200);
+        // Open again, and the Drain runs: its lane stays the lane's rows, and a landing under the ask
+        // (the funnel, the count) changes no pixel at all, so there is no write.
+        painter.paint(&drain, &asking);
+        assert!(painter.rgba() == open);
+        let mut landed = false;
+        for _ in 0..30 {
+            drain.tick(false);
+            let moved = Stills {
+                count: drain.count(),
+                ..asking.clone()
+            };
+            let before = painter.rgba().to_vec();
+            painter.paint(&drain, &moved);
+            match rows_differing(&before, painter.rgba()) {
+                // The lane, and the door across it: rows 4 to 90, none of them under the ask.
+                Some((first, last)) => assert!(first >= 4 && last <= 90, "{first} to {last}"),
+                None => {
+                    landed |= drain.refusal_step() == Some(11) || drain.refusal_step() == Some(16)
+                }
+            }
+        }
+        assert!(
+            landed,
+            "the dots' landing and the count's step are hidden under the ask"
+        );
+        // The ask is no part of a pixel when it is closed: a fresh painter agrees.
+        let mut fresh = Painter::new();
+        let closed = Stills {
+            gate_ask: false,
+            count: drain.count(),
+            ..asking
+        };
+        fresh.paint(&drain, &closed);
+        painter.paint(&drain, &closed);
+        assert!(painter.rgba() == fresh.rgba());
     }
 
     #[test]
@@ -1300,7 +1447,6 @@ mod tests {
             drain.offer(name, NameKind::Listed);
         }
         drain.set_blocked_today(Some(u32::MAX));
-        let longest = "a".repeat(253);
         let stills = [
             Stills::default(),
             Stills {
@@ -1314,7 +1460,7 @@ mod tests {
                 },
                 gate_fill: u8::MAX,
                 count: Some(u32::MAX),
-                alert: Some(alert_card(&longest, true, &longest, None)),
+                gate_ask: true,
                 words: Some(LaneWords::Quiet { minutes: u32::MAX }),
             },
             Stills {
@@ -1323,7 +1469,7 @@ mod tests {
                     minute: 0,
                 }),
                 count: None,
-                alert: Some(alert_card("", false, "", None)),
+                gate_ask: false,
                 ..Stills::default()
             },
         ];

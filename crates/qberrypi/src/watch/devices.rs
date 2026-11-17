@@ -5,7 +5,7 @@
 //! heard, and time is read from the clock that `Devices::new` was given, which is the same
 //! shape as the alert store's: (monotonic seconds, unix seconds). Everything is bounded: 512
 //! devices, 4 addresses each, a known list of 1024, two exempt lists of 64 and two block lists of
-//! 64, 64 held alerts and 64
+//! 64, 64 open gates, 64 labels, 64 held alerts and 64
 //! alerts waiting to be taken, so that a flood of forged frames fills a table that never grows past
 //! that.
 //!
@@ -36,6 +36,22 @@
 //! small set alone, and never this inventory or its lock. Exemption has no part in the new-device or the
 //! spoof alerts, and does not depend on the known list.
 //!
+//! A device's gate is the panel's way to let one device's ads pass for a while: while it is open
+//! (at most an hour, from the monotonic clock) the device is exempt in either mode, as if its MAC
+//! were on the exempt list in the list mode and off the block list in the exempt-by-default mode.
+//! A gate is a deadline in a small map, and opening it or letting it expire republishes the two
+//! sets exactly as a change of a list does: the DNS side reads the same two sets, and knows
+//! nothing of gates. [`Devices::expire_gates`] lets them expire; the device watch calls it when
+//! [`Devices::next_gate_deadline`] comes, and is woken by [`Devices::gate_wake`] when a gate is
+//! opened. Gates are never pushed or read back by the desktop and die with the board's restart.
+//!
+//! The panel also edits the pushed lists of the mode in force ([`Devices::set_ads_pass`]): a device
+//! that the configuration's list of that mode names is `fixed`, and the router and the Pi never
+//! take part. Labels are what the desktop calls the devices ([`Devices::load_labels`]), in its
+//! order, which the panel keeps. Every change of a pushed list, of the mode, of the labels or of a
+//! gate, whoever makes it, moves [`Devices::rev`], which the API gives and a push can be made
+//! conditional on, so that the desktop and the panel do not overwrite each other.
+//!
 //! In the exempt-by-default mode the exempt lists have no effect: every client is exempt but the
 //! fully blocked ones, and an address is fully blocked while the device that claimed it last is on
 //! the configuration's block list or the pushed one, and always when it is the router's or the
@@ -44,13 +60,17 @@
 //! pushed one once a policy has been pushed since the start, and the configuration's until then.
 //!
 //! Nothing here logs but counts and the mode: the devices on a known list that came, the devices
-//! learned, the devices on an exempt list that came, and the mode and number of blocked devices of
-//! a policy that came and changed them. A MAC, an address or a host name never reaches a log line
-//! from this file.
+//! learned, the devices on an exempt list that came, the labels that came, and the mode and number
+//! of blocked devices of a policy that came and changed them. A MAC, an address, a host name or a
+//! label never reaches a log line from this file.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr};
+use std::ops::Deref;
 use std::sync::{Arc, Mutex, PoisonError};
+
+use tokio::sync::Notify;
 
 use super::frames::{Arp, DHCP_DISCOVER, DHCP_REQUEST, Dhcp, HOSTNAME_MAX, Mac};
 use crate::alerts::{Alert, AlertSink, Severity};
@@ -74,9 +94,22 @@ pub const MAX_EXEMPT: usize = 64;
 /// How many MACs each block list keeps: the configuration's, and the one the desktop pushes.
 pub const MAX_BLOCK: usize = 64;
 
-// Every address of every device on both exempt lists fits the set that the DNS side reads, and
-// so does every address of every device on both block lists with the router's and the Pi's own.
-const _: () = assert!(2 * MAX_EXEMPT * MAX_IPV4 <= exempt::MAX_ADDRS);
+/// How many device gates are open at most.
+pub const MAX_GATES: usize = MAX_EXEMPT;
+
+/// How many labels the inventory keeps.
+pub const MAX_LABELS: usize = 64;
+
+/// The longest label, in characters.
+pub const LABEL_MAX: usize = 24;
+
+/// The longest a gate stays open, in seconds.
+pub const MAX_GATE_SECS: u16 = 3600;
+
+// Every address of every device on both exempt lists and of every device with a gate fits the set
+// that the DNS side reads, and so does every address of every device on both block lists with the
+// router's and the Pi's own.
+const _: () = assert!((2 * MAX_EXEMPT + MAX_GATES) * MAX_IPV4 <= exempt::MAX_ADDRS);
 const _: () = assert!(2 * MAX_BLOCK * MAX_IPV4 + 2 <= exempt::MAX_ADDRS);
 
 /// How long the watch waits for a known list before it learns every device it has seen, in
@@ -122,6 +155,64 @@ impl KnownList {
     }
 }
 
+/// What the owner calls a device: 1 to [`LABEL_MAX`] printable ASCII characters. It reads as a
+/// `str`, and its `Debug` says nothing of it: a label that ends up in a log line by accident would
+/// say who lives in the house.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Label(String);
+
+impl Label {
+    /// The label `text`, or `None` if it is empty, longer than [`LABEL_MAX`], or has a character
+    /// that is not printable ASCII (a space is).
+    pub fn new(text: &str) -> Option<Label> {
+        let fits = (1..=LABEL_MAX).contains(&text.len());
+        (fits && text.bytes().all(|byte| (0x20..=0x7e).contains(&byte))).then(|| Label(text.into()))
+    }
+}
+
+impl Deref for Label {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Label {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.write_str("Label(..)")
+    }
+}
+
+/// Why an edit of a device's exemption or gate was refused. It names no device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditError {
+    /// The configuration's list of the mode in force names the device: only the configuration
+    /// changes it.
+    Fixed,
+    /// The device is the router or the Pi itself, which are never exempt.
+    Always,
+    /// The pushed list or the gates are full.
+    Full,
+    /// The inventory has no such device (for a gate).
+    Unknown,
+    /// Not a device's address, or a gate for longer than [`MAX_GATE_SECS`].
+    Invalid,
+}
+
+impl EditError {
+    /// The word the API says: `fixed`, `always`, `full`, `unknown` or `invalid`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EditError::Fixed => "fixed",
+            EditError::Always => "always",
+            EditError::Full => "full",
+            EditError::Unknown => "unknown",
+            EditError::Invalid => "invalid",
+        }
+    }
+}
+
 /// One device as a reader sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceView {
@@ -138,27 +229,266 @@ pub struct DeviceView {
     /// Whether its MAC is on the known list, which is the learned one after the learning.
     pub known: bool,
     /// Whether it is exempt from the ads lists. In the list mode: its MAC is on an exempt list,
-    /// the configuration's or the pushed one. In the exempt-by-default mode: it is not on a block
-    /// list, and no address that it claimed last is the router's or the Pi's own.
+    /// the configuration's or the pushed one, or its gate is open. In the exempt-by-default mode:
+    /// it is not on a block list (or its gate is open), and no address that it claimed last is the
+    /// router's or the Pi's own.
     pub exempt: bool,
     /// Whether its MAC is on a block list, the configuration's or the pushed one, whatever the
-    /// mode.
+    /// mode, and whether or not its gate is open.
     pub blocked: bool,
+    /// What the owner calls it, from the desktop's labels.
+    pub label: Option<Label>,
+    /// The place of its label in the desktop's list, which is the order the panel shows labelled
+    /// devices in; `None` for a device with no label.
+    pub label_rank: Option<usize>,
+    /// How many seconds its gate stays open, 1 to [`MAX_GATE_SECS`]; `None` while it is shut.
+    pub gate_left_secs: Option<u16>,
+    /// Whether the configuration's list of the mode in force names it, so that no edit of the
+    /// panel or the desktop changes it: the exempt list in the list mode, the block list in the
+    /// exempt-by-default mode.
+    pub fixed: bool,
+    /// Whether it is the router, or claims the router's or the Pi's address: never exempt.
+    pub always: bool,
 }
 
 /// The inventory as a reader sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DevicesView {
+    /// The revision of the pushed lists, the mode, the labels and the gates: it moves with every
+    /// change of them, whoever made it.
+    pub rev: u64,
     /// Whether a known list has come.
     pub known_list: KnownList,
     /// Every device in the inventory, the one seen last first.
     pub devices: Vec<DeviceView>,
     /// The MACs of both exempt lists, sorted and each once, those not heard yet included.
     pub exempt_macs: Vec<Mac>,
+    /// The MACs of the pushed exempt list alone, sorted, those not heard yet included.
+    pub exempt_pushed: Vec<Mac>,
     /// Whether the exempt-by-default mode is in force.
     pub exempt_default: bool,
     /// The MACs of both block lists, sorted and each once, those not heard yet included.
     pub block_macs: Vec<Mac>,
+    /// The MACs of the pushed block list alone, sorted, those not heard yet included.
+    pub block_pushed: Vec<Mac>,
+    /// The Pi's own hardware address, once it is known: it is no device of the inventory, and is
+    /// one of the two that are always blocked.
+    pub own_mac: Option<Mac>,
+    /// The Pi's own address, if it was given: the panel names the Pi's place on its wall by it.
+    pub own_ip: Option<Ipv4Addr>,
+}
+
+/// How many places the panel's wall has: the most rows a [`WallCopy`] holds.
+pub const WALL_ROWS: usize = qb_panel::os::world::MAX_DEVICES;
+
+/// A text of at most `N` bytes kept in place, cut at a character boundary when it is longer; the
+/// empty text is none. For what a copy under the inventory's lock holds without allocating.
+#[derive(Clone, Copy)]
+struct Inline<const N: usize> {
+    len: u8,
+    bytes: [u8; N],
+}
+
+impl<const N: usize> Inline<N> {
+    /// No text.
+    const EMPTY: Self = Self {
+        len: 0,
+        bytes: [0; N],
+    };
+
+    /// Keeps `text`, or its longest start that is whole characters and fits.
+    fn set(&mut self, text: Option<&str>) {
+        let text = text.unwrap_or("");
+        let mut end = text.len().min(N);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.bytes[..end].copy_from_slice(&text.as_bytes()[..end]);
+        self.len = u8::try_from(end).unwrap_or(u8::MAX);
+    }
+
+    /// The text, or `None` for none.
+    fn get(&self) -> Option<&str> {
+        let text = self.bytes.get(..usize::from(self.len))?;
+        if text.is_empty() {
+            return None;
+        }
+        std::str::from_utf8(text).ok()
+    }
+}
+
+/// What the panel's wall needs of one device, held in place: no field allocates, so that
+/// [`Devices::wall_copy`] fills a buffer that it never grows while the inventory is locked.
+///
+/// It has no `Debug`: it holds a host name and a label.
+#[derive(Clone, Copy)]
+pub struct WallDevice {
+    /// The device's hardware address.
+    pub mac: Mac,
+    ipv4: [Ipv4Addr; MAX_IPV4],
+    ipv4_len: u8,
+    hostname: Inline<HOSTNAME_MAX>,
+    label: Inline<LABEL_MAX>,
+    /// The unix time when it was first seen.
+    pub first_unix: u64,
+    /// The unix time when it was last seen.
+    pub last_unix: u64,
+    /// The place of its label in the desktop's list; `None` for a device with no label.
+    pub label_rank: Option<usize>,
+    /// How many seconds its gate stays open; `None` while it is shut.
+    pub gate_left_secs: Option<u16>,
+    /// As [`DeviceView::exempt`].
+    pub exempt: bool,
+    /// As [`DeviceView::fixed`].
+    pub fixed: bool,
+    /// As [`DeviceView::always`].
+    pub always: bool,
+}
+
+impl WallDevice {
+    /// The IPv4 addresses it has been seen with, the newest first, at most four.
+    pub fn ipv4(&self) -> &[Ipv4Addr] {
+        self.ipv4.get(..usize::from(self.ipv4_len)).unwrap_or(&[])
+    }
+
+    /// The host name it gave, as the parsers sanitized it.
+    pub fn hostname(&self) -> Option<&str> {
+        self.hostname.get()
+    }
+
+    /// What the owner calls it.
+    pub fn label(&self) -> Option<&str> {
+        self.label.get()
+    }
+
+    /// The wall's fields of a device as a reader sees it, for tests that hold a [`DevicesView`].
+    #[cfg(test)]
+    pub fn of_view(device: &DeviceView) -> Self {
+        let mut ipv4 = [Ipv4Addr::UNSPECIFIED; MAX_IPV4];
+        let held = device.ipv4.len().min(MAX_IPV4);
+        ipv4[..held].copy_from_slice(&device.ipv4[..held]);
+        let mut wall = Self {
+            mac: device.mac,
+            ipv4,
+            ipv4_len: u8::try_from(held).unwrap_or(0),
+            hostname: Inline::EMPTY,
+            label: Inline::EMPTY,
+            first_unix: device.first_unix,
+            last_unix: device.last_unix,
+            label_rank: device.label_rank,
+            gate_left_secs: device.gate_left_secs,
+            exempt: device.exempt,
+            fixed: device.fixed,
+            always: device.always,
+        };
+        wall.hostname.set(device.hostname.as_deref());
+        wall.label.set(device.label.as_deref());
+        wall
+    }
+}
+
+/// What the panel's wall reads of the inventory, in a buffer that the panel keeps: made once by
+/// [`WallCopy::new`], filled by [`Devices::wall_copy`] every time, never grown.
+///
+/// It has no `Debug`: it holds the devices' names and addresses.
+pub struct WallCopy {
+    /// The devices the wall can show, in no order: at most [`WALL_ROWS`].
+    pub rows: Vec<WallDevice>,
+    /// Whether the exempt-by-default mode is in force.
+    pub exempt_default: bool,
+    /// The Pi's own hardware address, once it is known.
+    pub own_mac: Option<Mac>,
+    /// The Pi's own address, if it was given.
+    pub own_ip: Option<Ipv4Addr>,
+}
+
+impl WallCopy {
+    /// An empty copy, with room for every row it will ever hold.
+    pub fn new() -> Self {
+        Self {
+            rows: Vec::with_capacity(WALL_ROWS),
+            exempt_default: false,
+            own_mac: None,
+            own_ip: None,
+        }
+    }
+
+    /// The copy of a [`DevicesView`], all of its devices, for tests of what is built from a copy.
+    #[cfg(test)]
+    pub fn of_view(view: &DevicesView) -> Self {
+        Self {
+            rows: view.devices.iter().map(WallDevice::of_view).collect(),
+            exempt_default: view.exempt_default,
+            own_mac: view.own_mac,
+            own_ip: view.own_ip,
+        }
+    }
+}
+
+impl Default for WallCopy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How a device ranks for a place on the wall: labelled devices first by the place of the label (0,
+/// rank), then the others by first sighting (1, unix time), the MAC deciding a tie. The router and
+/// the Pi are ranked by first sighting among themselves.
+type WallKey = (u8, u64, Mac);
+
+/// The `N` devices with the smallest [`WallKey`]s of those offered, in order, on the stack: what
+/// [`Devices::wall_copy`] picks from the inventory in one pass without sorting it or allocating.
+struct Smallest<'a, const N: usize> {
+    len: usize,
+    keys: [WallKey; N],
+    devices: [Option<&'a Device>; N],
+}
+
+impl<'a, const N: usize> Smallest<'a, N> {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            keys: [(0, 0, Mac([0; 6])); N],
+            devices: [None; N],
+        }
+    }
+
+    /// Whether `key` would take a place now: there is one free, or it is smaller than the last.
+    fn accepts(&self, key: WallKey) -> bool {
+        self.len < N || self.keys.last().is_some_and(|worst| key < *worst)
+    }
+
+    /// Takes `device` in if its `key` is among the `N` smallest so far.
+    fn offer(&mut self, key: WallKey, device: &'a Device) {
+        // The common case once the places are full: it ranks after them all.
+        if self.len == N && self.keys.last().is_some_and(|worst| key >= *worst) {
+            return;
+        }
+        let at = self.keys[..self.len].partition_point(|held| *held < key);
+        if at >= N {
+            return;
+        }
+        // The last of the full places falls off the end.
+        let end = self.len.min(N - 1);
+        self.keys.copy_within(at..end, at + 1);
+        self.devices.copy_within(at..end, at + 1);
+        self.keys[at] = key;
+        self.devices[at] = Some(device);
+        self.len = (self.len + 1).min(N);
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The first `n` devices, smallest key first.
+    fn first(&self, n: usize) -> impl Iterator<Item = (Mac, &'a Device)> + '_ {
+        self.keys
+            .iter()
+            .zip(&self.devices)
+            .take(n.min(self.len))
+            .filter_map(|(key, device)| Some((key.2, (*device)?)))
+    }
 }
 
 /// What the inventory keeps of one device.
@@ -241,6 +571,19 @@ pub struct Devices {
     exempt_published: Vec<Ipv4Addr>,
     /// The fully blocked addresses that were published last, sorted, each once.
     blocked_published: Vec<Ipv4Addr>,
+    /// The revision of the pushed lists, the mode, the labels and the gates; it moves with every
+    /// change of them.
+    rev: u64,
+    /// The devices whose gate is open, by MAC, with the monotonic second at which it shuts, at
+    /// most [`MAX_GATES`].
+    gates: HashMap<Mac, u64>,
+    /// Woken when a gate is opened, so that the device watch looks at the next deadline again.
+    gate_wake: Arc<Notify>,
+    /// The desktop's labels, in its order, at most [`MAX_LABELS`], each MAC once.
+    labels: Vec<(Mac, Label)>,
+    /// The labels that are being sent in chunks and have not come whole; `None` when no list is on
+    /// its way.
+    staged_labels: Option<Vec<(Mac, Label)>>,
 }
 
 impl Devices {
@@ -278,6 +621,11 @@ impl Devices {
             exemption: Arc::default(),
             exempt_published: Vec::new(),
             blocked_published: Vec::new(),
+            rev: 0,
+            gates: HashMap::new(),
+            gate_wake: Arc::new(Notify::new()),
+            labels: Vec::new(),
+            staged_labels: None,
         }
     }
 
@@ -327,7 +675,11 @@ impl Devices {
     /// One line tells the mode, and in the exempt-by-default mode the number of different MACs of
     /// both block lists, when that is not what the line before told; no MAC or address is logged.
     pub fn set_policy(&mut self, exempt_default: bool, block: Vec<Mac>) -> usize {
-        self.block_pushed = first_different(block, MAX_BLOCK);
+        let block = first_different(block, MAX_BLOCK);
+        if exempt_default != self.exempt_default() || block != self.block_pushed {
+            self.rev += 1;
+        }
+        self.block_pushed = block;
         self.default_pushed = Some(exempt_default);
         // The blocked set is up to date before the mode that reads it is turned on.
         self.refresh_exempt();
@@ -384,11 +736,202 @@ impl Devices {
         let pushed = first_different(macs, MAX_EXEMPT);
         let kept = pushed.len();
         let news = !self.exempt_received || self.exempt_pushed.len() != kept;
+        if pushed != self.exempt_pushed {
+            self.rev += 1;
+        }
         self.exempt_pushed = pushed;
         self.exempt_received = true;
         self.refresh_exempt();
         if news {
             log::info!("watch: exempt list of {kept} devices received");
+        }
+        kept
+    }
+
+    /// The revision of the pushed lists, the mode, the labels and the gates: it moves with every
+    /// change of them, from the API, the panel or a gate that expires, and with nothing else. A
+    /// push that would change nothing does not move it.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    /// Whether a push that was made on the revision `if_rev` may go ahead: with `None` it always
+    /// may, and with a revision only if that is the one now. When it may not, the revision that
+    /// is now is the error.
+    pub fn check_rev(&self, if_rev: Option<u64>) -> Result<(), u64> {
+        match if_rev {
+            Some(wanted) if wanted != self.rev => Err(self.rev),
+            _ => Ok(()),
+        }
+    }
+
+    /// Lets ads pass for the device `mac` for good (`pass`) or stops that: it edits the pushed
+    /// list of the mode in force, the exempt list in the list mode and the block list in the
+    /// exempt-by-default mode, and republishes the sets as any change of a list does. A device
+    /// that is not in the inventory yet may be edited: the lists name MACs that have not been
+    /// heard. Stopping it also shuts the device's gate, so that it is blocked from then on. Doing
+    /// what is done already changes nothing, and moves no revision.
+    ///
+    /// Refused: the router and the Pi ([`EditError::Always`]), a device that the configuration's
+    /// list of the mode in force names ([`EditError::Fixed`]), an address that is no device's
+    /// ([`EditError::Invalid`]), and a pushed list that is full ([`EditError::Full`]).
+    pub fn set_ads_pass(&mut self, mac: Mac, pass: bool) -> Result<(), EditError> {
+        if !mac.can_be_a_device() {
+            return Err(EditError::Invalid);
+        }
+        if self.is_always(mac) {
+            return Err(EditError::Always);
+        }
+        if self.is_fixed(mac) {
+            return Err(EditError::Fixed);
+        }
+        let by_default = self.exempt_default();
+        // Whether the pushed list of the mode in force should hold the MAC.
+        let (list, cap, listed) = if by_default {
+            (&mut self.block_pushed, MAX_BLOCK, !pass)
+        } else {
+            (&mut self.exempt_pushed, MAX_EXEMPT, pass)
+        };
+        let mut changed = false;
+        if listed && !list.contains(&mac) {
+            if list.len() >= cap {
+                return Err(EditError::Full);
+            }
+            list.insert(mac);
+            changed = true;
+        } else if !listed {
+            changed = list.remove(&mac);
+        }
+        if !pass {
+            changed |= self.gates.remove(&mac).is_some();
+        }
+        if changed {
+            self.rev += 1;
+            self.refresh_exempt();
+        }
+        Ok(())
+    }
+
+    /// Opens the gate of the device `mac` for `secs` seconds from now, or shuts it with 0; an
+    /// open gate is given the new time. While it is open the device is exempt in either mode, and
+    /// the sets are republished as for a change of a list.
+    ///
+    /// Any device that the inventory lists may have a gate: the ones that are exempt or blocked by
+    /// a pushed list, or by neither. Refused: more than [`MAX_GATE_SECS`] or an address that is no
+    /// device's ([`EditError::Invalid`]), the router and the Pi ([`EditError::Always`]), a device
+    /// that the configuration's list of the mode in force names ([`EditError::Fixed`]), a device
+    /// that is not in the inventory ([`EditError::Unknown`], but for shutting a gate that is
+    /// open), and [`MAX_GATES`] gates already open for others ([`EditError::Full`]).
+    pub fn open_gate(&mut self, mac: Mac, secs: u16) -> Result<(), EditError> {
+        if !mac.can_be_a_device() || secs > MAX_GATE_SECS {
+            return Err(EditError::Invalid);
+        }
+        if self.is_always(mac) {
+            return Err(EditError::Always);
+        }
+        if self.is_fixed(mac) {
+            return Err(EditError::Fixed);
+        }
+        if secs == 0 {
+            if self.gates.remove(&mac).is_some() {
+                self.rev += 1;
+                self.refresh_exempt();
+                return Ok(());
+            }
+            return if self.devices.contains_key(&mac) {
+                Ok(())
+            } else {
+                Err(EditError::Unknown)
+            };
+        }
+        if !self.devices.contains_key(&mac) {
+            return Err(EditError::Unknown);
+        }
+        if !self.gates.contains_key(&mac) && self.gates.len() >= MAX_GATES {
+            return Err(EditError::Full);
+        }
+        let (mono, _) = (self.clock)();
+        self.gates.insert(mac, mono.saturating_add(u64::from(secs)));
+        self.rev += 1;
+        self.refresh_exempt();
+        self.gate_wake.notify_one();
+        Ok(())
+    }
+
+    /// Shuts the gate of `mac`: [`Devices::open_gate`] with 0.
+    pub fn shut_gate(&mut self, mac: Mac) -> Result<(), EditError> {
+        self.open_gate(mac, 0)
+    }
+
+    /// Shuts the gates whose time has come, at the monotonic second `now`, and republishes the
+    /// sets if any did. It says how many it shut.
+    pub fn expire_gates(&mut self, now: u64) -> usize {
+        let before = self.gates.len();
+        self.gates.retain(|_, shuts| *shuts > now);
+        let shut = before - self.gates.len();
+        if shut > 0 {
+            self.rev += 1;
+            self.refresh_exempt();
+        }
+        shut
+    }
+
+    /// The monotonic second at which the first open gate shuts; `None` with no gate open.
+    pub fn next_gate_deadline(&self) -> Option<u64> {
+        self.gates.values().min().copied()
+    }
+
+    /// The inventory's monotonic second, which is the clock that the gates' deadlines are on.
+    pub fn mono_now(&self) -> u64 {
+        (self.clock)().0
+    }
+
+    /// What the device watch waits on while no gate is due: woken when a gate is opened, so that it
+    /// looks at the next deadline again.
+    pub fn gate_wake(&self) -> Arc<Notify> {
+        self.gate_wake.clone()
+    }
+
+    /// Takes a chunk of the labels, `labels`, and says how many the set that it belongs to holds
+    /// now, at most [`MAX_LABELS`]: the list of the desktop's names for its devices, in its order,
+    /// each MAC once (the first of a MAC that comes twice stays), is sent as the known list is.
+    ///
+    /// With `append` false the chunk starts a list that replaces the labels; with it true the
+    /// chunk is added to the list that is being sent, or to the labels if none is. A list that is
+    /// being sent is kept apart and takes the place of the labels only when its last chunk, the one
+    /// with `complete` true, has come; the old labels stay in force until then. Whenever the labels
+    /// in force change the revision moves. One line says how many labels the list has when it
+    /// is complete and changed them; no MAC and no label is logged.
+    pub fn load_labels(
+        &mut self,
+        labels: Vec<(Mac, Label)>,
+        append: bool,
+        complete: bool,
+    ) -> usize {
+        let (mut list, staged) = match (append, self.staged_labels.take()) {
+            (false, _) => (Vec::new(), true),
+            (true, Some(staged)) => (staged, true),
+            (true, None) => (self.labels.clone(), false),
+        };
+        for (mac, label) in labels {
+            if list.len() >= MAX_LABELS {
+                break;
+            }
+            if !list.iter().any(|(held, _)| *held == mac) {
+                list.push((mac, label));
+            }
+        }
+        let kept = list.len();
+        if staged && !complete {
+            self.staged_labels = Some(list);
+            return kept;
+        }
+        if list != self.labels {
+            self.labels = list;
+            self.rev += 1;
+            if complete {
+                log::info!("watch: labels of {kept} devices received");
+            }
         }
         kept
     }
@@ -541,13 +1084,134 @@ impl Devices {
         log::info!("watch: learned {} devices", self.devices.len());
     }
 
+    /// Copies what the panel's wall reads into `out`, whose rows and fields it replaces: the devices
+    /// that the wall can show, no more than [`WALL_ROWS`] of them, and the few fields of each that
+    /// the wall uses. The panel asks every two seconds, and `devwatch` takes this lock for every ARP,
+    /// DHCP and mDNS packet on the thread that also answers DNS, so this is made to be short:
+    /// [`Devices::view`] builds up to 512 devices with clones, a map of the labels and a sort, and
+    /// this builds none of that. It walks the inventory once, keeps the best few keys on the stack,
+    /// and copies only those devices into `out`'s own room (made by [`WallCopy::new`] and never
+    /// grown). The wall's own sorting, its names, and the fitting of its texts are done by the
+    /// panel with the lock let go.
+    ///
+    /// Which devices: those the wall shows first, by its own order (spec §3.4): the router and the
+    /// Pi (the `always` ones), then, with the places that are left, the labelled devices in the
+    /// desktop's order and the others seen lately (`recent` says it of a device's last sighting, in
+    /// unix time) by first sighting. What the wall's rule would drop from the full inventory is not
+    /// copied, and the rest is: the wall built from this is the wall built from [`Devices::view`].
+    pub fn wall_copy(&self, recent: &dyn Fn(u64) -> bool, out: &mut WallCopy) {
+        let by_default = self.exempt_default();
+        let (now, _) = (self.clock)();
+        out.rows.clear();
+        out.exempt_default = by_default;
+        out.own_mac = self.own_mac;
+        out.own_ip = self.own_ip;
+
+        // The labels' places, by MAC, so that a device's is found by a search and not a scan.
+        let labels = self.labels.get(..MAX_LABELS).unwrap_or(&self.labels);
+        let mut ranked = [(Mac([0; 6]), 0u8); MAX_LABELS];
+        for (slot, (rank, (mac, _))) in ranked.iter_mut().zip(labels.iter().enumerate()) {
+            *slot = (*mac, u8::try_from(rank).unwrap_or(u8::MAX));
+        }
+        let ranked = &mut ranked[..labels.len()];
+        ranked.sort_unstable();
+        let rank_of = |mac: Mac| {
+            ranked
+                .binary_search_by_key(&mac, |&(held, _)| held)
+                .ok()
+                .map(|at| usize::from(ranked[at].1))
+        };
+
+        let mut front: Smallest<'_, WALL_ROWS> = Smallest::new();
+        let mut always: Smallest<'_, WALL_ROWS> = Smallest::new();
+        // The labelled devices are found from the labels, a few dozen lookups, and not by asking each of
+        // the inventory's 512 devices whether it has one. The router and the Pi are left to the pass
+        // below, which sees every device once.
+        for (rank, (mac, _)) in labels.iter().enumerate() {
+            if let Some(device) = self.devices.get(mac)
+                && !self.is_always_device(*mac, device)
+            {
+                front.offer((0, rank as u64, *mac), device);
+            }
+        }
+        for (&mac, device) in &self.devices {
+            if self.is_always_device(mac, device) {
+                always.offer((0, device.first_unix, mac), device);
+                continue;
+            }
+            // An unlabelled device is checked against the labels only when its first sighting would
+            // take a place: once the places are full of earlier ones that is rare.
+            let key = (1, device.first_unix, mac);
+            if front.accepts(key) && recent(device.last_unix) && rank_of(mac).is_none() {
+                front.offer(key, device);
+            }
+        }
+
+        // The wall puts the router and the Pi last, and the Pi's own place, if the inventory does
+        // not hold it, among them; what is left of its places goes to the others.
+        let pi_place = self
+            .own_mac
+            .is_some_and(|mac| !self.devices.contains_key(&mac));
+        let tail = (always.len() + usize::from(pi_place)).min(WALL_ROWS);
+        let room = WALL_ROWS - tail;
+        for (mac, device) in always.first(tail).chain(front.first(room)) {
+            let mut row = WallDevice {
+                mac,
+                ipv4: [Ipv4Addr::UNSPECIFIED; MAX_IPV4],
+                ipv4_len: 0,
+                hostname: Inline::EMPTY,
+                label: Inline::EMPTY,
+                first_unix: device.first_unix,
+                last_unix: device.last_unix,
+                label_rank: rank_of(mac),
+                gate_left_secs: self
+                    .gates
+                    .get(&mac)
+                    .and_then(|shuts| shuts.checked_sub(now))
+                    .filter(|&left| left > 0)
+                    .map(|left| u16::try_from(left).unwrap_or(MAX_GATE_SECS)),
+                exempt: if by_default {
+                    !self.held_blocked(mac) && !self.claims_router_or_pi(mac, device)
+                } else {
+                    self.is_exempt(mac) || self.gates.contains_key(&mac)
+                },
+                fixed: self.is_fixed(mac),
+                always: self.is_always_device(mac, device),
+            };
+            // Newest first, as `view` has them.
+            for (slot, ip) in row.ipv4.iter_mut().zip(device.ipv4.iter().rev()) {
+                *slot = *ip;
+                row.ipv4_len += 1;
+            }
+            row.hostname.set(device.hostname.as_deref());
+            if let Some(rank) = row.label_rank {
+                row.label
+                    .set(self.labels.get(rank).map(|(_, label)| &**label));
+            }
+            out.rows.push(row);
+        }
+    }
+
     /// The inventory now, the device seen last first.
     pub fn view(&self) -> DevicesView {
         let by_default = self.exempt_default();
+        let (now, _) = (self.clock)();
+        let labels: HashMap<Mac, (usize, &Label)> = self
+            .labels
+            .iter()
+            .enumerate()
+            .map(|(rank, (mac, label))| (*mac, (rank, label)))
+            .collect();
         let mut seen: Vec<(u64, DeviceView)> = self
             .devices
             .iter()
             .map(|(&mac, device)| {
+                let gate_left = self
+                    .gates
+                    .get(&mac)
+                    .and_then(|shuts| shuts.checked_sub(now))
+                    .filter(|&left| left > 0)
+                    .map(|left| u16::try_from(left).unwrap_or(MAX_GATE_SECS));
                 let view = DeviceView {
                     mac,
                     ipv4: device.ipv4.iter().rev().copied().collect(),
@@ -556,11 +1220,16 @@ impl Devices {
                     last_unix: device.last_unix,
                     known: self.known.contains(&mac),
                     exempt: if by_default {
-                        !self.is_blocked(mac) && !self.claims_router_or_pi(mac, device)
+                        !self.held_blocked(mac) && !self.claims_router_or_pi(mac, device)
                     } else {
-                        self.is_exempt(mac)
+                        self.is_exempt(mac) || self.gates.contains_key(&mac)
                     },
                     blocked: self.is_blocked(mac),
+                    label: labels.get(&mac).map(|&(_, label)| label.clone()),
+                    label_rank: labels.get(&mac).map(|&(rank, _)| rank),
+                    gate_left_secs: gate_left,
+                    fixed: self.is_fixed(mac),
+                    always: self.is_always(mac),
                 };
                 (device.seen, view)
             })
@@ -578,12 +1247,22 @@ impl Devices {
             .copied()
             .collect();
         block_macs.sort_unstable();
+        let sorted = |set: &HashSet<Mac>| {
+            let mut macs: Vec<Mac> = set.iter().copied().collect();
+            macs.sort_unstable();
+            macs
+        };
         DevicesView {
+            rev: self.rev,
             known_list: self.state,
             devices: seen.into_iter().map(|(_, view)| view).collect(),
             exempt_macs,
+            exempt_pushed: sorted(&self.exempt_pushed),
             exempt_default: by_default,
             block_macs,
+            block_pushed: sorted(&self.block_pushed),
+            own_mac: self.own_mac,
+            own_ip: self.own_ip,
         }
     }
 
@@ -631,10 +1310,46 @@ impl Devices {
         self.block_config.contains(&mac) || self.block_pushed.contains(&mac)
     }
 
-    /// Whether `mac` is on any of the four lists, so that an address it takes or leaves may
-    /// change a published set.
+    /// Whether `mac` is held fully blocked in the exempt-by-default mode: on the configuration's
+    /// block list, or on the pushed one with no gate open.
+    fn held_blocked(&self, mac: Mac) -> bool {
+        self.block_config.contains(&mac)
+            || (self.block_pushed.contains(&mac) && !self.gates.contains_key(&mac))
+    }
+
+    /// Whether the configuration's list of the mode in force names `mac`: the exempt list in the
+    /// list mode, the block list in the exempt-by-default mode. Nothing but the configuration
+    /// changes such a device.
+    fn is_fixed(&self, mac: Mac) -> bool {
+        if self.exempt_default() {
+            self.block_config.contains(&mac)
+        } else {
+            self.exempt_config.contains(&mac)
+        }
+    }
+
+    /// Whether `mac` is the Pi's own, or the router's, or a device in the inventory that claims
+    /// the router's or the Pi's address: none of them is ever exempt.
+    fn is_always(&self, mac: Mac) -> bool {
+        Some(mac) == self.own_mac
+            || Some(mac) == self.gateway_mac
+            || self
+                .devices
+                .get(&mac)
+                .is_some_and(|device| self.claims_router_or_pi(mac, device))
+    }
+
+    /// [`Devices::is_always`] for a device that is at hand, which saves its lookup.
+    fn is_always_device(&self, mac: Mac, device: &Device) -> bool {
+        Some(mac) == self.own_mac
+            || Some(mac) == self.gateway_mac
+            || self.claims_router_or_pi(mac, device)
+    }
+
+    /// Whether `mac` is on any of the four lists or has a gate open, so that an address it takes
+    /// or leaves may change a published set.
     fn is_listed(&self, mac: Mac) -> bool {
-        self.is_exempt(mac) || self.is_blocked(mac)
+        self.is_exempt(mac) || self.is_blocked(mac) || self.gates.contains_key(&mac)
     }
 
     /// Whether `ip` is the router's address or the Pi's own.
@@ -667,11 +1382,16 @@ impl Devices {
     }
 
     /// The addresses that are exempt now, sorted, each once: each address of an exempt device in
-    /// the inventory that the device claimed last, but for the router's and the Pi's own, which
-    /// are never exempt.
+    /// the inventory, or of one whose gate is open, that the device claimed last, but for the
+    /// router's and the Pi's own, which are never exempt.
     fn exempt_now(&self) -> Vec<Ipv4Addr> {
         let mut addrs: Vec<Ipv4Addr> = self
-            .claimed_by(self.exempt_config.iter().chain(&self.exempt_pushed))
+            .claimed_by(
+                self.exempt_config
+                    .iter()
+                    .chain(&self.exempt_pushed)
+                    .chain(self.gates.keys()),
+            )
             .filter(|&ip| !self.is_router_or_pi(ip))
             .collect();
         addrs.sort_unstable();
@@ -681,12 +1401,20 @@ impl Devices {
 
     /// The addresses that are fully blocked now, sorted, each once: the router's and the Pi's own,
     /// and each address of a device on a block list in the inventory that the device claimed
-    /// last. The router's and the Pi's come first, so that a cut of the set could never drop them.
+    /// last, but for a device of the pushed list whose gate is open. The router's and the Pi's
+    /// come first, so that a cut of the set could never drop them.
     fn blocked_now(&self) -> Vec<Ipv4Addr> {
         let mut addrs: Vec<Ipv4Addr> = [Some(self.gateway), self.own_ip]
             .into_iter()
             .flatten()
-            .chain(self.claimed_by(self.block_config.iter().chain(&self.block_pushed)))
+            .chain(
+                self.claimed_by(
+                    self.block_config
+                        .iter()
+                        .chain(&self.block_pushed)
+                        .filter(|&&mac| self.held_blocked(mac)),
+                ),
+            )
             .collect();
         addrs.sort_unstable();
         addrs.dedup();
@@ -695,7 +1423,7 @@ impl Devices {
 
     /// Works out the exempt and the fully blocked addresses again, and publishes each set that
     /// changed, and the count of the addresses that are not blocked. It looks at the devices of
-    /// the four lists alone, at most 256 of four addresses each.
+    /// the four lists and the gates alone, at most 320 of four addresses each.
     fn refresh_exempt(&mut self) {
         let now = self.exempt_now();
         if now != self.exempt_published {
@@ -2335,5 +3063,775 @@ mod tests {
         devices.on_dhcp(&dhcp(DHCP_REQUEST, mac(2), None, ip(12), None));
         assert_eq!(order(&devices), [2, 1, 3]);
         assert_eq!(devices.view().devices[0].last_unix, UNIX_START + 5);
+    }
+
+    /// The label `text`.
+    fn label(text: &str) -> Label {
+        Label::new(text).unwrap()
+    }
+
+    /// The hosts `192.0.2.<host>` are devices `5..`: hears the devices `lasts`, each with the
+    /// address `192.0.2.<last>`.
+    fn hear_all(devices: &mut Devices, lasts: &[u8]) {
+        for &last in lasts {
+            devices.on_arp(&arp(mac(last), ip(last)));
+        }
+    }
+
+    #[test]
+    fn a_label_is_one_to_24_printable_ascii_characters_and_says_nothing_in_debug() {
+        assert_eq!(Label::new("Desk PC").as_deref(), Some("Desk PC"));
+        assert_eq!(Label::new(" a ").as_deref(), Some(" a "));
+        assert!(Label::new("x").is_some());
+        assert!(Label::new(&"x".repeat(LABEL_MAX)).is_some());
+        for bad in [
+            "",
+            &"x".repeat(LABEL_MAX + 1),
+            "caf\u{e9}",
+            "tab\t",
+            "line\nbreak",
+            "bell\u{7}",
+            "del\u{7f}",
+            "\u{1f600}",
+        ] {
+            assert!(Label::new(bad).is_none(), "{bad:?}");
+        }
+        assert_eq!(format!("{:?}", label("Desk PC")), "Label(..)");
+    }
+
+    #[test]
+    fn an_open_gate_makes_the_device_exempt_in_the_list_mode_until_it_expires() {
+        let (mut devices, clock, addrs) = exempt_setup();
+        hear_all(&mut devices, &[5, 6]);
+        assert!(exempt_hosts(&addrs).is_empty());
+        let rev = devices.rev();
+        assert_eq!(devices.next_gate_deadline(), None);
+
+        assert_eq!(devices.open_gate(mac(5), 300), Ok(()));
+        // The sets are republished as for a list change: the device's address, and nobody else's.
+        assert_eq!(exempt_hosts(&addrs), [5]);
+        assert!(addrs.is_exempt(IpAddr::V4(ip(5))) && !addrs.is_exempt(IpAddr::V4(ip(6))));
+        assert_eq!(devices.rev(), rev + 1);
+        assert_eq!(devices.next_gate_deadline(), Some(1300));
+        let view = devices.view();
+        let of = |m: Mac| view.devices.iter().find(|d| d.mac == m).unwrap().clone();
+        assert!(of(mac(5)).exempt && !of(mac(6)).exempt);
+        assert_eq!(of(mac(5)).gate_left_secs, Some(300));
+        assert_eq!(of(mac(6)).gate_left_secs, None);
+        // It is on no list: a gate is no part of the lists the desktop sees.
+        assert!(view.exempt_macs.is_empty() && view.exempt_pushed.is_empty());
+
+        clock.advance(100);
+        assert_eq!(devices.view().devices[1].gate_left_secs, Some(200));
+        // Not due yet: nothing changes, and no revision moves.
+        assert_eq!(devices.expire_gates(1299), 0);
+        assert_eq!(exempt_hosts(&addrs), [5]);
+        assert_eq!(devices.rev(), rev + 1);
+        // Due: the gate shuts, the set is republished, and that is a change.
+        assert_eq!(devices.expire_gates(1300), 1);
+        assert!(exempt_hosts(&addrs).is_empty());
+        assert_eq!(devices.rev(), rev + 2);
+        assert_eq!(devices.next_gate_deadline(), None);
+        let view = devices.view();
+        assert!(
+            view.devices
+                .iter()
+                .all(|d| !d.exempt && d.gate_left_secs.is_none())
+        );
+        assert_eq!(devices.expire_gates(5000), 0);
+        assert_eq!(devices.rev(), rev + 2);
+    }
+
+    #[test]
+    fn a_gate_on_a_device_that_is_exempt_already_shuts_without_taking_its_exemption() {
+        let (mut devices, _, addrs) = exempt_setup();
+        hear_all(&mut devices, &[5]);
+        devices.set_exempt(macs(&[5]));
+        assert_eq!(devices.open_gate(mac(5), 60), Ok(()));
+        assert_eq!(devices.expire_gates(2000), 1);
+        assert_eq!(exempt_hosts(&addrs), [5]);
+        assert!(devices.view().devices[0].exempt);
+    }
+
+    #[test]
+    fn an_open_gate_lifts_the_block_in_the_exempt_by_default_mode_and_shutting_it_puts_it_back() {
+        let (mut devices, clock, addrs) = exempt_setup();
+        hear_all(&mut devices, &[5, 6]);
+        devices.set_policy(true, macs(&[5]));
+        assert_eq!(blocked_hosts(&addrs), [1, 2, 5]);
+        assert!(!addrs.is_exempt(IpAddr::V4(ip(5))));
+        let view = devices.view();
+        let five = view.devices.iter().find(|d| d.mac == mac(5)).unwrap();
+        assert!(five.blocked && !five.exempt);
+
+        let rev = devices.rev();
+        assert_eq!(devices.open_gate(mac(5), 60), Ok(()));
+        assert_eq!(blocked_hosts(&addrs), [1, 2]);
+        assert!(addrs.is_exempt(IpAddr::V4(ip(5))));
+        assert_eq!(devices.rev(), rev + 1);
+        // It is still on the block list, and exempt for now.
+        let view = devices.view();
+        let five = view.devices.iter().find(|d| d.mac == mac(5)).unwrap();
+        assert!(five.blocked && five.exempt);
+        assert_eq!(five.gate_left_secs, Some(60));
+        assert_eq!(view.block_pushed, [mac(5)]);
+
+        // Shut by hand: blocked again at once, and shutting a shut gate changes nothing.
+        assert_eq!(devices.shut_gate(mac(5)), Ok(()));
+        assert_eq!(blocked_hosts(&addrs), [1, 2, 5]);
+        assert_eq!(devices.rev(), rev + 2);
+        assert_eq!(devices.shut_gate(mac(5)), Ok(()));
+        assert_eq!(devices.rev(), rev + 2);
+
+        // Shut by the clock: the same.
+        assert_eq!(devices.open_gate(mac(5), 60), Ok(()));
+        clock.advance(60);
+        let now = devices.mono_now();
+        assert_eq!(devices.expire_gates(now), 1);
+        assert_eq!(blocked_hosts(&addrs), [1, 2, 5]);
+        assert!(!addrs.is_exempt(IpAddr::V4(ip(5))));
+        // The router and the Pi were blocked all the while.
+        assert!(!addrs.is_exempt(IpAddr::V4(ip(1))) && !addrs.is_exempt(IpAddr::V4(ip(2))));
+    }
+
+    #[test]
+    fn a_gate_is_refused_for_the_router_the_pi_a_fixed_device_and_what_is_not_listed() {
+        let (mut devices, _, _) = exempt_setup();
+        hear_all(&mut devices, &[1, 5, 6]);
+        devices.set_exempt_config(macs(&[5]));
+        let rev = devices.rev();
+        // The MAC that claimed the router's address first is the router; the Pi is never listed.
+        assert_eq!(devices.open_gate(mac(1), 60), Err(EditError::Always));
+        assert_eq!(devices.open_gate(own(), 60), Err(EditError::Always));
+        assert_eq!(devices.shut_gate(own()), Err(EditError::Always));
+        // A device that claims the Pi's address is as little exempt.
+        devices.on_arp(&arp(mac(6), ip(2)));
+        assert_eq!(devices.open_gate(mac(6), 60), Err(EditError::Always));
+        // The configuration's exempt list, in the list mode.
+        assert_eq!(devices.open_gate(mac(5), 60), Err(EditError::Fixed));
+        assert_eq!(devices.shut_gate(mac(5)), Err(EditError::Fixed));
+        // Not in the inventory, shut or open.
+        assert_eq!(devices.open_gate(mac(9), 60), Err(EditError::Unknown));
+        assert_eq!(devices.shut_gate(mac(9)), Err(EditError::Unknown));
+        // Too long, and no device's address.
+        assert_eq!(devices.open_gate(mac(7), 3601), Err(EditError::Invalid));
+        assert_eq!(
+            devices.open_gate(Mac([3, 0, 0, 0, 0, 1]), 60),
+            Err(EditError::Invalid)
+        );
+        assert_eq!(devices.open_gate(Mac([0; 6]), 60), Err(EditError::Invalid));
+        assert_eq!(devices.rev(), rev);
+        assert_eq!(devices.next_gate_deadline(), None);
+        // An hour is the most.
+        hear_all(&mut devices, &[7]);
+        assert_eq!(devices.open_gate(mac(7), 3600), Ok(()));
+        assert_eq!(devices.view().devices[0].gate_left_secs, Some(3600));
+    }
+
+    #[test]
+    fn what_the_configuration_fixes_depends_on_the_mode_in_force() {
+        let (mut devices, _, _) = exempt_setup();
+        hear_all(&mut devices, &[5, 6]);
+        devices.set_exempt_config(macs(&[5]));
+        devices.set_block_config(macs(&[6]));
+        let fixed = |d: &Devices| -> Vec<(u8, bool)> {
+            let mut all: Vec<_> = d
+                .view()
+                .devices
+                .iter()
+                .map(|v| (v.mac.0[5], v.fixed))
+                .collect();
+            all.sort_unstable();
+            all
+        };
+        // The list mode: the exempt list decides.
+        assert_eq!(fixed(&devices), [(5, true), (6, false)]);
+        assert_eq!(devices.open_gate(mac(6), 60), Ok(()));
+        // The exempt-by-default mode: the block list decides.
+        devices.set_policy(true, Vec::new());
+        assert_eq!(fixed(&devices), [(5, false), (6, true)]);
+        assert_eq!(devices.open_gate(mac(6), 60), Err(EditError::Fixed));
+        assert_eq!(devices.open_gate(mac(5), 60), Ok(()));
+    }
+
+    #[test]
+    fn at_most_64_gates_are_open_and_one_that_is_open_may_be_given_a_new_time() {
+        let (mut devices, _, _) = exempt_setup();
+        for n in 0..=MAX_GATES as u16 {
+            devices.on_arp(&arp(mac2(n), ip(10 + n as u8)));
+        }
+        for n in 0..MAX_GATES as u16 {
+            assert_eq!(devices.open_gate(mac2(n), 60), Ok(()), "{n}");
+        }
+        assert_eq!(
+            devices.open_gate(mac2(MAX_GATES as u16), 60),
+            Err(EditError::Full)
+        );
+        // A gate that is open takes a new time, and room is made by shutting one.
+        assert_eq!(devices.open_gate(mac2(3), 600), Ok(()));
+        assert_eq!(devices.shut_gate(mac2(0)), Ok(()));
+        assert_eq!(devices.open_gate(mac2(MAX_GATES as u16), 60), Ok(()));
+        assert_eq!(devices.next_gate_deadline(), Some(1060));
+    }
+
+    #[test]
+    fn every_address_of_both_lists_and_of_all_the_gates_fits_the_set_the_dns_side_reads() {
+        let (mut devices, _, addrs) = exempt_setup();
+        // 192 devices, 4 addresses each: 64 on the configuration's list, 64 on the pushed one,
+        // 64 with a gate open.
+        for n in 0..192u16 {
+            for k in 0..4u8 {
+                let host = Ipv4Addr::new(10, 1, (n % 192) as u8, k);
+                devices.on_arp(&arp(mac2(n), host));
+            }
+        }
+        devices.set_exempt_config((0..64).map(mac2).collect());
+        devices.set_exempt((64..128).map(mac2).collect());
+        for n in 128..192 {
+            assert_eq!(devices.open_gate(mac2(n), 60), Ok(()));
+        }
+        assert_eq!(addrs.listed().len(), 192 * 4);
+        assert!(addrs.is_exempt(IpAddr::V4(Ipv4Addr::new(10, 1, 191, 3))));
+        assert!(addrs.is_exempt(IpAddr::V4(Ipv4Addr::new(10, 1, 0, 0))));
+    }
+
+    #[test]
+    fn ads_pass_edits_the_pushed_exempt_list_in_the_list_mode() {
+        let (mut devices, _, addrs) = exempt_setup();
+        hear_all(&mut devices, &[5, 6, 8]);
+        devices.set_exempt(macs(&[6]));
+        devices.set_exempt_config(macs(&[8]));
+        let rev = devices.rev();
+
+        assert_eq!(devices.set_ads_pass(mac(5), true), Ok(()));
+        assert_eq!(exempt_hosts(&addrs), [5, 6, 8]);
+        let view = devices.view();
+        assert_eq!(view.exempt_pushed, [mac(5), mac(6)]);
+        assert_eq!(view.exempt_macs, [mac(5), mac(6), mac(8)]);
+        assert_eq!(devices.rev(), rev + 1);
+        // The same again changes nothing and moves nothing.
+        assert_eq!(devices.set_ads_pass(mac(5), true), Ok(()));
+        assert_eq!(devices.rev(), rev + 1);
+
+        assert_eq!(devices.set_ads_pass(mac(5), false), Ok(()));
+        assert_eq!(exempt_hosts(&addrs), [6, 8]);
+        assert_eq!(devices.view().exempt_pushed, [mac(6)]);
+        assert_eq!(devices.rev(), rev + 2);
+        assert_eq!(devices.set_ads_pass(mac(5), false), Ok(()));
+        assert_eq!(devices.rev(), rev + 2);
+
+        // The configuration's list fixes its devices, either way.
+        assert_eq!(devices.set_ads_pass(mac(8), false), Err(EditError::Fixed));
+        assert_eq!(devices.set_ads_pass(mac(8), true), Err(EditError::Fixed));
+        assert_eq!(devices.rev(), rev + 2);
+        // A MAC that has not been heard may be edited: the lists name such devices.
+        assert_eq!(devices.set_ads_pass(mac(9), true), Ok(()));
+        assert_eq!(devices.view().exempt_pushed, [mac(6), mac(9)]);
+        // No device's address.
+        assert_eq!(
+            devices.set_ads_pass(Mac([0; 6]), true),
+            Err(EditError::Invalid)
+        );
+        assert_eq!(
+            devices.set_ads_pass(Mac([1, 0, 0, 0, 0, 1]), false),
+            Err(EditError::Invalid)
+        );
+    }
+
+    #[test]
+    fn ads_pass_edits_the_pushed_block_list_in_the_exempt_by_default_mode() {
+        let (mut devices, _, addrs) = exempt_setup();
+        hear_all(&mut devices, &[5, 6, 7]);
+        devices.set_block_config(macs(&[6]));
+        devices.set_exempt_config(macs(&[7]));
+        devices.set_policy(true, macs(&[5]));
+        assert_eq!(blocked_hosts(&addrs), [1, 2, 5, 6]);
+        let rev = devices.rev();
+
+        // ADS PASS for a blocked device takes it off the pushed block list.
+        assert_eq!(devices.set_ads_pass(mac(5), true), Ok(()));
+        assert_eq!(blocked_hosts(&addrs), [1, 2, 6]);
+        assert!(devices.view().block_pushed.is_empty());
+        assert_eq!(devices.rev(), rev + 1);
+        assert_eq!(devices.set_ads_pass(mac(5), true), Ok(()));
+        assert_eq!(devices.rev(), rev + 1);
+        // Stopping it puts it on the list again.
+        assert_eq!(devices.set_ads_pass(mac(5), false), Ok(()));
+        assert_eq!(blocked_hosts(&addrs), [1, 2, 5, 6]);
+        assert_eq!(devices.view().block_pushed, [mac(5)]);
+        assert_eq!(devices.rev(), rev + 2);
+        // The configuration's block list fixes its device; its exempt list means nothing here.
+        assert_eq!(devices.set_ads_pass(mac(6), true), Err(EditError::Fixed));
+        assert_eq!(devices.set_ads_pass(mac(7), false), Ok(()));
+        assert_eq!(blocked_hosts(&addrs), [1, 2, 5, 6, 7]);
+        // The exempt list of the mode that is not in force is left alone.
+        assert_eq!(devices.view().exempt_pushed, []);
+    }
+
+    #[test]
+    fn stopping_ads_pass_also_shuts_the_devices_gate() {
+        let (mut devices, _, addrs) = exempt_setup();
+        hear_all(&mut devices, &[5]);
+        devices.open_gate(mac(5), 600).unwrap();
+        devices.set_ads_pass(mac(5), true).unwrap();
+        // Letting ads pass for good leaves the gate as it is.
+        assert_eq!(devices.view().devices[0].gate_left_secs, Some(600));
+        let rev = devices.rev();
+        devices.set_ads_pass(mac(5), false).unwrap();
+        assert!(exempt_hosts(&addrs).is_empty());
+        assert_eq!(devices.view().devices[0].gate_left_secs, None);
+        assert_eq!(devices.rev(), rev + 1);
+        // In the other mode too: blocked, and not open.
+        devices.set_policy(true, Vec::new());
+        devices.open_gate(mac(5), 600).unwrap();
+        devices.set_ads_pass(mac(5), false).unwrap();
+        assert_eq!(blocked_hosts(&addrs), [1, 2, 5]);
+        assert_eq!(devices.next_gate_deadline(), None);
+    }
+
+    #[test]
+    fn the_router_and_the_pi_take_no_ads_pass_in_either_mode() {
+        let (mut devices, _, _) = exempt_setup();
+        hear_all(&mut devices, &[1, 5]);
+        let rev = devices.rev();
+        for default in [false, true] {
+            devices.set_policy(default, Vec::new());
+            let rev = devices.rev();
+            for pass in [true, false] {
+                assert_eq!(devices.set_ads_pass(mac(1), pass), Err(EditError::Always));
+                assert_eq!(devices.set_ads_pass(own(), pass), Err(EditError::Always));
+            }
+            assert_eq!(devices.rev(), rev);
+        }
+        assert!(devices.rev() > rev);
+        // A device that claims the router's address is the router for this.
+        devices.on_arp(&arp(mac(5), ip(1)));
+        assert_eq!(devices.set_ads_pass(mac(5), true), Err(EditError::Always));
+        let view = devices.view();
+        assert!(view.devices.iter().all(|d| d.always));
+        assert_eq!(view.own_mac, Some(own()));
+    }
+
+    #[test]
+    fn a_full_pushed_list_refuses_one_more_but_still_edits_its_members() {
+        let (mut devices, _, _) = exempt_setup();
+        devices.set_exempt((0..64).map(mac2).collect());
+        assert_eq!(devices.set_ads_pass(mac2(64), true), Err(EditError::Full));
+        assert_eq!(devices.set_ads_pass(mac2(3), true), Ok(()));
+        assert_eq!(devices.set_ads_pass(mac2(3), false), Ok(()));
+        assert_eq!(devices.set_ads_pass(mac2(64), true), Ok(()));
+        devices.set_policy(true, (0..64).map(mac2).collect());
+        assert_eq!(devices.set_ads_pass(mac2(64), false), Err(EditError::Full));
+        assert_eq!(devices.set_ads_pass(mac2(3), true), Ok(()));
+        assert_eq!(devices.set_ads_pass(mac2(64), false), Ok(()));
+    }
+
+    #[test]
+    fn the_revision_moves_with_every_change_of_a_pushed_list_the_mode_the_labels_or_a_gate() {
+        let (mut devices, clock, _) = exempt_setup();
+        assert_eq!(devices.rev(), 0);
+        // What the watch hears, the known list, the configuration and the learning are no part.
+        hear_all(&mut devices, &[5, 6]);
+        devices.set_known(macs(&[5]));
+        devices.set_exempt_config(macs(&[7]));
+        devices.set_block_config(macs(&[7]));
+        devices.set_exempt_default_config(false);
+        clock.advance(1000);
+        devices.tick();
+        assert_eq!(devices.rev(), 0);
+        let expect = std::cell::Cell::new(0);
+        let moved = |devices: &Rig, what: &str| {
+            expect.set(expect.get() + 1);
+            assert_eq!(devices.rev(), expect.get(), "{what}");
+        };
+        let still = |devices: &Rig, what: &str| assert_eq!(devices.rev(), expect.get(), "{what}");
+
+        devices.set_exempt(macs(&[5]));
+        moved(&devices, "an exempt list that differs");
+        devices.set_exempt(macs(&[5]));
+        still(&devices, "the same exempt list");
+        // A mode that is the one in force and a block list that is the one there is.
+        devices.set_policy(false, Vec::new());
+        still(&devices, "a policy that changes nothing");
+        devices.set_policy(true, Vec::new());
+        moved(&devices, "the mode");
+        devices.set_policy(true, macs(&[6]));
+        moved(&devices, "a block list that differs");
+        devices.set_policy(true, macs(&[6]));
+        still(&devices, "the same policy");
+        devices.load_labels(vec![(mac(5), label("Desk"))], false, true);
+        moved(&devices, "a label");
+        devices.load_labels(vec![(mac(5), label("Desk"))], false, true);
+        still(&devices, "the same labels");
+        devices.load_labels(vec![(mac(6), label("TV"))], false, false);
+        still(&devices, "a chunk that is on its way");
+        devices.load_labels(Vec::new(), true, true);
+        moved(&devices, "the chunk that completes");
+        devices.open_gate(mac(5), 60).unwrap();
+        moved(&devices, "a gate opens");
+        devices.shut_gate(mac(5)).unwrap();
+        moved(&devices, "a gate shuts");
+        devices.shut_gate(mac(5)).unwrap();
+        still(&devices, "a gate that is shut");
+        devices.open_gate(mac(5), 60).unwrap();
+        moved(&devices, "a gate opens again");
+        devices.expire_gates(1000 + 1000 + 60);
+        moved(&devices, "a gate expires");
+        // The exempt-by-default mode is in force, and device 5 is not on the block list.
+        devices.set_ads_pass(mac(5), true).unwrap();
+        still(&devices, "an edit that changes nothing");
+        devices.set_ads_pass(mac(5), false).unwrap();
+        moved(&devices, "an edit of the block list");
+        devices.set_ads_pass(mac(5), false).unwrap();
+        still(&devices, "the same edit again");
+        devices.set_ads_pass(mac(5), true).unwrap();
+        moved(&devices, "an edit the other way");
+    }
+
+    #[test]
+    fn a_check_of_the_revision_lets_a_push_through_only_on_the_revision_there_is() {
+        let (mut devices, _, _) = exempt_setup();
+        assert_eq!(devices.check_rev(None), Ok(()));
+        assert_eq!(devices.check_rev(Some(0)), Ok(()));
+        devices.set_exempt(macs(&[5]));
+        assert_eq!(devices.check_rev(Some(0)), Err(1));
+        assert_eq!(devices.check_rev(Some(2)), Err(1));
+        assert_eq!(devices.check_rev(Some(1)), Ok(()));
+        assert_eq!(devices.check_rev(None), Ok(()));
+    }
+
+    #[test]
+    fn labels_come_in_chunks_like_the_known_list_and_keep_the_desktops_order() {
+        let (mut devices, _, _) = exempt_setup();
+        hear_all(&mut devices, &[5, 6, 7, 8]);
+        let pair = |last: u8, text: &str| (mac(last), label(text));
+        let label_of = |d: &Devices, last: u8| {
+            let view = d.view();
+            let device = view
+                .devices
+                .iter()
+                .find(|v| v.mac == mac(last))
+                .unwrap()
+                .clone();
+            (
+                device.label.as_deref().map(str::to_owned),
+                device.label_rank,
+            )
+        };
+
+        assert_eq!(
+            devices.load_labels(vec![pair(7, "TV"), pair(5, "Desk PC")], false, false),
+            2
+        );
+        // A list on its way is not in force.
+        assert_eq!(label_of(&devices, 7), (None, None));
+        // The chunk adds; a MAC that comes twice keeps its first label and place.
+        assert_eq!(
+            devices.load_labels(vec![pair(6, "Phone"), pair(7, "Again")], true, true),
+            3
+        );
+        assert_eq!(label_of(&devices, 7), (Some("TV".into()), Some(0)));
+        assert_eq!(label_of(&devices, 5), (Some("Desk PC".into()), Some(1)));
+        assert_eq!(label_of(&devices, 6), (Some("Phone".into()), Some(2)));
+        assert_eq!(label_of(&devices, 8), (None, None));
+        // A list that starts again leaves the old labels in force until it completes.
+        assert_eq!(
+            devices.load_labels(vec![pair(8, "Kettle")], false, false),
+            1
+        );
+        assert_eq!(label_of(&devices, 7).0.as_deref(), Some("TV"));
+        assert_eq!(devices.load_labels(vec![pair(5, "PC")], true, true), 2);
+        assert_eq!(label_of(&devices, 7), (None, None));
+        assert_eq!(label_of(&devices, 8), (Some("Kettle".into()), Some(0)));
+        assert_eq!(label_of(&devices, 5), (Some("PC".into()), Some(1)));
+        // An adding chunk with no list on its way adds to the labels there are.
+        assert_eq!(devices.load_labels(vec![pair(6, "Phone")], true, true), 3);
+        assert_eq!(label_of(&devices, 6), (Some("Phone".into()), Some(2)));
+        // An empty complete list clears them.
+        assert_eq!(devices.load_labels(Vec::new(), false, true), 0);
+        assert_eq!(label_of(&devices, 5), (None, None));
+    }
+
+    #[test]
+    fn the_labels_keep_the_first_64_and_the_cap_holds_across_chunks() {
+        let (mut devices, _, _) = exempt_setup();
+        let many = |from: u16, to: u16| -> Vec<(Mac, Label)> {
+            (from..to).map(|n| (mac2(n), label("x"))).collect()
+        };
+        assert_eq!(devices.load_labels(many(0, 40), false, false), 40);
+        assert_eq!(devices.load_labels(many(30, 100), true, true), MAX_LABELS);
+        assert_eq!(devices.load_labels(many(200, 210), true, true), MAX_LABELS);
+    }
+
+    #[test]
+    fn the_debug_of_a_view_says_nothing_of_a_label() {
+        let (mut devices, _, _) = exempt_setup();
+        hear_all(&mut devices, &[5]);
+        devices.load_labels(vec![(mac(5), label("Desk PC"))], false, true);
+        let text = format!("{:?}", devices.view());
+        assert!(!text.contains("Desk"), "{text}");
+        assert!(text.contains("Label(..)"), "{text}");
+    }
+
+    // ---- the panel's copy for the wall ----
+
+    /// A busy house on a clock that moves: 600 devices heard (the inventory keeps 512), two of
+    /// them in each three at the same second, every fifth with a host name, the router and the
+    /// Pi's address in use, 40 labels in an order of their own (one of them the router's), a few
+    /// open gates, and the configuration's lists in both modes.
+    fn busy_house() -> (Rig, FakeClock) {
+        let (mut rig, clock, _) = exempt_setup();
+        for n in 0..600u16 {
+            if n % 3 != 0 {
+                clock.advance(1);
+            }
+            let [high, low] = n.to_be_bytes();
+            let host = Ipv4Addr::new(10, 1, high, low);
+            rig.on_arp(&arp(mac2(n), host));
+            if n % 5 == 0 {
+                rig.on_dhcp(&dhcp(
+                    DHCP_REQUEST,
+                    mac2(n),
+                    Some(host),
+                    Ipv4Addr::UNSPECIFIED,
+                    Some(&format!("host-{n}-with-a-name")),
+                ));
+            }
+            // A second address for some, which comes first in the list of its device.
+            if n % 7 == 0 {
+                rig.on_arp(&arp(mac2(n), Ipv4Addr::new(10, 2, high, low)));
+            }
+        }
+        // The router, heard last so that the inventory still holds it, and a device that claims the
+        // Pi's address: neither is ever exempt.
+        rig.on_arp(&arp(mac2(9_999), ip(1)));
+        rig.on_arp(&arp(mac2(580), ip(2)));
+        let labels: Vec<(Mac, Label)> = std::iter::once((mac2(9_999), label("Router")))
+            .chain((0..39).map(|k| (mac2(100 + k * 3), label(&format!("Label {k}")))))
+            .collect();
+        rig.load_labels(labels, false, true);
+        // Gates on labelled devices, which have their place on the wall, and on others.
+        for n in [100, 103, 160, 595, 400] {
+            rig.open_gate(mac2(n), 90 + n).unwrap();
+        }
+        rig.set_exempt_config(vec![mac2(597), mac2(300)]);
+        rig.set_exempt(vec![mac2(598)]);
+        rig.set_block_config(vec![mac2(596), mac2(501)]);
+        (rig, clock)
+    }
+
+    /// The wall, as the panel builds it, in a form to compare: every field of every place.
+    fn places(copy: &WallCopy, now: Option<u64>) -> Vec<String> {
+        crate::panel::view::wall(copy, &[], 5_000, now)
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{:?} {} {} {} {} {} {:?} {:?} {:?}",
+                    entry.row.mac,
+                    entry.row.name,
+                    entry.row.named,
+                    entry.row.octet,
+                    entry.row.fixed,
+                    entry.row.asking,
+                    entry.row.state,
+                    entry.ipv4,
+                    entry.gate_ends_ms,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_wall_built_from_the_panels_copy_is_the_wall_built_from_the_whole_view() {
+        use crate::panel::view;
+        let (mut rig, _) = busy_house();
+        // At 24 hours and 300 seconds after the start, those last seen in the first 300 are too old: about
+        // half the devices. And with no clock, none are.
+        let late = UNIX_START + 86_400 + 300;
+        // The 40 labels, then 10 of them (the places are not full of labelled devices), then none.
+        let all = rig
+            .view()
+            .devices
+            .iter()
+            .filter(|d| d.label.is_some())
+            .count();
+        assert!(all >= 39, "{all}");
+        for labels in [40usize, 10, 0] {
+            let kept: Vec<(Mac, Label)> = (0..labels.min(39))
+                .map(|k| (mac2(100 + k as u16 * 3), label(&format!("Label {k}"))))
+                .collect();
+            rig.load_labels(kept, false, true);
+            for exempt_default in [false, true] {
+                rig.set_policy(exempt_default, vec![mac2(590), mac2(160), mac2(2)]);
+                for now in [None, Some(UNIX_START + 600), Some(late)] {
+                    let mut copy = WallCopy::new();
+                    rig.wall_copy(&|last| view::recent(last, now), &mut copy);
+                    let whole = WallCopy::of_view(&rig.view());
+                    assert!(whole.rows.len() > 500);
+                    let (lean, full) = (places(&copy, now), places(&whole, now));
+                    assert_eq!(lean.len(), WALL_ROWS, "{labels} {exempt_default} {now:?}");
+                    assert_eq!(
+                        lean, full,
+                        "{labels} labels, default mode {exempt_default}, clock {now:?}"
+                    );
+                    assert_eq!(copy.exempt_default, exempt_default);
+                    assert_eq!(
+                        view::newcomer_of(&copy),
+                        view::newcomer_of(&whole),
+                        "the mode"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_copy_holds_what_the_wall_reads_of_each_device_as_the_view_says_it() {
+        let (rig, _) = busy_house();
+        let mut copy = WallCopy::new();
+        rig.wall_copy(&|_| true, &mut copy);
+        let view = rig.view();
+        assert!(copy.rows.len() <= WALL_ROWS);
+        let (mut gated, mut named, mut labelled, mut always) = (0, 0, 0, 0);
+        for row in &copy.rows {
+            let whole = view
+                .devices
+                .iter()
+                .find(|device| device.mac == row.mac)
+                .expect("a device of the inventory");
+            assert_eq!(row.ipv4(), whole.ipv4.as_slice());
+            assert_eq!(row.hostname(), whole.hostname.as_deref());
+            assert_eq!(row.label(), whole.label.as_deref());
+            assert_eq!(row.label_rank, whole.label_rank);
+            assert_eq!(
+                (row.first_unix, row.last_unix),
+                (whole.first_unix, whole.last_unix)
+            );
+            assert_eq!(
+                (row.gate_left_secs, row.exempt, row.fixed, row.always),
+                (
+                    whole.gate_left_secs,
+                    whole.exempt,
+                    whole.fixed,
+                    whole.always
+                )
+            );
+            gated += usize::from(row.gate_left_secs.is_some());
+            named += usize::from(row.hostname().is_some());
+            labelled += usize::from(row.label().is_some());
+            always += usize::from(row.always);
+        }
+        // The things above were in the house, and so in the copy: it is a test of them.
+        assert!(
+            gated > 0 && named > 0 && labelled > 0 && always >= 2,
+            "{gated} {named} {labelled} {always}"
+        );
+        assert_eq!(
+            (copy.own_mac, copy.own_ip, copy.exempt_default),
+            (view.own_mac, view.own_ip, view.exempt_default)
+        );
+    }
+
+    #[test]
+    fn the_copy_is_bounded_and_makes_no_allocation_when_the_buffer_is_used_again() {
+        let (mut rig, clock) = busy_house();
+        let mut copy = WallCopy::new();
+        let room = copy.rows.capacity();
+        assert!(room >= WALL_ROWS);
+        rig.wall_copy(&|_| true, &mut copy);
+        // The wall's 33 places are full, the Pi's own among them: it is no device of the inventory.
+        assert_eq!(
+            copy.rows.len(),
+            WALL_ROWS - 1,
+            "a house of 512 fills the wall"
+        );
+        assert_eq!(
+            copy.rows.capacity(),
+            room,
+            "the room it was made with is all it uses"
+        );
+        // Again, after the inventory changed under it, and with a window that holds fewer: the same room,
+        // never more rows than the wall has places.
+        clock.advance(5);
+        rig.on_arp(&arp(mac2(700), Ipv4Addr::new(10, 3, 0, 1)));
+        rig.wall_copy(&|last| last > UNIX_START + 300, &mut copy);
+        assert!(copy.rows.len() <= WALL_ROWS);
+        rig.wall_copy(&|_| false, &mut copy);
+        assert!(
+            copy.rows
+                .iter()
+                .all(|row| row.label().is_some() || row.always),
+            "the unlabelled are too old"
+        );
+        assert_eq!(copy.rows.capacity(), room);
+        // An inventory with next to nothing in it leaves the buffer as big as it was.
+        let (small, _) = setup();
+        small.wall_copy(&|_| true, &mut copy);
+        assert!(copy.rows.is_empty());
+        assert_eq!(copy.rows.capacity(), room);
+    }
+
+    #[test]
+    fn the_copy_of_a_long_name_is_cut_to_whole_characters_and_keeps_the_router_when_the_wall_is_full()
+     {
+        let mut text = Inline::<4>::EMPTY;
+        assert_eq!(text.get(), None);
+        text.set(Some("abcdef"));
+        assert_eq!(text.get(), Some("abcd"));
+        // `\u{e9}` is two bytes: the cut goes before the one that would not fit.
+        text.set(Some("abc\u{e9}"));
+        assert_eq!(text.get(), Some("abc"));
+        text.set(Some("\u{20ac}\u{20ac}"));
+        assert_eq!(text.get(), Some("\u{20ac}"));
+        text.set(None);
+        assert_eq!(text.get(), None);
+
+        // Far more than 33 devices were seen first; the router, heard last, still has its place.
+        let (mut rig, clock, _) = exempt_setup();
+        for n in 0..100u16 {
+            clock.advance(1);
+            rig.on_arp(&arp(mac2(n), Ipv4Addr::new(10, 1, 0, n as u8)));
+        }
+        clock.advance(1);
+        rig.on_arp(&arp(mac(250), ip(1)));
+        let mut copy = WallCopy::new();
+        rig.wall_copy(&|_| true, &mut copy);
+        assert_eq!(copy.rows.len(), WALL_ROWS - 1, "and the Pi's own place");
+        assert_eq!(copy.rows.iter().filter(|row| row.always).count(), 1);
+        assert!(copy.rows.iter().any(|row| row.mac == mac(250)));
+    }
+
+    /// The panel's copy against the view that it replaced, for 512 devices: `view` builds every
+    /// device with clones, a map of the labels and a sort; `wall_copy` walks the inventory and copies
+    /// the few the wall can show.
+    #[test]
+    #[ignore = "prints timings; run it in release"]
+    fn what_the_wall_copy_costs_against_the_view() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let (rig, _) = busy_house();
+        let mut copy = WallCopy::new();
+        const ROUNDS: u32 = 2_000;
+        let mut best = (u128::MAX, u128::MAX);
+        for _ in 0..7 {
+            let began = Instant::now();
+            for _ in 0..ROUNDS {
+                black_box(black_box(&*rig).view());
+            }
+            let before = began.elapsed().as_nanos() / u128::from(ROUNDS);
+            let began = Instant::now();
+            for _ in 0..ROUNDS {
+                black_box(&*rig).wall_copy(&|last| last > 0, black_box(&mut copy));
+                black_box(&copy);
+            }
+            let after = began.elapsed().as_nanos() / u128::from(ROUNDS);
+            best = (best.0.min(before), best.1.min(after));
+        }
+        assert_eq!(copy.rows.len(), WALL_ROWS - 1);
+        println!(
+            "panel's read of the inventory, 512 devices, 40 labels, fastest of 7 runs of {ROUNDS}:\n  \
+             view() (before): {} ns per call\n  wall_copy (after): {} ns per call",
+            best.0, best.1
+        );
     }
 }

@@ -103,6 +103,26 @@ impl Clients {
             .collect()
     }
 
+    /// Puts in `out`, whose contents it replaces, the address of every device that was last seen
+    /// less than `window_secs` seconds before `mono_secs`, the most recently seen first.
+    ///
+    /// For the panel, which asks once a second from under this table's lock, the one the
+    /// resolver's answer path also takes for each query: nothing is allocated here, and only the
+    /// devices within the window are touched. The table is ordered by when each device was seen, so
+    /// the walk ends at the first one outside the window. `out` pushes at most [`MAX_CLIENTS`]: a
+    /// caller that reserves that much before it takes the lock never has the lock held over an
+    /// allocation.
+    pub fn asking_within(&self, mono_secs: u64, window_secs: u64, out: &mut Vec<Ipv4Addr>) {
+        out.clear();
+        out.extend(
+            self.entries
+                .iter()
+                .rev()
+                .take_while(|e| mono_secs.saturating_sub(e.last_seen) < window_secs)
+                .map(|e| e.addr),
+        );
+    }
+
     /// How many devices the table holds.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -193,6 +213,96 @@ mod tests {
         assert_eq!(c.len(), MAX_CLIENTS);
         let oldest = c.list(5).last().map(|e| e.addr);
         assert_eq!(oldest, Some(Ipv4Addr::from(0xc000_0200 + 44)));
+    }
+
+    #[test]
+    fn the_asking_are_those_within_the_window_most_recent_first_with_no_allocation_on_reuse() {
+        let mut c = Clients::default();
+        for n in 0..MAX_CLIENTS as u32 {
+            c.record(v4(n), u64::from(n));
+        }
+        // The last seen at 255; a window of 3 at 257 holds those seen at 255 (2 ago) and 256 (not there).
+        let mut out = Vec::with_capacity(MAX_CLIENTS);
+        c.asking_within(257, 3, &mut out);
+        assert_eq!(out, [Ipv4Addr::from(0xc000_0200 + 255)]);
+        // Those seen at 253, 254 and 255, newest first, as `list` says them.
+        c.asking_within(256, 4, &mut out);
+        let listed: Vec<Ipv4Addr> = c
+            .list(256)
+            .iter()
+            .filter(|client| client.last_seen_secs_ago < 4)
+            .map(|client| client.addr)
+            .collect();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out, listed);
+        // What was in `out` is replaced, and a window of nothing holds nobody.
+        c.asking_within(256, 0, &mut out);
+        assert!(out.is_empty());
+        // Everything in the table fits the reserved room, and a second copy does not grow it.
+        let room = out.capacity();
+        c.asking_within(300, 1_000, &mut out);
+        assert_eq!(out.len(), MAX_CLIENTS);
+        assert_eq!(
+            out.capacity(),
+            room,
+            "the buffer was reserved for the table"
+        );
+        c.asking_within(300, 1_000, &mut out);
+        assert_eq!(out.capacity(), room, "and is not grown by the next copy");
+        // A device seen after `mono_secs` (a query that came in between) is no time ago at all.
+        c.record(v4(1_000), 400);
+        c.asking_within(399, 1, &mut out);
+        assert_eq!(out, [Ipv4Addr::from(0xc000_0200 + 1_000)]);
+    }
+
+    /// The panel's copy against the old one: `list` makes a vector of up to 256 clients under the
+    /// lock, `asking_within` copies the few that are in the window into a buffer it keeps.
+    #[test]
+    #[ignore = "prints timings; run it in release"]
+    fn what_the_asking_copy_costs_against_the_list() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mut c = Clients::default();
+        for n in 0..MAX_CLIENTS as u32 {
+            c.record(v4(n), 1_000 + u64::from(n));
+        }
+        // Eight of the 256 asked in the last second or two: the lamps of a busy evening.
+        let now = 1_000 + MAX_CLIENTS as u64 + 1;
+        for n in 0..8 {
+            c.record(v4(n), now);
+        }
+        const ROUNDS: u32 = 20_000;
+        let window = 2;
+        let mut out: Vec<Ipv4Addr> = Vec::with_capacity(MAX_CLIENTS);
+        let mut best = (u128::MAX, u128::MAX);
+        for _ in 0..7 {
+            let began = Instant::now();
+            for _ in 0..ROUNDS {
+                let clients = black_box(&c).list(black_box(now));
+                out.clear();
+                out.extend(
+                    clients
+                        .iter()
+                        .filter(|client| client.last_seen_secs_ago < window)
+                        .map(|client| client.addr),
+                );
+                black_box(&out);
+            }
+            let before = began.elapsed().as_nanos() / u128::from(ROUNDS);
+            let began = Instant::now();
+            for _ in 0..ROUNDS {
+                black_box(&c).asking_within(black_box(now), window, &mut out);
+                black_box(&out);
+            }
+            let after = began.elapsed().as_nanos() / u128::from(ROUNDS);
+            best = (best.0.min(before), best.1.min(after));
+        }
+        assert_eq!(out.len(), 8);
+        println!(
+            "panel's asking copy, 256 clients, 8 in the window, fastest of 7 runs of {ROUNDS}:\n  \
+             list + filter (before): {} ns per call\n  asking_within (after):  {} ns per call",
+            best.0, best.1
+        );
     }
 
     #[test]

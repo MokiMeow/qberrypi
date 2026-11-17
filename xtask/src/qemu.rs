@@ -247,9 +247,10 @@ const SYSTEM_LOG: &str = "qberrypi/log.txt";
 /// The API's key and certificate, where init reads them. The scenarios that serve the API get one
 /// made for the run, which is never written anywhere but the image.
 const TLS_PEM: &str = "qberrypi/tls.pem";
-/// The password of the API in the scenarios that serve it. It is no secret: the card of a QEMU run
-/// is a throwaway, and the hash has a salt of zeros.
-const API_PASSWORD: &[u8] = b"qemu";
+/// The password of the API in the scenarios that serve it: the one the guest's self-test logs in
+/// with (`qberrypi::selftest::API_PASSWORD`). It is no secret: the card of a QEMU run is a
+/// throwaway, and the hash has a salt of zeros.
+const API_PASSWORD: &[u8] = qberrypi::selftest::API_PASSWORD.as_bytes();
 /// The log that a slot's build keeps in its own folder when `debug.log_to_sd` is on.
 const SLOT_LOG: &str = "log.txt";
 /// What `tls.pem` holds in the slots of the scenarios' cards: a sentence, as the stand-in boot
@@ -1526,7 +1527,14 @@ fn dns_selftest_conditions(evidence: &Evidence) -> Vec<Condition> {
         // Nothing can be forwarded, and the client is told so.
         evidence.serial_has("INFO  selftest: dns: udp example.com A: SERVFAIL"),
         evidence.serial_has("INFO  selftest: status: /api/v1/stats: 200"),
+        // The panel OS's P1: the API logged in over loopback (the password is the scenario's, the
+        // certificate the card's, taken by its pin) and its device inventory answered with a `rev`.
+        evidence.serial_has("INFO  selftest: api: /api/qbp/devices: 200 rev"),
         evidence.serial_has("INFO  selftest: dns: done"),
+        // The last line: the process's resident memory in kB, for the memory check of the
+        // milestones. A number that could not be read is `unknown`, and is no line.
+        evidence.serial_has("INFO  selftest: vmrss: "),
+        evidence.serial_lacks("selftest: vmrss: unknown"),
         // The clock waits for a default route, which a guest without a network card never gets.
         evidence.serial_has("INFO  clock: waiting for a default route"),
         // The refresh waits for the clock, which no guest without a network card ever gets.
@@ -4717,7 +4725,9 @@ mod tests {
              [  22.730] WARN  dns: no upstream answers\n\
              [  22.731] INFO  selftest: dns: udp example.com A: SERVFAIL\n\
              [  22.740] INFO  selftest: status: /api/v1/stats: 200\n\
-             [  22.741] INFO  selftest: dns: done\n\
+             [  22.900] INFO  selftest: api: /api/qbp/devices: 200 rev\n\
+             [  22.901] INFO  selftest: dns: done\n\
+             [  22.902] INFO  selftest: vmrss: 14400 kB\n\
              [  60.000] INFO  returning\n",
         );
         evidence
@@ -4733,7 +4743,7 @@ mod tests {
         let conditions = dns_selftest_conditions(&good_dns_selftest_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 27);
+        assert_eq!(conditions.len(), 30);
     }
 
     #[test]
@@ -4751,7 +4761,7 @@ mod tests {
     fn each_thing_wrong_with_the_dns_selftest_boot_fails_its_condition() {
         /// What the failed condition is about, and what makes the evidence wrong.
         type Wrong = (&'static str, fn(&mut Evidence));
-        let wrong: [Wrong; 22] = [
+        let wrong: [Wrong; 27] = [
             ("has `INFO  services: started`", |e| {
                 e.serial = e.serial.replace("services: started", "services: startup")
             }),
@@ -4826,8 +4836,28 @@ mod tests {
             ("has `INFO  selftest: status: /api/v1/stats: 200`", |e| {
                 e.serial = e.serial.replace("stats: 200", "stats: no answer")
             }),
+            // The login was refused, the API did not answer, or its devices came without a `rev`.
+            (
+                "has `INFO  selftest: api: /api/qbp/devices: 200 rev`",
+                |e| e.serial = e.serial.replace("devices: 200 rev", "devices: login 401"),
+            ),
+            (
+                "has `INFO  selftest: api: /api/qbp/devices: 200 rev`",
+                |e| e.serial = e.serial.replace("devices: 200 rev", "devices: no answer"),
+            ),
+            (
+                "has `INFO  selftest: api: /api/qbp/devices: 200 rev`",
+                |e| e.serial = e.serial.replace("devices: 200 rev", "devices: 200 no rev"),
+            ),
             ("has `INFO  selftest: dns: done`", |e| {
                 e.serial = e.serial.replace("INFO  selftest: dns: done", "")
+            }),
+            // The resident memory was not logged, or could not be read.
+            ("has `INFO  selftest: vmrss: `", |e| {
+                e.serial = e.serial.replace("selftest: vmrss: 14400 kB", "")
+            }),
+            ("does not have `selftest: vmrss: unknown`", |e| {
+                e.serial = e.serial.replace("vmrss: 14400 kB", "vmrss: unknown")
             }),
             ("has `INFO  clock: waiting for a default route`", |e| {
                 e.serial = e

@@ -10,7 +10,11 @@
 //!
 //! [`drain::Drain`] is the scene, one `tick` a frame; [`drain::Stills`] holds
 //! the figures; [`Painter`] keeps a frame between calls and repaints only
-//! what changed, as RGB565 for the screen. [`touch`] maps taps to controls.
+//! what changed, as RGB565 for the screen. [`touch`] decides which presses are taps.
+//!
+//! Round 8 turns the Drain into one section (LIVE) of a small OS: [`ui`] holds the palette, the
+//! canvas the other screens are drawn on and the painter that paints one whole from a view, and
+//! [`os`] the world the screens read, where the panel is and the screens themselves.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -18,14 +22,16 @@
 pub mod drain;
 pub mod format;
 pub mod geometry;
+pub mod os;
 mod rgb565;
 pub mod rows;
 pub mod state;
 pub mod text;
 pub mod touch;
+pub mod ui;
 
 pub use drain::{Fixture, Painter, drain_fixture};
 pub use geometry::{HEIGHT, WIDTH};
 pub use rgb565::rgba_to_rgb565;
 pub use state::{Blocking, LaneWords, Share, TimeOfDay};
-pub use touch::{Calibration, Control, Switch, TapTracker, TouchEvent, hit, to_screen};
+pub use touch::{Calibration, Switch, TapTracker, TouchEvent, to_screen};

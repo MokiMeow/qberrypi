@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use qberrypi::api::http::{Head, Reply, read_request_body, read_request_head, write_reply};
+use qberrypi::api::http::{
+    Head, Reply, Request, read_request_body, read_request_head, write_reply,
+};
 use qberrypi::api::tls::server_config;
 use rustls::{ServerConnection, StreamOwned};
 use serde_json::Value;
@@ -41,6 +43,10 @@ pub(crate) type Stream = BufReader<StreamOwned<ServerConnection, TcpStream>>;
 /// What [`TlsPi`] does with `POST /api/qbp/update`: reads what it wants of the body from the
 /// stream and says what to answer; the connection closes after the answer.
 pub(crate) type UpdateHandler = Box<dyn Fn(&Head, &mut Stream) -> Reply + Send + Sync>;
+
+/// What [`TlsPi`] answers any other request with, read whole, but the login and the logout; the
+/// session is the handler's to check.
+pub(crate) type RequestHandler = Box<dyn Fn(&Request) -> Reply + Send + Sync>;
 
 /// A reply with a JSON body.
 pub(crate) fn json_reply(status: u16, body: &str) -> Reply {
@@ -120,6 +126,17 @@ impl TlsPi {
     /// Starts serving; `update` answers `POST /api/qbp/update` (the session is checked first: a
     /// request without [`SID`] is a 401 and the handler is not called).
     pub(crate) fn start(pem: &str, update: UpdateHandler) -> TlsPi {
+        Self::start_with(pem, update, None)
+    }
+
+    /// Starts serving with `other` answering every request but the login, the logout and the
+    /// update, which is then a 404.
+    pub(crate) fn serving(pem: &str, other: RequestHandler) -> TlsPi {
+        let none: UpdateHandler = Box::new(|_, _| error_reply(404, "not_found", "Not found"));
+        Self::start_with(pem, none, Some(other))
+    }
+
+    fn start_with(pem: &str, update: UpdateHandler, other: Option<RequestHandler>) -> TlsPi {
         let config = server_config(pem.as_bytes()).expect("the test certificate serves");
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
         listener
@@ -139,6 +156,7 @@ impl TlsPi {
                 serve(
                     BufReader::new(StreamOwned::new(conn, socket)),
                     &update,
+                    other.as_ref(),
                     &seen,
                 );
             })
@@ -167,7 +185,12 @@ impl TlsPi {
 }
 
 /// Serves one connection: requests until the client is done, or the update's turn has come.
-fn serve(mut stream: Stream, update: &UpdateHandler, seen: &Mutex<Vec<String>>) {
+fn serve(
+    mut stream: Stream,
+    update: &UpdateHandler,
+    other: Option<&RequestHandler>,
+    seen: &Mutex<Vec<String>>,
+) {
     let note = |text: String| {
         seen.lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -220,7 +243,13 @@ fn serve(mut stream: Stream, update: &UpdateHandler, seen: &Mutex<Vec<String>>) 
                     body: Vec::new(),
                 }
             }
-            _ => error_reply(404, "not_found", "Not found"),
+            _ => match other {
+                Some(other) => {
+                    note(format!("{} {}", request.method, request.target));
+                    other(&request)
+                }
+                None => error_reply(404, "not_found", "Not found"),
+            },
         };
         if write_reply(stream.get_mut(), &reply, request.close).is_err() || request.close {
             return;

@@ -32,6 +32,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::{OnceCell, Semaphore, watch};
 use tokio::time::sleep;
 
+use crate::api::bench::Bench;
 use crate::api::live::LiveFacts;
 use crate::api::qbp::QbpWatch;
 use crate::api::routes::Api;
@@ -56,12 +57,14 @@ use crate::update::UpdateCtl;
 use crate::update::receive;
 use crate::update::trial::{self, BoardHealth};
 use crate::watch::behaviour::Behaviour;
-use crate::watch::devices::Devices;
+use crate::watch::devices::{Devices, KnownList};
 use crate::watch::rebind::RebindPolicy;
 use crate::watch::store::AlertStore;
 use crate::watch::{Event, Watch, analysis, devwatch, feed};
 use crate::wifi;
-use crate::wiring::{self, Extras, Live, PROC_WIRELESS, SharedResolver, SignalCache, Slot};
+use crate::wiring::{
+    self, Extras, Live, LiveDevices, PROC_WIRELESS, SharedResolver, SignalCache, Slot,
+};
 
 /// The threads of the blocking pool, beside the runtime's own: the most blocking jobs that run
 /// at once. List parsing and TLS must leave the DNS service its share of the board's four cores.
@@ -273,7 +276,11 @@ impl Lazy {
                 .with_update(receive::Receiver::new(
                     self.ctx.update.clone(),
                     crate::BUILD_EPOCH,
-                ));
+                ))
+                .with_bench(Bench::new(SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    DNS_PORT,
+                ))));
                 Ok(ApiParts {
                     api: Arc::new(api),
                     tls,
@@ -303,6 +310,13 @@ impl Lazy {
         let loaded = load_snapshot(&self.snapshot, &cfg.dns.deny, &cfg.dns.allow).await;
         let upstreams = upstreams_of(cfg);
         let dns = Dns::new(loaded.set, upstreams, Box::new(cfg.timezone.clone()));
+        // Addresses that stand for many devices answer to the upstreams' rate alone.
+        dns.set_shared_clients(
+            std::iter::once(cfg.net.gateway)
+                .chain(cfg.dns.shared_clients.iter().copied())
+                .map(std::net::IpAddr::V4)
+                .collect(),
+        );
         // The switches live in the resolver, and a block set that a refresh swaps in leaves them.
         {
             let mut resolver = dns.resolver();
@@ -327,6 +341,12 @@ impl Lazy {
         // it takes its screen over for is the watchdog's.
         slot.fill(running(&dns, &lists, &synced, wifi, signal));
         slot.fill_alerts(alerts.clone());
+        slot.fill_devices(Arc::new(LiveDevices {
+            devices: devices.clone(),
+            alerts: alerts.clone(),
+            dns: dns.clone(),
+            lane: slot.lane(),
+        }));
         dns.set_lane(slot.lane());
 
         let status = Status {
@@ -337,6 +357,7 @@ impl Lazy {
             started: *started,
             link: link_reader(wifi.clone(), signal.clone()),
             board_c: Arc::new(|| thermal::read_c(Path::new(BOARD_TEMP))),
+            unknown_devices: unknown_devices_of(devices.clone()),
             update: update.clone(),
         };
         let client = Arc::new(Client::new(client_config(mozilla_roots()), dns.clone()));
@@ -353,6 +374,25 @@ impl Lazy {
             analysis,
         }
     }
+}
+
+/// What the status server calls for the number of devices that are not on the known list: it
+/// locks the inventory for a look at its devices, and gives their count and nothing of them.
+///
+/// While no known list has come ([`KnownList::Waiting`]) it is 0: there is nothing yet to be
+/// unknown to, every device would count, and the inventory holds the alerts for them for that
+/// reason too.
+fn unknown_devices_of(devices: Arc<Mutex<Devices>>) -> Arc<dyn Fn() -> usize + Send + Sync> {
+    Arc::new(move || {
+        let view = devices
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .view();
+        if view.known_list == KnownList::Waiting {
+            return 0;
+        }
+        view.devices.iter().filter(|d| !d.known).count()
+    })
 }
 
 /// The upstreams of `cfg`, asked over UDP, with the way over TLS ready for [`Upstreams::start_tls`]
@@ -508,7 +548,7 @@ fn prepare_from(ctx: Context, snapshot: PathBuf) -> Vec<Component> {
         tokio::spawn(async move {
             lazy.get().await;
             tokio::task::yield_now().await;
-            dns_selftest().await;
+            dns_selftest(lazy.ctx.tls_pem).await;
         });
     }
 
@@ -820,9 +860,11 @@ fn snapshot_outcome(job: io::Result<Loaded>, deny: &[String], allow: &[String]) 
     job.unwrap_or_else(|_| snapshot::config_only(deny, allow, JOIN_FAILED.to_owned()))
 }
 
-/// The self-test of the DNS and status servers, for the boot in QEMU that asks for it: waits for
-/// `lo`, asks the servers over it, and logs what they said. It is started once they have bound.
-async fn dns_selftest() {
+/// The self-test of the DNS and status servers and of the API, for the boot in QEMU that asks for
+/// it: waits for `lo`, asks the servers over it, logs in to the API with the card's certificate
+/// as the pin, and logs what they said, then this process's resident memory. It is started once
+/// the DNS and status servers have bound; the API, which binds later, is waited for.
+async fn dns_selftest(tls_pem: Option<&'static [u8]>) {
     let flags = Path::new(selftest::LO_FLAGS);
     if !selftest::lo_comes_up(flags, selftest::LO_WAIT).await {
         log::error!("selftest: lo is not up");
@@ -832,7 +874,11 @@ async fn dns_selftest() {
     for line in selftest::dns(dns, status).await {
         log::info!("{line}");
     }
+    let api = SocketAddr::from((Ipv4Addr::LOCALHOST, api::PORT));
+    let line = selftest::api(api, tls_pem, selftest::API_PASSWORD, selftest::API_WAIT).await;
+    log::info!("{line}");
     log::info!("selftest: dns: done");
+    log::info!("{}", selftest::vmrss_line());
 }
 
 /// The IPv4 address that a server listens on to be reached by every interface, at `port`.
@@ -1409,6 +1455,37 @@ mod tests {
 
         assert_eq!(answered[0].0, 401);
         assert!(!running.is_finished());
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn the_self_tests_api_step_logs_in_and_reads_the_devices_with_a_revision() {
+        let pem = leaked_pem();
+        let (ctx, _slot, _sender) = context_with(&api_section(), Some(pem));
+        let lazy = Arc::new(Lazy::new(ctx, "/nonexistent/blocklist.zst".into()));
+        let addr = free_address();
+        let running = tokio::spawn({
+            let lazy = lazy.clone();
+            async move { api_start(&lazy, addr).await }
+        });
+        let wait = Duration::from_secs(30);
+
+        // The API has not bound when the step starts, as in the guest: the step tries again.
+        let line = selftest::api(addr, Some(pem), "right", wait).await;
+        assert_eq!(line, "selftest: api: /api/qbp/devices: 200 rev");
+
+        // A password that is not the API's is a refused login, and the line says no more.
+        let line = selftest::api(addr, Some(pem), "wrong", wait).await;
+        assert_eq!(line, "selftest: api: /api/qbp/devices: login 401");
+
+        // Another certificate than the one served is not trusted: nothing is answered.
+        let other = leaked_pem();
+        let line = selftest::api(addr, Some(other), "right", Duration::from_secs(5)).await;
+        assert_eq!(line, "selftest: api: /api/qbp/devices: no answer");
+
+        // A card with no `tls.pem` has no certificate to trust.
+        let line = selftest::api(addr, None, "right", wait).await;
+        assert_eq!(line, "selftest: api: /api/qbp/devices: no certificate");
         running.abort();
     }
 
@@ -2110,6 +2187,78 @@ mod tests {
             .dns
             .observe(client, &nxdomain_reply("two.example.org"));
         assert_eq!(shared.dns.watch_events_dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_status_counts_the_devices_that_are_not_on_the_known_list() {
+        use crate::watch::devices::with_devices;
+        use crate::watch::frames::{Arp, Mac};
+
+        let (ctx, _slot, _sender) = context();
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+        let asker = Ipv4Addr::new(198, 51, 100, 4);
+        let unknown = || {
+            let response = shared
+                .status
+                .respond("GET /api/v1/me HTTP/1.1", asker.into());
+            let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+            body["unknown_devices"].as_u64()
+        };
+        assert_eq!(unknown(), Some(0));
+
+        let (first, second) = (Mac([2, 0, 0, 0, 0, 5]), Mac([2, 0, 0, 0, 0, 6]));
+        let heard = |mac: Mac, last: u8| Arp {
+            op: 1,
+            sender_mac: mac,
+            sender_ip: Ipv4Addr::new(192, 0, 2, last),
+            target_ip: Ipv4Addr::new(192, 0, 2, 200),
+        };
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.on_arp(&heard(first, 30));
+            devices.on_arp(&heard(second, 31));
+        });
+        // A known list that names neither of them: both are unknown.
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.set_known(vec![Mac([2, 0, 0, 0, 0, 9])]);
+        });
+        assert_eq!(unknown(), Some(2));
+        // A list that names one of them takes it out of the count.
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.set_known(vec![first]);
+        });
+        assert_eq!(unknown(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_waiting_known_list_counts_no_unknown_devices() {
+        use crate::watch::devices::{KnownList, with_devices};
+        use crate::watch::frames::{Arp, Mac};
+
+        let (ctx, _slot, _sender) = context();
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+        let unknown = || (shared.status.unknown_devices)();
+        let heard = |last: u8| Arp {
+            op: 1,
+            sender_mac: Mac([2, 0, 0, 0, 0, last]),
+            sender_ip: Ipv4Addr::new(192, 0, 2, last),
+            target_ip: Ipv4Addr::new(192, 0, 2, 200),
+        };
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.on_arp(&heard(30));
+            devices.on_arp(&heard(31));
+        });
+        // No known list has come: none of the two devices is known, and none is reported as
+        // unknown, as the alerts for them are held for the same reason.
+        let state = shared.devices.lock().unwrap().view().known_list;
+        assert_eq!(state, KnownList::Waiting);
+        assert_eq!(unknown(), 0);
+        // A list that names neither of them makes both unknown at once.
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.set_known(vec![Mac([2, 0, 0, 0, 0, 9])]);
+        });
+        assert_eq!(unknown(), 2);
     }
 
     #[tokio::test]

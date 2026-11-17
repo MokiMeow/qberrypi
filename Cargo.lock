@@ -1355,6 +1355,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qb-bench"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "serde_json",
+]
+
+[[package]]
 name = "qb-dns"
 version = "0.1.0"
 dependencies = [
@@ -1393,6 +1401,7 @@ dependencies = [
  "libc",
  "log",
  "pbkdf2",
+ "qb-bench",
  "qb-dns",
  "qb-panel",
  "qb-wpa2",
@@ -2322,6 +2331,7 @@ dependencies = [
  "fatfs",
  "hickory-proto",
  "png",
+ "qb-bench",
  "qb-dns",
  "qb-panel",
  "qb-wpa2",

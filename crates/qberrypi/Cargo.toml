@@ -12,6 +12,7 @@ httparse = "1"
 libc = "0.2.191"
 log = "0.4.35"
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+qb-bench = { version = "0.1.0", path = "../qb-bench" }
 qb-dns = { version = "0.1.0", path = "../qb-dns" }
 qb-panel = { version = "0.1.0", path = "../qb-panel" }
 qb-wpa2 = { version = "0.1.0", path = "../qb-wpa2" }

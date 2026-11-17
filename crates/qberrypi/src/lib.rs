@@ -33,6 +33,7 @@ pub mod sys;
 pub(crate) mod testns;
 pub mod thermal;
 pub mod update;
+pub mod usage;
 pub mod watch;
 pub mod wifi;
 pub mod wiring;

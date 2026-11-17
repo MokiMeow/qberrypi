@@ -200,7 +200,15 @@ pub struct Dns {
     /// Whether `use-application-dns.net` gets NXDOMAIN, which tells browsers to keep their own
     /// DNS-over-HTTPS off; true when unset.
     pub doh_canary: bool,
+    /// Addresses that stand for many devices (a router that relays DNS, a mesh that puts its
+    /// devices behind one address): held to the upstreams' rate of fresh names alone, as the
+    /// gateway is, and to no device's rate or share. At most [`MAX_SHARED_CLIENTS`]; none when
+    /// unset.
+    pub shared_clients: Vec<Ipv4Addr>,
 }
+
+/// The most addresses that `dns.shared_clients` may list (the refusal says 32).
+pub const MAX_SHARED_CLIENTS: usize = 32;
 
 /// How the upstream resolvers are asked: the optional `[upstream]` table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +437,7 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             "allow",
             "threat_lists",
             "doh_canary",
+            "shared_clients",
         ],
     )?)?;
     let upstream = match root.section("upstream", &["tls", "tls_name"])? {
@@ -666,7 +675,23 @@ fn dns(section: &Section) -> Result<Dns, ConfigError> {
         allow: names_or_empty(section, "allow")?,
         threat_lists: https_urls_or_empty(section, "threat_lists")?,
         doh_canary: section.bool_or("doh_canary", true)?,
+        shared_clients: shared_clients(section)?,
     })
+}
+
+/// `dns.shared_clients`: IPv4 addresses, at most [`MAX_SHARED_CLIENTS`], none when unset.
+fn shared_clients(section: &Section) -> Result<Vec<Ipv4Addr>, ConfigError> {
+    let addrs = section
+        .strings("shared_clients")?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|addr| addr.parse::<Ipv4Addr>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| section.error("shared_clients", "every entry must be an IPv4 address"))?;
+    if addrs.len() > MAX_SHARED_CLIENTS {
+        return Err(section.error("shared_clients", "lists at most 32 addresses"));
+    }
+    Ok(addrs)
 }
 
 /// A list of `https://` URLs, as written, or none when unset.
@@ -1281,6 +1306,37 @@ upstreams = ["9.9.9.9"]
     fn refusal(text: &str) -> (String, String) {
         let e = parse(text).unwrap_err();
         (e.key, e.reason)
+    }
+
+    #[test]
+    fn shared_clients_are_ipv4_addresses_none_when_unset() {
+        assert!(parse(MINIMAL).unwrap().dns.shared_clients.is_empty());
+        let c = parse(&minimal_with_dns(
+            "shared_clients = [\"192.0.2.2\", \"192.0.2.3\"]",
+        ))
+        .unwrap();
+        let want: [Ipv4Addr; 2] = ["192.0.2.2".parse().unwrap(), "192.0.2.3".parse().unwrap()];
+        assert_eq!(c.dns.shared_clients, want);
+        for bad in [
+            "shared_clients = [\"router\"]",
+            "shared_clients = [\"2001:db8::1\"]",
+            "shared_clients = \"192.0.2.2\"",
+        ] {
+            assert_eq!(
+                refusal(&minimal_with_dns(bad)).0,
+                "dns.shared_clients",
+                "{bad}"
+            );
+        }
+        let many: Vec<String> = (1..=33).map(|n| format!("\"192.0.2.{n}\"")).collect();
+        let (key, reason) = refusal(&minimal_with_dns(&format!(
+            "shared_clients = [{}]",
+            many.join(", ")
+        )));
+        assert_eq!(
+            (key.as_str(), reason.as_str()),
+            ("dns.shared_clients", "lists at most 32 addresses")
+        );
     }
 
     #[test]

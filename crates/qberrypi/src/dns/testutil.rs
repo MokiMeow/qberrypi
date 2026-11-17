@@ -504,6 +504,20 @@ pub(crate) struct TlsMode {
     /// Advertises this idle timeout, in units of 100 ms, with the edns-tcp-keepalive option in
     /// the answers to the queries that carry the option. `None`: never.
     pub(crate) keepalive: Option<u16>,
+    /// Closes a connection, with the TLS close notice, as soon as it reads a query while this many
+    /// of its queries are read and not answered yet: a server that ends a session on which too
+    /// many questions are out at once. The query is not answered. `None`: never.
+    pub(crate) max_in_flight: Option<usize>,
+    /// Answers at most this many queries a second, over all the connections of the fake (a bucket
+    /// that holds a tenth of a second's worth), and reads and drops the rest unanswered: a server
+    /// that rate-limits its client. `None`: no limit.
+    pub(crate) rate: Option<u32>,
+    /// With [`TlsMode::rate`], whose bucket then holds a second's worth: once a query finds the
+    /// bucket empty, every query is dropped for
+    /// this long, on every connection: a server that throttles a source that sent too much, as
+    /// Quad9 did to this household for about 30 s after a burst of fresh names, over UDP as over
+    /// TLS. `None`: only the excess is dropped.
+    pub(crate) penalty: Option<Duration>,
 }
 
 /// What a [`TlsFakeUpstream`] has seen, from all of its connections.
@@ -514,13 +528,63 @@ struct TlsSeen {
     queries: AtomicUsize,
     /// Of those, the ones that carried the edns-tcp-keepalive option.
     keepalive_asked: AtomicUsize,
-    /// The connections that the fake closed itself, for [`TlsMode::idle_close`] or
-    /// [`TlsMode::close_on_query`].
+    /// The connections that the fake closed itself, for [`TlsMode::idle_close`],
+    /// [`TlsMode::close_on_query`] or [`TlsMode::max_in_flight`].
     closed: AtomicUsize,
     /// The bytes of [`TlsMode::flood`] written so far.
     flooded: AtomicUsize,
     /// Set when the fake is dropped: its connections end, and it takes no more.
     stopped: AtomicBool,
+    /// The bucket of [`TlsMode::rate`]: the tokens in it and when it was last filled.
+    bucket: Mutex<Option<(f64, StdInstant)>>,
+    /// The queries that [`TlsMode::rate`] dropped.
+    rate_dropped: AtomicUsize,
+    /// Until when [`TlsMode::penalty`] drops everything, and how often it began.
+    penalised: Mutex<Option<StdInstant>>,
+    penalties: AtomicUsize,
+}
+
+impl TlsSeen {
+    /// Whether a query may be answered under a limit of `rate` a second and the `penalty` for
+    /// going past it.
+    fn allowed(&self, rate: u32, penalty: Option<Duration>) -> bool {
+        let now = StdInstant::now();
+        let mut until = self
+            .penalised
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if until.is_some_and(|until| now < until) {
+            return false;
+        }
+        // A server that throttles takes a second's worth at once (a page's names), one that only
+        // drops the excess a tenth of one.
+        let window = if penalty.is_some() { 1.0 } else { 0.1 };
+        if self.within(rate, window) {
+            return true;
+        }
+        if let Some(penalty) = penalty {
+            *until = Some(now + penalty);
+            self.penalties.fetch_add(1, Ordering::SeqCst);
+        }
+        false
+    }
+
+    /// Whether a query may be answered under a limit of `rate` a second, from a bucket that holds
+    /// `window` of it, taking its token.
+    fn within(&self, rate: u32, window: f64) -> bool {
+        let now = StdInstant::now();
+        let size = (f64::from(rate) * window).max(1.0);
+        let mut bucket = self.bucket.lock().unwrap_or_else(PoisonError::into_inner);
+        let (tokens, at) = bucket.get_or_insert((size, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * f64::from(rate)).min(size);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// A DNS-over-TLS resolver on a `127.0.0.1` port, served by threads of its own, with a
@@ -590,6 +654,16 @@ impl TlsFakeUpstream {
     /// still be on their way: in the kernel's buffers).
     pub(crate) fn flooded(&self) -> usize {
         self.seen.flooded.load(Ordering::SeqCst)
+    }
+
+    /// The queries that [`TlsMode::rate`] dropped.
+    pub(crate) fn rate_dropped(&self) -> usize {
+        self.seen.rate_dropped.load(Ordering::SeqCst)
+    }
+
+    /// How often [`TlsMode::penalty`] began.
+    pub(crate) fn penalties(&self) -> usize {
+        self.seen.penalties.load(Ordering::SeqCst)
     }
 }
 
@@ -849,9 +923,20 @@ fn serve_tls(
             if asks_keepalive {
                 seen.keepalive_asked.fetch_add(1, Ordering::SeqCst);
             }
-            if mode.close_on_query == Some(read_here) {
+            if mode.close_on_query == Some(read_here)
+                || mode
+                    .max_in_flight
+                    .is_some_and(|most| due.len() + usize::from(held.is_some()) >= most)
+            {
                 close(&mut tls);
                 return;
+            }
+            if mode
+                .rate
+                .is_some_and(|rate| !seen.allowed(rate, mode.penalty))
+            {
+                seen.rate_dropped.fetch_add(1, Ordering::SeqCst);
+                continue;
             }
             if mode
                 .never_answers

@@ -2,21 +2,21 @@
 //!
 //! Each is a Drain run forward from a fixed start and the figures that go with it, made to look like
 //! the still of its name in `round6/` of the mockups (`scenes.js`, with the shot defaults of
-//! `common.js`: the clock at 10:21, 4,780 refused, 44 %, and 4:37 of a pause left).
+//! `common.js`: the clock at 10:21, 4,780 refused, 44 %, and 4:37 of a pause left). Round 8 changes them in
+//! one place: the lane's first four cells, x 0 to 96, say `HOME` (spec 3.3), and no name shows there. The
+//! scenes are the same moments of the same runs, with what stood in those cells gone from view.
 //!
-//! The names are public ad domains, `example.org` and `example.com`, and the client is in the
-//! documentation range. Where the mockup shows a name that is not on its public list of ads, the name
-//! here is one of the same length, so the lane's and the card's geometry are the mockup's.
+//! The names are public ad domains, `example.org` and `example.com`. Where the mockup shows a name that is
+//! not on its public list of ads, the name here is one of the same length, so the lane's geometry is the
+//! mockup's.
 //!
 //! The mockup's funnel in the busy stills is its `fill(146)` and then the landings of its seed-7
 //! traffic: `Drain::prefill`, and then the same runs landed one after another. Only the lengths of the
 //! runs are kept (`NORMAL_LANDINGS`, `PAUSED_LANDINGS`), found by running the mockup's own code; the
 //! names that made them are not reproduced, and a name that is landed later in a still lands as usual.
 
-use std::net::{IpAddr, Ipv4Addr};
-
-use super::{AlertCard, Drain, NameKind, Stills, TileStyle};
-use crate::format::{alert_card, gate_fill};
+use super::{Drain, NameKind, Stills};
+use crate::format::gate_fill;
 use crate::state::{Blocking, LaneWords, Share, TimeOfDay};
 
 /// Which still to make; each is named for the mockup's still it reproduces.
@@ -26,12 +26,6 @@ pub enum Fixture {
     Normal,
     /// Blocking is paused, with 4:37 left, and a listed name crosses the gate outlined.
     Paused,
-    /// The normal scene, with a high severity alert over its lower right.
-    Alert,
-    /// The normal scene, with a blue alert for a new device.
-    AlertLow,
-    /// The normal scene, with an alert whose subject takes two lines.
-    AlertLong,
     /// Wi-Fi not joined: the lane says so, the funnel is empty and the figures are dashes.
     Boot,
     /// Joined, and no query yet: the lane says it is listening and the count is a true 0.
@@ -52,12 +46,9 @@ pub enum Fixture {
 
 impl Fixture {
     /// Every fixture, in the order of the mockup's page.
-    pub const ALL: [Fixture; 13] = [
+    pub const ALL: [Fixture; 10] = [
         Fixture::Normal,
         Fixture::Paused,
-        Fixture::Alert,
-        Fixture::AlertLow,
-        Fixture::AlertLong,
         Fixture::Boot,
         Fixture::Listening,
         Fixture::Quiet,
@@ -68,14 +59,11 @@ impl Fixture {
         Fixture::Pct100,
     ];
 
-    /// The mockup's name for the still: `normal`, `alert-low`, and so on. A golden is `drain-<name>.png`.
+    /// The mockup's name for the still: `normal`, `quiet`, and so on. A golden is `drain-<name>.png`.
     pub const fn name(self) -> &'static str {
         match self {
             Fixture::Normal => "normal",
             Fixture::Paused => "paused",
-            Fixture::Alert => "alert",
-            Fixture::AlertLow => "alert-low",
-            Fixture::AlertLong => "alert-long",
             Fixture::Boot => "boot",
             Fixture::Listening => "listening",
             Fixture::Quiet => "quiet",
@@ -109,6 +97,9 @@ const COUNT: u32 = 4780;
 /// The seconds left of the pause in the paused still.
 const PAUSE_LEFT_SECS: u16 = 277;
 
+/// The length of the pause the paused still is in: five minutes, the mockup's.
+const PAUSE_TOTAL_SECS: u16 = 300;
+
 /// The minutes the quiet still has been quiet for.
 const QUIET_MINUTES: u32 = 47;
 
@@ -141,47 +132,14 @@ const CROSSING: &str = "amazon-adsystem.com";
 /// The Drain and the figures of one of the stills.
 pub fn drain_fixture(which: Fixture) -> (Drain, Stills) {
     match which {
-        Fixture::Normal => refusing(COUNT, Share::Percent(PERCENT), None),
+        Fixture::Normal => refusing(COUNT, Share::Percent(PERCENT)),
         Fixture::Paused => paused(),
-        Fixture::Alert => refusing(
-            COUNT,
-            Share::Percent(PERCENT),
-            Some(alert_card(
-                "phishing_blocked",
-                true,
-                // 23 letters, as the mockup's.
-                "verify-site.example.org",
-                // Nine characters, like the mockup's `10.0.0.23`.
-                Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3))),
-            )),
-        ),
-        Fixture::AlertLow => refusing(
-            COUNT,
-            Share::Percent(PERCENT),
-            Some(AlertCard {
-                high: false,
-                title: ["NEW".to_string(), "DEVICE".to_string()],
-                subject: ["192.0.2.7 joined".to_string(), String::new()],
-                who: "first seen 10:19".to_string(),
-            }),
-        ),
-        Fixture::AlertLong => refusing(
-            COUNT,
-            Share::Percent(PERCENT),
-            Some(alert_card(
-                "phishing_blocked",
-                true,
-                // 44 letters, as the mockup's: it breaks after the dot, into 20 and 24.
-                "secure-login-verify.billing-site.example.com",
-                Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 3))),
-            )),
-        ),
         Fixture::Boot => boot(),
         Fixture::Listening => listening(),
         Fixture::Quiet => quiet(),
         Fixture::Long => long(),
-        Fixture::Five => refusing(12_480, Share::Percent(PERCENT), None),
-        Fixture::Six => refusing(104_780, Share::Percent(37), None),
+        Fixture::Five => refusing(12_480, Share::Percent(PERCENT)),
+        Fixture::Six => refusing(104_780, Share::Percent(37)),
         Fixture::Pct0 => pct0(),
         Fixture::Pct100 => pct100(),
     }
@@ -195,7 +153,7 @@ fn stills(percent: Option<Share>, count: Option<u32>) -> Stills {
         blocking: Blocking::On,
         gate_fill: 0,
         count,
-        alert: None,
+        gate_ask: false,
         words: None,
     }
 }
@@ -225,9 +183,9 @@ fn tick_until(drain: &mut Drain, paused: bool, done: impl Fn(&Drain) -> bool) {
     }
 }
 
-/// A refused name stopped at the gate and melting, with a plain one that has gone on ahead of it, over
-/// a full funnel; `count` is what the day's figure and the count show, and `alert` a card over the lower right.
-fn refusing(count: u32, percent: Share, alert: Option<AlertCard>) -> (Drain, Stills) {
+/// A refused name stopped at the gate and melting, with a plain one that has gone on ahead of it (under `HOME`
+/// by now), over a full funnel; `count` is what the day's figure and the count show.
+fn refusing(count: u32, percent: Share) -> (Drain, Stills) {
     let mut drain = funnel_of_the_day(&NORMAL_LANDINGS);
     drain.offer(AHEAD, NameKind::Plain);
     drain.offer(REFUSED, NameKind::Refused);
@@ -236,11 +194,7 @@ fn refusing(count: u32, percent: Share, alert: Option<AlertCard>) -> (Drain, Sti
     tick_until(&mut drain, false, |drain| {
         drain.refusal_step() == Some(NORMAL_STEP)
     });
-    let still = Stills {
-        alert,
-        ..stills(Some(percent), Some(count))
-    };
-    (drain, still)
+    (drain, stills(Some(percent), Some(count)))
 }
 
 /// A listed name crossing the gate while it is paused, outlined, with a plain one gone on ahead of it.
@@ -250,18 +204,20 @@ fn paused() -> (Drain, Stills) {
     drain.set_blocked_today(Some(COUNT));
     drain.offer(AHEAD_PAUSED, NameKind::Plain);
     drain.offer(CROSSING, NameKind::Listed);
-    // The listed name's first letter has crossed the gate, into the cell right of it.
+    // The listed name's first letter has crossed the gate, into the first cell past it: that is under `HOME`
+    // now, so the moment is read from the model.
     tick_until(&mut drain, true, |drain| {
         drain
-            .lane()
-            .any(|tile| tile.cell == 16 && tile.ch == 'a' && tile.style == TileStyle::Listed)
+            .names
+            .iter()
+            .any(|name| name.kind == NameKind::Listed && name.head == 16)
     });
     let blocking = Blocking::Paused {
         left_secs: PAUSE_LEFT_SECS,
     };
     let still = Stills {
         blocking,
-        gate_fill: gate_fill(PAUSE_LEFT_SECS),
+        gate_fill: gate_fill(PAUSE_LEFT_SECS, PAUSE_TOTAL_SECS),
         ..stills(Some(Share::Percent(PERCENT)), Some(COUNT))
     };
     (drain, still)
@@ -314,17 +270,16 @@ fn quiet() -> (Drain, Stills) {
     (drain, still)
 }
 
-/// Nothing refused yet today: `0%`, an empty funnel, and a plain name passing the gate's cell.
+/// Nothing refused yet today: `0%`, an empty funnel, and a plain name that has passed the gate.
 fn pct0() -> (Drain, Stills) {
     let mut drain = Drain::new(SEED);
     drain.set_blocked_today(Some(0));
     // 14 letters, as the mockup's `api.github.com`.
     drain.offer("my.example.com", NameKind::Plain);
-    // The name's first letter is in cell 17, left of the gate, as the mockup stops it.
+    // The name's first letter is in cell 17, left of the gate, as the mockup stops it: under `HOME` now, so
+    // the moment is read from the model.
     tick_until(&mut drain, false, |drain| {
-        drain
-            .lane()
-            .any(|tile| tile.cell == 17 && tile.ch == 'm' && tile.melt == super::Melt::Whole)
+        drain.names.iter().any(|name| name.head == 17)
     });
     (drain, stills(Some(Share::Zero), Some(0)))
 }
@@ -345,6 +300,7 @@ fn pct100() -> (Drain, Stills) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Melt, Shade, TileStyle};
     use super::*;
 
     #[test]
@@ -352,30 +308,24 @@ mod tests {
         let (drain, stills) = drain_fixture(Fixture::Normal);
         assert_eq!(drain.refusal_step(), Some(NORMAL_STEP));
         assert!(drain.door_shut());
-        // `rubiconproject~` melts: 5 tiles slump, 5 puddle and 5 sag, and the plain name's `com` is ahead.
+        // `rubiconproject~` melts: 5 tiles slump, 5 puddle and 5 sag. The plain name that went ahead of it is
+        // under `HOME`, and has left the lane.
         let melt = |melt| drain.lane().filter(|tile| tile.melt == melt).count();
         assert_eq!(
-            (
-                melt(super::super::Melt::Slump),
-                melt(super::super::Melt::Puddle),
-                melt(super::super::Melt::Sag)
-            ),
+            (melt(Melt::Slump), melt(Melt::Puddle), melt(Melt::Sag)),
             (5, 5, 5)
         );
-        let ahead: Vec<_> = drain
-            .lane()
-            .filter(|tile| tile.style == TileStyle::Plain)
-            .map(|tile| (tile.cell, tile.ch))
-            .collect();
-        assert_eq!(ahead, [(17, 'm'), (18, 'o'), (19, 'c')]);
+        assert!(drain.lane().all(|tile| tile.style == TileStyle::Refused));
+        assert_eq!(drain.lane().count(), 15);
+        assert_eq!(drain.names.len(), 1, "the name ahead has left the lane");
         assert_eq!(drain.count(), Some(COUNT), "one refused name is held back");
         assert_eq!(stills.count, drain.count());
-        assert_eq!(stills.alert, None);
+        assert!(!stills.gate_ask);
         assert_eq!(stills.words, None);
     }
 
     #[test]
-    fn the_paused_still_has_a_plain_name_gone_ahead_and_a_listed_one_crossing() {
+    fn the_paused_still_has_a_listed_name_crossing_the_gate_and_none_ahead() {
         let (drain, stills) = drain_fixture(Fixture::Paused);
         assert_eq!(stills.blocking, Blocking::Paused { left_secs: 277 });
         assert_eq!(stills.gate_fill, 1);
@@ -386,46 +336,17 @@ mod tests {
                 .map(|tile| tile.cell)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(at(TileStyle::Plain), [18, 19], "the `rg` of the name ahead");
+        assert!(
+            at(TileStyle::Plain).is_empty(),
+            "the name ahead is under `HOME`, and gone"
+        );
         assert_eq!(
-            at(TileStyle::Listed).len(),
-            17,
-            "`amazon-adsystem.c` is on the screen, from cell 16 to cell 0"
+            at(TileStyle::Listed),
+            (0..16).collect::<Vec<_>>(),
+            "`mazon-adsystem.c` is on the screen, from cell 15 to cell 0; its first letter is under `HOME`"
         );
         assert_eq!(drain.refusal_step(), None);
         assert!(!drain.door_shut());
-    }
-
-    #[test]
-    fn the_alert_stills_are_the_normal_one_with_a_card() {
-        let (_, normal) = drain_fixture(Fixture::Normal);
-        for which in [Fixture::Alert, Fixture::AlertLow, Fixture::AlertLong] {
-            let (_, alert) = drain_fixture(which);
-            assert!(alert.alert.is_some(), "{}", which.name());
-            assert_eq!(
-                Stills {
-                    alert: None,
-                    ..alert
-                },
-                normal,
-                "{}",
-                which.name()
-            );
-        }
-        let (_, alert) = drain_fixture(Fixture::Alert);
-        let card = alert.alert.as_ref().expect("the alert still has a card");
-        assert!(card.high);
-        assert_eq!(card.title, ["PHISHING", "BLOCKED"]);
-        assert_eq!(card.subject, ["verify-site.example.org", ""]);
-        assert_eq!(card.who, "asked by 192.0.2.3");
-        let (_, low) = drain_fixture(Fixture::AlertLow);
-        assert!(!low.alert.is_some_and(|card| card.high));
-        let (_, long) = drain_fixture(Fixture::AlertLong);
-        let card = long.alert.expect("the long alert has a card");
-        assert_eq!(
-            card.subject,
-            ["secure-login-verify.", "billing-site.example.com"]
-        );
     }
 
     #[test]
@@ -442,8 +363,7 @@ mod tests {
         assert!(
             drain
                 .lane()
-                .all(|tile| tile.style == TileStyle::Refused
-                    && tile.melt == super::super::Melt::Whole)
+                .all(|tile| tile.style == TileStyle::Refused && tile.melt == Melt::Whole)
         );
     }
 
@@ -484,7 +404,11 @@ mod tests {
         let (drain, zero) = drain_fixture(Fixture::Pct0);
         assert_eq!((zero.percent, zero.count), (Some(Share::Zero), Some(0)));
         assert!(drain.funnel().iter().all(|cell| cell.shade.is_none()));
-        assert_eq!(drain.lane().count(), 14, "the name has come in whole");
+        assert_eq!(
+            drain.lane().count(),
+            12,
+            "the name has come in whole, 14 letters from cell 17: two are under `HOME`"
+        );
         let (drain, all) = drain_fixture(Fixture::Pct100);
         assert_eq!((all.percent, all.count), (Some(Share::All), Some(3)));
         assert_eq!(all.words, None);
@@ -498,11 +422,7 @@ mod tests {
                 .count()
         };
         assert_eq!(
-            (
-                lit(super::super::Shade::Blue),
-                lit(super::super::Shade::Mid),
-                lit(super::super::Shade::Dark)
-            ),
+            (lit(Shade::Blue), lit(Shade::Mid), lit(Shade::Dark)),
             (9, 15, 10)
         );
         assert_eq!(

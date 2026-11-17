@@ -56,6 +56,11 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// The rectangle at `x`, `y` that is `w` wide and `h` high.
+    pub const fn new(x: u16, y: u16, w: u16, h: u16) -> Self {
+        Self { x, y, w, h }
+    }
+
     /// Whether the pixel is inside: columns `x..x + w`, rows `y..y + h`, ends excluded.
     pub const fn contains(&self, x: u16, y: u16) -> bool {
         // Subtracting first cannot overflow, where `self.x + self.w` could.

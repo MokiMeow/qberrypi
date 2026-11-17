@@ -109,6 +109,15 @@ impl<K: Hash + Eq + Clone, V> Lru<K, V> {
         self.map.len()
     }
 
+    /// About how many bytes of the heap the map and the slots hold at their capacity, not
+    /// counting what a key or a value holds of its own: each slot, and for each place in the map
+    /// a key, an index and its control byte.
+    pub(crate) fn table_bytes(&self) -> usize {
+        let slot = std::mem::size_of::<Slot<K, V>>();
+        let place = std::mem::size_of::<(K, usize)>() + 1;
+        self.slots.capacity() * slot + self.map.capacity() * place
+    }
+
     /// Takes the least recently used entry out of the map and the use list.
     fn evict_oldest(&mut self) -> Option<(K, V)> {
         let at = self.oldest;

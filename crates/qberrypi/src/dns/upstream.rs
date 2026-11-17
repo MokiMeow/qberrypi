@@ -31,7 +31,9 @@
 //! the first session that is up answers. A question that finds a connection opening its session
 //! waits for it, and one that was open on a session that the server ended is sent again on the
 //! next; neither is a failure. A question that finds every connection down (in its backoff) waits
-//! for one within its own wait, and is not failed for the want of one before that.
+//! for one within its own wait, and is not failed for the want of one before that: it hurries
+//! their backoffs (`Conn::hurry`), so that no burst leaves every upstream down for long while
+//! questions wait.
 //!
 //! Nothing here logs a name that is asked for: the only lines are about the upstreams.
 
@@ -50,8 +52,8 @@ use qb_dns::{Pending, Transport, UpstreamOutcome};
 use rustix::net::RecvFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest, Ready};
 use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
-use tokio::time::{Instant, Sleep, sleep_until, timeout};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
+use tokio::time::{Instant, Sleep, sleep, sleep_until, timeout};
 
 use super::dot::{Conn, ConnCounts, ConnOptions, Link, TlsUpstream};
 use super::listen::TCP_CLIENTS;
@@ -510,16 +512,20 @@ struct TlsLeg {
     cold: bool,
     /// The answer, or why there is none. The question is queued already: this is only waited on.
     answer: Pin<Box<dyn Future<Output = io::Result<Vec<u8>>> + Send>>,
+    /// Told when the question is written to the session: it may wait in the queue first.
+    written: Option<oneshot::Receiver<()>>,
 }
 
 impl TlsLeg {
     /// Asks `query` on the connection `conns[index]`, now.
     fn ask(conns: &[Conn], index: usize, query: &[u8]) -> Self {
+        let (answer, written) = conns[index].ask_noting_write(query.to_vec());
         Self {
             index,
             sent: Instant::now(),
             cold: !conns[index].is_up(),
-            answer: Box::pin(conns[index].ask(query.to_vec())),
+            answer: Box::pin(answer),
+            written: Some(written),
         }
     }
 }
@@ -651,7 +657,18 @@ impl TlsAsk<'_> {
             );
         }
         let mut hedge_due = hedge.is_some();
-        let hedge_timer = sleep_until(start + hedge.unwrap_or(left));
+        // The hedge delay counts from the write of the preferred one's question, not from its
+        // queueing: a question that waits behind a burst for room on its session is not sent to
+        // the other upstream for that wait, which would double the burst. The end of the wait
+        // still bounds it.
+        let written = legs.first_mut().and_then(|leg| leg.written.take());
+        let delay = hedge.unwrap_or(left);
+        let hedge_timer = async move {
+            if let Some(written) = written {
+                let _ = written.await;
+            }
+            sleep(delay).await;
+        };
         let mut hedge_timer = pin!(hedge_timer);
         let mut down = true;
         while !legs.is_empty() || unsent.peek().is_some() {
@@ -1083,9 +1100,25 @@ impl Upstreams {
                         idle_closes: all.idle_closes + one.idle_closes,
                         server_closes: all.server_closes + one.server_closes,
                         retried: all.retried + one.retried,
+                        unretried: all.unretried + one.unretried,
                     }),
             },
         }
+    }
+
+    /// The most questions that go out on one session at once, the lowest of the connections':
+    /// [`SESSION_IN_FLIGHT`](super::dot::SESSION_IN_FLIGHT) unless a server that ended busy
+    /// sessions had it lowered. `None` before [`Upstreams::start_tls`].
+    pub fn session_cap(&self) -> Option<usize> {
+        self.started_tls()?.iter().map(Conn::limit).min()
+    }
+
+    /// What each connection is doing about its session, in the order of the upstreams; empty
+    /// before [`Upstreams::start_tls`]. For the measurements.
+    #[cfg(test)]
+    pub(crate) fn links(&self) -> Vec<Link> {
+        self.started_tls()
+            .map_or_else(Vec::new, |conns| conns.iter().map(Conn::link).collect())
     }
 
     /// The connections, if [`Upstreams::start_tls`] has opened them.
@@ -1307,7 +1340,12 @@ impl Upstreams {
         for _ in 0..TLS_ROUNDS {
             if conns.iter().all(|conn| conn.link() == Link::Down) {
                 // The wait for a connection that can be asked, which the end of the wait cuts
-                // short: the upstreams that never had one are failures.
+                // short: the upstreams that never had one are failures. A question waits, so the
+                // backoffs end soon: a burst that made the server end sessions does not leave
+                // every upstream down for half a minute.
+                for conn in conns {
+                    conn.hurry();
+                }
                 tokio::select! {
                     biased;
                     () = deadline_timer.as_mut() => {
@@ -3637,6 +3675,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn after_a_burst_that_made_the_servers_end_busy_sessions_forwarding_works_at_once() {
+        // Two servers that end a session as they read a question while 8 are out, with the
+        // connections' standard waits: a burst of fresh names must not leave the upstreams down
+        // once it is over (it left both in backoff for many seconds, 2026-11-12).
+        let mode = TlsMode {
+            max_in_flight: Some(8),
+            handshake_delay: ms(50),
+            ..TlsMode::default()
+        };
+        let first = TlsFakeUpstream::start_with(Reply::After(ms(20), ip("192.0.2.10")), mode);
+        let second = TlsFakeUpstream::start_with(Reply::After(ms(20), ip("192.0.2.20")), mode);
+        let ups = Upstreams::with(vec![closed_port(), closed_port()], UDP_WAIT, TCP_WAIT)
+            .with_tls_at(
+                tls_for_fakes(&[&first, &second]),
+                vec![first.addr, second.addr],
+            );
+        ups.start_tls();
+        until_up(&ups, 2).await;
+        let ups = Arc::new(ups);
+        // 500 fresh names a second for 4 s, 50 at a time.
+        let mut burst = tokio::task::JoinSet::new();
+        for batch in 0..40 {
+            for n in 0..50 {
+                let ups = ups.clone();
+                burst.spawn(async move { run(&ups, &format!("b{batch}n{n}.example.com")).await });
+            }
+            sleep(ms(100)).await;
+        }
+        let mut answered = 0;
+        while let Some(done) = burst.join_next().await {
+            answered += usize::from(done.unwrap().0.is_some());
+        }
+        // Over: a question now is answered, within a household's patience, by either upstream.
+        let (answer, took) = run(&ups, "after.example.org").await;
+        let links = ups.links();
+        assert!(
+            answer.is_some() && took < ms(1000),
+            "after the burst: {answer:?} in {took:?}, links {links:?}, {answered} of the burst \
+             answered, {:?}",
+            ups.tls()
+        );
+        // And most of the burst was answered on the way, not failed.
+        assert!(answered > 1000, "{answered} of 2,000 answered");
+    }
+
+    #[tokio::test]
+    async fn a_question_that_waits_for_room_on_its_session_is_not_hedged_for_that_wait() {
+        // Two servers that answer in 30 ms: the hedge delay is about 60 ms.
+        let first = TlsFakeUpstream::start(Reply::After(ms(30), ip("192.0.2.10")));
+        let second = TlsFakeUpstream::start(Reply::After(ms(30), ip("192.0.2.20")));
+        let ups = Upstreams::with(vec![closed_port(), closed_port()], UDP_WAIT, TCP_WAIT)
+            .with_tls_at(
+                tls_for_fakes(&[&first, &second]),
+                vec![first.addr, second.addr],
+            );
+        ups.start_tls();
+        until_up(&ups, 2).await;
+        for n in 0..10 {
+            assert!(run(&ups, &format!("warm{n}.example.com")).await.0.is_some());
+        }
+        let before = first.queries() + second.queries();
+        // 96 at once: the preferred session takes 16 at a time, so the last wait 150 ms and more
+        // in its queue, far past the hedge delay. Counted from the write, none is hedged.
+        let ups = Arc::new(ups);
+        let mut burst = tokio::task::JoinSet::new();
+        for n in 0..96 {
+            let ups = ups.clone();
+            burst.spawn(async move { run(&ups, &format!("q{n}.example.com")).await });
+        }
+        while let Some(done) = burst.join_next().await {
+            assert!(done.unwrap().0.is_some());
+        }
+        let sent = first.queries() + second.queries() - before;
+        assert!(sent <= 96 + 8, "{sent} questions for 96");
+    }
+
+    #[tokio::test]
     async fn a_question_while_both_sessions_reconnect_is_answered() {
         // Each fake closes a session after one answer, and the first question is asked of both
         // (there is no latency figure yet): both sessions end together.
@@ -3652,6 +3767,7 @@ mod tests {
             backoff_max: ms(100),
             min_lived: Duration::ZERO,
             idle: Duration::from_secs(60),
+            ..ConnOptions::default()
         };
         let ups = Upstreams::with(vec![closed_port(), closed_port()], ms(10_000), ms(10_000))
             .with_tls_at(

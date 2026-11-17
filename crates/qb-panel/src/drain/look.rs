@@ -28,34 +28,12 @@ impl Area {
     }
 }
 
-// Colours: the round 5 palette, and nothing else.
+// Colours: the round 5 palette, and nothing else. It is the whole panel's now and lives in `ui::look`;
+// these names stay where the Drain's code reads them.
 
-/// The ground of the screen.
-pub const GROUND: Rgb = [0x00, 0x00, 0x00];
-/// The accent: refused tiles, the funnel's first shade, the key, the gate.
-pub const BLUE: Rgb = [0x4a, 0x72, 0xff];
-/// The light blue.
-pub const BLUE_LT: Rgb = [0xa4, 0xb6, 0xff];
-/// The mid blue.
-pub const BLUE_MD: Rgb = [0x31, 0x52, 0xc4];
-/// The funnel's second shade.
-pub const BLUE_DK: Rgb = [0x1f, 0x33, 0x83];
-/// The fill of a plain tile.
-pub const BLUE_DEEP: Rgb = [0x12, 0x1b, 0x44];
-/// The ink on the lit key.
-pub const BLUE_NIGHT: Rgb = [0x0c, 0x12, 0x30];
-/// Values, outlines and the paused key.
-pub const WHITE: Rgb = [0xff, 0xff, 0xff];
-/// The brightest grey: a plain tile's letter, the clock and the paused key's label.
-pub const G1: Rgb = [0xd0, 0xd0, 0xd0];
-/// The `REFUSED` label.
-pub const G2: Rgb = [0x8e, 0x8e, 0x8e];
-/// The third grey.
-pub const G3: Rgb = [0x5e, 0x5e, 0x5e];
-/// The rails the lane runs between.
-pub const G4: Rgb = [0x2e, 0x2e, 0x2e];
-/// The darkest grey.
-pub const G5: Rgb = [0x18, 0x18, 0x18];
+pub use crate::ui::look::{
+    BLUE, BLUE_DEEP, BLUE_DK, BLUE_LT, BLUE_MD, BLUE_NIGHT, G1, G2, G3, G4, G5, GROUND, WHITE,
+};
 
 // The lane. A model cell is a letter's place; cell 0 is at the right edge, where names enter, and cell 19 at the left.
 
@@ -291,47 +269,66 @@ pub const KEY_BIG_ON: &str = "SHUT";
 /// The width of the paused key's white outline, which is drawn inside the key.
 pub const KEY_STROKE: f32 = 4.0;
 
-// The alert takeover: one card claims this region until it is tapped.
+// HOME, in the lane's first four cells (spec 3.3): LIVE gives the cells left of the gate to the OS's `HOME`.
 
-/// The card: inset 8 px from the gate and from the right edge, and standing on the floor. A tap anywhere on it dismisses the alert.
-pub const ALERT: Area = Area::new(128.0, 80.0, 344.0, 224.0);
-/// The field the takeover clears to black before the card is drawn, so that nothing of the funnel or the count shows around it.
-pub const ALERT_FIELD: Area = Area::new(120.0, 80.0, 360.0, 240.0);
-/// The height of the stub at the card's foot, which holds `TAP TO DISMISS`: the paused key's outline.
-pub const ALERT_STUB_H: f32 = 44.0;
-/// The width of the stub's rim, in the card's colour.
-pub const ALERT_STUB_RIM: f32 = 4.0;
-/// The left edge of the title lines, from the card's left.
-pub const ALERT_TITLE_DX: f32 = 14.0;
-/// The baselines of the two title lines, from the card's top.
-pub const ALERT_TITLE_DY: [f32; 2] = [45.0, 87.0];
-/// The size of the title lines, in bold ink.
-pub const ALERT_TITLE_PX: f32 = 40.0;
-/// The left edge of the subject and who lines, from the card's left.
-pub const ALERT_TEXT_DX: f32 = 15.0;
-/// The baseline of the card's last line, from the card's top: 15 px above the slab's foot.
-pub const ALERT_LAST_DY: f32 = ALERT.h - ALERT_STUB_H - 15.0;
-/// The size of the subject, in bold ink.
-pub const ALERT_SUBJECT_PX: f32 = 20.0;
-/// The distance between the baselines of the subject's two lines.
-pub const ALERT_SUBJECT_LEADING: f32 = 23.0;
-/// The size of the who line, in regular ink, on the card's last baseline.
-pub const ALERT_WHO_PX: f32 = 18.0;
-/// How much higher the subject's last line stands when there is a who line.
-pub const ALERT_WHO_LIFT: f32 = 24.0;
-/// The stub's text, centred, in bold white.
-pub const ALERT_STUB_TEXT: &str = "TAP TO DISMISS";
-/// The stub text's baseline, from the card's top.
-pub const ALERT_STUB_TEXT_DY: f32 = ALERT.h - ALERT_STUB_H + 27.0;
-/// The size of the stub's text.
-pub const ALERT_STUB_PX: f32 = 20.0;
-/// The extra space after each letter of the stub's text.
-pub const ALERT_STUB_TRACKING: f32 = 2.0;
-/// The ink of everything on the card that is not in its colour.
-pub const ALERT_INK: Rgb = GROUND;
-/// How many cells a title line has before it is cut: the room right of the card's margin at 40 px, 24 px a letter.
-pub const ALERT_TITLE_CELLS: usize = 13;
-/// How many cells a line of the subject has: the card's width less its margins at 20 px, 12 px a letter. A longer subject wraps onto a second line, and past two lines its start goes.
-pub const ALERT_SUBJECT_CELLS: usize = 26;
-/// How many cells the who line has before it is cut: the same room at 18 px, 10.8 px a letter.
-pub const ALERT_WHO_CELLS: usize = 29;
+/// How many of the lane's cells, from the left edge, say `HOME`: four, x 0 to 96, left of the gate.
+pub const HOME_CELLS: u8 = 4;
+/// The first model cell that is under `HOME`: a name's tile never shows there, so a passing name leaves the
+/// lane here, in the gate's own cell at the last, instead of running on to the left edge.
+pub const LANE_END: u8 = LANE_CELLS - HOME_CELLS;
+/// The word the first four cells say.
+pub const HOME_WORD: &str = "HOME";
+/// The first letter's centre, and every letter's from the cell: `12 + 24 * cell`, as the lane's letters of
+/// every other screen stand.
+pub const HOME_X: f32 = CELL_W / 2.0;
+/// The letters' baseline.
+pub const HOME_BASELINE: f32 = 45.0;
+/// The size of the letters, in bold.
+pub const HOME_PX: f32 = 24.0;
+
+// The gate ask (spec 3.3, `drawGateAsk`): the key, tapped while the gate is shut, unfolds the gate's choices in
+// place over the field, until a tap or 8 s.
+
+/// The field the ask claims: it clears the funnel and the count to black, from the gate to the screen's right
+/// edge and down to its foot. Its three keys stand on the floor, 8 px in from the edge.
+pub const ASK_FIELD: Area = Area::new(120.0, 80.0, 360.0, 240.0);
+/// The title's left edge, and its baseline.
+pub const ASK_TITLE_X: f32 = 140.0;
+/// The title's baseline.
+pub const ASK_TITLE_BASELINE: f32 = 125.0;
+/// The size of the title, in bold white.
+pub const ASK_TITLE_PX: f32 = 40.0;
+/// The title.
+pub const ASK_TITLE: &str = "OPEN THE GATE";
+/// The left edge of the three lines under the title.
+pub const ASK_LINE_X: f32 = 141.0;
+/// The size of the three lines, in regular.
+pub const ASK_LINE_PX: f32 = 18.0;
+/// The three lines under the title, with their baselines and inks: what the choices do.
+pub const ASK_LINES: [(&str, f32, Rgb); 3] = [
+    ("Ads pass on every device.", 158.0, G1),
+    ("Threats stay blocked.", 182.0, G1),
+    ("GATE SHUT leaves it shut.", 206.0, G2),
+];
+/// The keys' values, left to right: the gate's choices, 5, 30 and 60 minutes (`os::screens::parts::GATE_CHOICES`).
+pub const ASK_KEYS: [&str; 3] = ["5 MIN", "30 MIN", "1 HOUR"];
+/// The left edge of the first choice key.
+pub const ASK_KEY_X0: f32 = 128.0;
+/// The distance between two keys' left edges.
+pub const ASK_KEY_PITCH: f32 = 117.0;
+/// A key's top.
+pub const ASK_KEY_Y: f32 = 224.0;
+/// A key's width.
+pub const ASK_KEY_W: f32 = 110.0;
+/// A key's height.
+pub const ASK_KEY_H: f32 = 80.0;
+/// The width of a key's white outline, drawn inside the key.
+pub const ASK_KEY_STROKE: f32 = 4.0;
+/// A key's top label, `OPEN`, from the key's top to its baseline: `h / 2 - 10`.
+pub const ASK_KEY_LABEL_DY: f32 = 30.0;
+/// The size of the top label, in bold, with `KEY_LABEL_TRACKING` after each letter.
+pub const ASK_KEY_LABEL_PX: f32 = 16.0;
+/// A key's value (`5 MIN`), from the key's top to its baseline: `h / 2 + 22`.
+pub const ASK_KEY_VALUE_DY: f32 = 62.0;
+/// The size of the value, in bold white.
+pub const ASK_KEY_VALUE_PX: f32 = 24.0;

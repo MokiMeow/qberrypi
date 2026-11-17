@@ -202,6 +202,18 @@ impl GlyphCache {
         }
     }
 
+    /// The bytes of memory the cache holds: the slots of its table and each glyph's coverage. The fonts
+    /// are in the binary and not counted.
+    pub fn bytes(&self) -> usize {
+        self.glyphs.capacity() * (size_of::<GlyphKey>() + size_of::<Option<Glyph>>())
+            + self
+                .glyphs
+                .values()
+                .flatten()
+                .map(|glyph| glyph.coverage.capacity())
+                .sum::<usize>()
+    }
+
     /// Renders one glyph at a pen of the fraction `(fx, fy)` of a pixel; `None` for one with no outline or no size that fits the frame.
     fn render(
         font: &FontRef<'static>,

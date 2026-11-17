@@ -402,6 +402,17 @@ impl Resolver {
         self.cache.len()
     }
 
+    /// About how many bytes of the heap the cache holds: its tables, its answers and their names.
+    /// A few loads: the figure is kept as answers come and go.
+    pub fn cache_bytes(&self) -> usize {
+        self.cache.heap_bytes()
+    }
+
+    /// The bytes of the block set's buffers ([`BlockSet::heap_bytes`]).
+    pub fn block_set_bytes(&self) -> usize {
+        self.blockset.heap_bytes()
+    }
+
     /// Steps 2 to 7 of [`Resolver::handle_query_threat`] for a client held to `filter`, and
     /// whether the block of step 4 was of a threat. The canary and block checks come before the
     /// cache, so a blocked name is never answered from it and never touches it.
@@ -1761,6 +1772,13 @@ mod tests {
             r.cache.insert(key(&name, 1, false), vec![0], 60, 0);
         }
         assert_eq!(r.cache_len(), 10_000);
+        // Each answer's byte and its name, of 14 bytes or more, held twice, at the least.
+        assert!(
+            r.cache_bytes() >= 10_000 * (1 + 2 * 14),
+            "{}",
+            r.cache_bytes()
+        );
+        assert_eq!(r.block_set_bytes(), r.blockset.heap_bytes());
 
         // 1,024 names blocked after it push a name out of the 24-hour counts: blocked again, it
         // starts from 1.

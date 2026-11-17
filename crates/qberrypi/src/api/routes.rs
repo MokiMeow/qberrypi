@@ -19,7 +19,10 @@
 //!    `/api/v1/queries`, which takes `n` alone.
 //!
 //! The watchdog's endpoints, everything under `/api/qbp/`, are handed on to [`qbp`] once the
-//! session is valid, and are 404 on an API that was given no watch ([`Api::with_watch`]).
+//! session is valid, and are 404 on an API that was given no watch ([`Api::with_watch`]), but for
+//! `POST /api/qbp/bench`, the load generator against the board's own DNS service ([`bench`]),
+//! which is 404 on an API that was given none ([`Api::with_bench`]), 405 for another method and
+//! 404 with a query string.
 //!
 //! `POST /api/qbp/update` is the one request that is not answered here: its body is far over the
 //! cap that every other request has, so the connection recognises it from the head, asks
@@ -48,6 +51,7 @@ use qb_dns::{Counts, HistoryBucket, LogEntry};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
+use super::bench::{self, Bench};
 use super::http::{Reply, Request};
 use super::password::PasswordHash;
 use super::qbp::{self, QbpWatch};
@@ -156,6 +160,8 @@ pub struct Api {
     /// The update receiver, which the connection hands the body of `POST /api/qbp/update` to;
     /// `None` until [`Api::with_update`].
     update: Option<Receiver>,
+    /// The load generator of `POST /api/qbp/bench`; `None` until [`Api::with_bench`].
+    bench: Option<Bench>,
 }
 
 /// The endpoints, by path.
@@ -221,6 +227,7 @@ impl Api {
             verifying: Mutex::default(),
             qbp: None,
             update: None,
+            bench: None,
         }
     }
 
@@ -235,6 +242,13 @@ impl Api {
     /// body of that request to it. Without it the path is 404.
     pub fn with_update(mut self, receiver: Receiver) -> Self {
         self.update = Some(receiver);
+        self
+    }
+
+    /// This API, with `POST /api/qbp/bench` run by `bench`: the load generator against the
+    /// board's own DNS service. Without it the path is 404.
+    pub fn with_bench(mut self, bench: Bench) -> Self {
+        self.bench = Some(bench);
         self
     }
 
@@ -283,6 +297,14 @@ impl Api {
                 _ if query.is_some() => error(404, NOT_FOUND, started),
                 (None, _) => error(404, NOT_FOUND, started),
                 (Some(_), "POST") => error(400, NOT_STREAMED, started),
+                (Some(_), _) => error(405, METHOD_NOT_ALLOWED, started),
+            };
+        }
+        if path == bench::PATH {
+            return match (&self.bench, request.method.as_str()) {
+                _ if query.is_some() => error(404, NOT_FOUND, started),
+                (None, _) => error(404, NOT_FOUND, started),
+                (Some(bench), "POST") => bench.handle(&request.body, started),
                 (Some(_), _) => error(405, METHOD_NOT_ALLOWED, started),
             };
         }
@@ -1324,6 +1346,52 @@ mod tests {
         let reply = with.handle(&req("POST", path, Some(&sid), b"{}"), ME);
         assert_eq!(reply.status, 400);
         assert_eq!(json(&reply)["error"]["key"], "bad_request");
+    }
+
+    #[test]
+    fn the_bench_path_needs_a_session_and_a_post_and_is_404_without_a_bench() {
+        let without = api(Fake::default());
+        let sid = login(&without);
+        let status = |api: &Api, m: &str, t: &str, sid: Option<&str>, body: &[u8]| {
+            api.handle(&req(m, t, sid, body), ME).status
+        };
+        let path = bench::PATH;
+        let body = br#"{"class": "cached"}"#;
+        assert_eq!(status(&without, "POST", path, Some(&sid), body), 404);
+        assert_eq!(status(&without, "POST", path, None, body), 401);
+
+        let ran = Arc::new(AtomicUsize::new(0));
+        let with = api(Fake::default()).with_bench(Bench::with_runner(Box::new({
+            let ran = ran.clone();
+            move |_| {
+                ran.fetch_add(1, Ordering::Relaxed);
+                Ok(json!({ "max_sustained_qps": 1.0 }))
+            }
+        })));
+        let sid = login(&with);
+        assert_eq!(status(&with, "POST", path, None, body), 401);
+        assert_eq!(status(&with, "POST", path, Some("0000"), body), 401);
+        for method in ["GET", "PUT", "DELETE"] {
+            assert_eq!(
+                status(&with, method, path, Some(&sid), body),
+                405,
+                "{method}"
+            );
+        }
+        assert_eq!(
+            status(&with, "POST", &format!("{path}?x=1"), Some(&sid), body),
+            404
+        );
+        assert_eq!(ran.load(Ordering::Relaxed), 0, "nothing ran before this");
+        let reply = with.handle(&req("POST", path, Some(&sid), body), ME);
+        assert_eq!(reply.status, 200);
+        assert_eq!(json(&reply)["bench"]["max_sustained_qps"], 1.0);
+        assert_eq!(ran.load(Ordering::Relaxed), 1);
+        // The rest of `/api/qbp/` is still the watchdog's: 404 on an API with no watch.
+        assert_eq!(
+            status(&with, "GET", "/api/qbp/alerts", Some(&sid), b""),
+            404
+        );
     }
 
     #[test]

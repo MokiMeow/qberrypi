@@ -588,7 +588,7 @@ fn hex(hash: Sha256) -> String {
 }
 
 /// `yyyymmddThhmmssZ` for the moment `unix` seconds after 1970, in UTC.
-fn stamp(unix: u64) -> Result<String> {
+pub(crate) fn stamp(unix: u64) -> Result<String> {
     let at = OffsetDateTime::from_unix_timestamp(i64::try_from(unix).unwrap_or(i64::MAX))
         .context("the clock of this machine is out of range")?;
     Ok(format!(

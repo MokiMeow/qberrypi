@@ -13,6 +13,11 @@
 //! starts again from the wait for the interface. Without a wireless interface, as in QEMU, it
 //! checks every 30 seconds and says so once, at debug level.
 //!
+//! It also shuts the devices' gates: while one is open it sleeps until the first one is due
+//! ([`Devices::next_gate_deadline`]), also while it waits for the interface, and tells the
+//! inventory to expire the gates then, which republishes who is exempt. The 30 second tick is
+//! far too coarse for that. A gate that is opened while it sleeps wakes it ([`Devices::gate_wake`]).
+//!
 //! Logs say what failed and never what was heard: a run of failures is one WARN line, and no line
 //! holds a MAC, an address or a host name. The kernel's error text may name an operation but
 //! not an address, and it is the only detail a line carries.
@@ -23,13 +28,15 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::fd::OwnedFd;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::pin::pin;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use rustix::net::{AddressFamily, RecvFlags, SocketFlags, SocketType, bind, socket_with, sockopt};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UdpSocket;
-use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
+use tokio::sync::Notify;
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, sleep_until};
 
 use super::devices::{Devices, with_devices};
 use super::frames::{Mac, parse_arp, parse_dhcp, parse_mdns};
@@ -135,10 +142,62 @@ async fn run_in(
     }
 }
 
-/// Waits `time`, and then tells the inventory to check its deadline.
+/// Waits `time`, shutting the gates that come due meanwhile, and then tells the inventory to check
+/// its learning deadline.
 async fn pause(devices: &Mutex<Devices>, sink: &dyn AlertSink, time: Duration) {
-    sleep(time).await;
+    let end = Instant::now() + time;
+    let mut gate = pin!(gate_due(devices));
+    loop {
+        tokio::select! {
+            () = sleep_until(end) => break,
+            () = gate.as_mut() => {
+                with(devices, sink, expire_gates);
+                gate.set(gate_due(devices));
+            }
+        }
+    }
     with(devices, sink, Devices::tick);
+}
+
+/// Shuts the gates that are due by the inventory's clock.
+fn expire_gates(inventory: &mut Devices) {
+    let now = inventory.mono_now();
+    inventory.expire_gates(now);
+}
+
+/// Completes when an open gate is due: when the clock of the inventory has reached the first
+/// deadline. With no gate open it waits for ever, and a gate that is opened meanwhile wakes it to
+/// look again; a gate that is opened for a time that ends sooner than the one it waits for is
+/// found the same way. Dropping the future loses nothing: the deadlines are the inventory's, and
+/// the next call looks at them again.
+///
+/// The deadlines are whole seconds of the monotonic clock, so it sleeps the whole seconds that are
+/// left, which never ends early, and looks again if the clock does not read the deadline yet.
+async fn gate_due(devices: &Mutex<Devices>) {
+    let wake: Arc<Notify> = peek(devices, Devices::gate_wake);
+    loop {
+        // A wake-up that comes while the deadline is read is kept for the wait below.
+        let woken = wake.notified();
+        let left = peek(devices, |inventory| {
+            let now = inventory.mono_now();
+            inventory
+                .next_gate_deadline()
+                .map(|deadline| deadline.saturating_sub(now))
+        });
+        match left {
+            Some(0) => return,
+            Some(secs) => tokio::select! {
+                () = woken => {}
+                () = sleep(Duration::from_secs(secs)) => {}
+            },
+            None => woken.await,
+        }
+    }
+}
+
+/// What `read` says of the inventory, which is locked for that call alone and is not changed.
+fn peek<R>(devices: &Mutex<Devices>, read: impl FnOnce(&Devices) -> R) -> R {
+    read(&devices.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 /// Calls `call` with the inventory, which is locked for that call alone; what it makes alerts of
@@ -185,6 +244,7 @@ async fn watch(
     let mut mdns_buffer = [0u8; DATAGRAM_BUFFER];
     let mut ticker = interval_at(Instant::now() + TICK_EVERY, TICK_EVERY);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut gate = pin!(gate_due(devices));
     loop {
         tokio::select! {
             read = recv_frame(&arp, &mut arp_buffer) => {
@@ -209,6 +269,10 @@ async fn watch(
                 });
             }
             _ = ticker.tick() => with(devices, sink, Devices::tick),
+            () = gate.as_mut() => {
+                with(devices, sink, expire_gates);
+                gate.set(gate_due(devices));
+            }
         }
     }
 }
@@ -318,7 +382,7 @@ fn into_tokio(fd: OwnedFd) -> io::Result<UdpSocket> {
 mod tests {
     use super::*;
 
-    use std::net::UdpSocket as StdUdpSocket;
+    use std::net::{IpAddr, UdpSocket as StdUdpSocket};
     use std::sync::PoisonError;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -326,6 +390,7 @@ mod tests {
 
     use super::super::devices::KnownList;
     use crate::alerts::{Alert, NullSink};
+    use crate::dns::exempt::Exemption;
     use crate::net::loopback_up;
     use crate::netlink::route::Route;
     use crate::wifi::eapol::{LinkSocket, build};
@@ -547,6 +612,78 @@ mod tests {
         }
     }
 
+    /// An inventory with the device `mac(5)` at `.5` and the device `mac(6)` at `.6`, which keeps the
+    /// set for the DNS side in `exemption`, and reads the clock of the runtime.
+    fn inventory_with_two() -> (Arc<Mutex<Devices>>, Arc<Exemption>) {
+        let start = Instant::now();
+        let clock = Arc::new(move || (start.elapsed().as_secs(), 1_800_000_000));
+        let exemption = Arc::new(Exemption::new());
+        let mut devices = Devices::new(None, GATEWAY, clock).with_exemption(exemption.clone());
+        for (mac, ip) in [(mac(5), ip(5)), (mac(6), ip(6))] {
+            devices.on_arp(&crate::watch::frames::Arp {
+                op: 1,
+                sender_mac: mac,
+                sender_ip: ip,
+                target_ip: ip,
+            });
+        }
+        (Arc::new(Mutex::new(devices)), exemption)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_gate_shuts_when_it_is_due_also_while_the_watch_waits_for_the_interface() {
+        let (devices, exemption) = inventory_with_two();
+        let mut watch = Box::pin(run(devices.clone(), Arc::new(NullSink), "nosuch0"));
+        // The watch is asleep with no gate open, and waits for ever for one.
+        tokio::select! {
+            ended = &mut watch => panic!("the device watch ended: {ended:?}"),
+            () = sleep(Duration::from_secs(1)) => {}
+        }
+        // A gate opened now wakes it: it is the 90 s from the second it was opened that counts.
+        with(&devices, &NullSink, |inventory| {
+            inventory.open_gate(mac(5), 90).unwrap();
+        });
+        assert!(exemption.is_exempt(IpAddr::V4(ip(5))));
+        tokio::select! {
+            ended = &mut watch => panic!("the device watch ended: {ended:?}"),
+            () = sleep(Duration::from_secs(88)) => {}
+        }
+        // Still open, a second before it is due; and a gate that is due sooner than the one it
+        // waits for is found by the same wake-up.
+        assert!(exemption.is_exempt(IpAddr::V4(ip(5))));
+        with(&devices, &NullSink, |inventory| {
+            inventory.open_gate(mac(6), 5).unwrap();
+        });
+        assert!(exemption.is_exempt(IpAddr::V4(ip(6))));
+        tokio::select! {
+            ended = &mut watch => panic!("the device watch ended: {ended:?}"),
+            () = sleep(Duration::from_millis(6_500)) => {}
+        }
+        let (rev, gates) = {
+            let inventory = devices.lock().unwrap();
+            (inventory.rev(), inventory.next_gate_deadline())
+        };
+        // `.6` shut at its second, and `.5` too, which was due 1.5 s after.
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(6))));
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(5))));
+        assert_eq!(gates, None);
+        // Two gates opened and two shut.
+        assert_eq!(rev, 4);
+        // Nothing is due, and it sleeps on, and a late gate is shut too.
+        tokio::select! {
+            ended = &mut watch => panic!("the device watch ended: {ended:?}"),
+            () = sleep(Duration::from_secs(1000)) => {}
+        }
+        with(&devices, &NullSink, |inventory| {
+            inventory.open_gate(mac(5), 3600).unwrap();
+        });
+        tokio::select! {
+            ended = &mut watch => panic!("the device watch ended: {ended:?}"),
+            () = sleep(Duration::from_secs(3601)) => {}
+        }
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(5))));
+    }
+
     #[test]
     fn an_interface_is_read_from_its_index_and_address() {
         let sysfs = fake_sysfs("wlan9", 7, "02:00:00:00:00:ee");
@@ -618,6 +755,24 @@ mod tests {
                 assert!(!line.contains(heard), "{line}");
             }
         }
+        // A gate that is opened while the sockets are being read shuts by itself, within the
+        // second after its time, with none of the sockets heard from.
+        with(&devices, &NullSink, |inventory| {
+            inventory.open_gate(mac(5), 1).unwrap();
+        });
+        let shut = timeout(Duration::from_secs(5), async {
+            loop {
+                sleep(Duration::from_millis(50)).await;
+                let open = with(&devices, &NullSink, |inventory| {
+                    inventory.next_gate_deadline().is_some()
+                });
+                if !open {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(shut.is_ok(), "the gate did not shut in 5 s");
         watching.abort();
     }
 

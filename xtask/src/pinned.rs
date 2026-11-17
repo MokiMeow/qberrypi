@@ -539,6 +539,27 @@ impl Session {
         )
     }
 
+    /// Posts `body`, JSON, to `path` on a connection of its own, under this session, and reads
+    /// the answer, all within `within`. A run of the Pi's bench holds its connection for up to
+    /// half a minute of the connection's minute, so each is sent on a fresh one.
+    pub fn post_json(&self, path: &str, body: &[u8], within: Duration) -> Result<Response> {
+        let began = Instant::now();
+        let mut link = Link::open(self.addr, self.config.clone(), within)?;
+        let left = within.saturating_sub(began.elapsed());
+        let response = link.request(
+            &Request {
+                method: "POST",
+                path,
+                sid: Some(self.sid.as_str()),
+                content_type: Some("application/json"),
+                body: &[body],
+            },
+            left.max(Duration::from_secs(1)),
+        );
+        link.close();
+        response
+    }
+
     /// Logs out, on a connection of its own (the update's ends with its answer), as well as that
     /// can be done within `wait`. Nothing is raised: an update that was refused is not made worse
     /// by a logout that did not go through, and the session ends by itself.

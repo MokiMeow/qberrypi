@@ -19,9 +19,18 @@
 //!
 //! A session that the server ends (with the close notice, the end of the stream, or a reset)
 //! is no failure either. The questions that were open on it are sent once more on the next
-//! session, which is opened at once (RFC 7766 §6.2.1 and RFC 7858 §3.4: a client is prepared to
-//! reconnect and retry); one that was open on a second session that ended too fails with
-//! `NotConnected`. The asker bounds how long that takes, as with any question.
+//! session, which is opened after up to [`REOPEN_JITTER`] (RFC 7766 §6.2.1 and RFC 7858 §3.4: a
+//! client is prepared to reconnect and retry); one that was open on a second session that ended
+//! too fails with `NotConnected`, and so does one that finds the retry budget spent
+//! ([`RETRY_BURST`]). The asker bounds how long that takes, as with any question.
+//!
+//! A burst is spread, not sent at once: at most [`SESSION_IN_FLIGHT`] questions are out on a
+//! session (those sent in the last [`SEAT_HOLD`]), and the rest wait in the queue for an answer to
+//! make room. A server that ends a session on which half of that or more was out halves the limit
+//! for the next ([`SESSION_IN_FLIGHT_MIN`] at the least). Without that, a burst of fresh names went
+//! out whole, the server ended the session, every question was sent again on the next, which it
+//! ended too, and the backoff of the sessions that ended so soon kept both upstreams down for many
+//! seconds after the burst (2026-11-12).
 //!
 //! The expensive part of a session is its handshake (the certificate checks and the key
 //! exchange, which a Cortex-A53 without AES instructions does in pure Rust): it runs on a thread
@@ -41,8 +50,8 @@
 //! Bounds, all of them fixed here or in [`MAX_FORWARDS`]:
 //! - the TCP connect waits [`CONNECT_WAIT`], and the handshake [`HANDSHAKE_WAIT`] from its first
 //!   byte to its last, however its peer trickles;
-//! - the ask queue holds [`MAX_FORWARDS`] questions, and as many can be out on the session: one
-//!   more is refused at once; so are the questions to be sent again;
+//! - the ask queue holds [`MAX_FORWARDS`] questions, and as many can be open on the session (of
+//!   which [`SESSION_IN_FLIGHT`] hold a place): one more is refused at once;
 //! - a question is at most [`MAX_QUERY`] bytes;
 //! - what is held of the plaintext of the session is at most [`PLAIN_MAX`] bytes;
 //! - a session whose oldest open question is `stall` old, and from which not a byte was read since
@@ -51,9 +60,11 @@
 //!   that is still being read, such a question alone ends, with a `TimedOut` for its asker, so
 //!   that one name that the upstream never answers does not cost the answers of all the others
 //!   their session;
-//! - a reconnect waits [`BACKOFF_MIN`], doubling to [`BACKOFF_MAX`] (see [`backoff`]) for as long
-//!   as the sessions end sooner than [`MIN_LIVED`] after they began, or cannot be opened at all:
-//!   a handshake that completes is no reason to start over, a session that lived is.
+//! - a reconnect waits [`BACKOFF_MIN`], doubling to [`BACKOFF_MAX`] (see [`backoff`]), and up to
+//!   half of that again at random, for as long as the sessions end sooner than [`MIN_LIVED`] after
+//!   they began having answered fewer than [`LIVED_ANSWERS`], or cannot be opened at all: a
+//!   handshake that completes is no reason to start over, a session that lived or answered is; a
+//!   question that finds every connection down cuts the wait to [`HURRY_AFTER`] ([`Conn::hurry`]).
 //!
 //! While the connection is down (the last attempt failed, and the backoff is being waited out),
 //! [`Conn::ask`] fails at once, so whoever asks can turn to another upstream without waiting.
@@ -66,11 +77,13 @@
 //! logs nothing.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rustls::client::Resumption;
@@ -78,7 +91,7 @@ use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, HandshakeKind};
 use tokio::io::Interest;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 
@@ -111,6 +124,46 @@ pub const IDLE_CLOSE: Duration = Duration::from_secs(9);
 /// How much sooner than the idle timeout that a server advertises its session is closed: as much
 /// as this, and half the timeout at most.
 pub const KEEPALIVE_MARGIN: Duration = Duration::from_secs(1);
+/// The most questions that are out on one session at once, of those sent in the last
+/// [`SEAT_HOLD`]: the rest wait in the connection's queue, in the order they came, and go out as
+/// answers come. A public resolver ends a session on which too many questions are out (Quad9
+/// closed 18 sessions of a burst of 200 fresh names in 0.4 s, on 2026-11-12), and the questions
+/// that were open on it then cost a retry each. At the 20 to 40 ms that Quad9 answers in, this is
+/// 400 to 800 questions a second for each upstream, many times what a household asks.
+pub const SESSION_IN_FLIGHT: usize = 16;
+/// The fewest that the limit of a connection comes down to: the limit is halved each time the
+/// server ends a session on which half of it or more was out, and grows back by one for each
+/// [`LIMIT_GROWS_AFTER`] answers (over the sessions that follow, which an idle close ends every
+/// few seconds), and to [`SESSION_IN_FLIGHT`] whole once [`LIMIT_RESETS_AFTER`] passed without
+/// such a close. Even at this, a session carries over 100 questions a second.
+pub const SESSION_IN_FLIGHT_MIN: usize = 4;
+/// The answers after which a limit that was lowered grows by one.
+pub const LIMIT_GROWS_AFTER: usize = 64;
+/// How long after the last busy session that the server ended a lowered limit is whole again.
+pub const LIMIT_RESETS_AFTER: Duration = Duration::from_secs(600);
+/// How long an unanswered question counts towards [`SESSION_IN_FLIGHT`]: ten times Quad9's usual
+/// time, and twice the Pi's p99 at 100 forwarded questions a second. A question that the server
+/// dropped (one that rate-limits drops some) stays open for its answer to the end of its wait,
+/// but stops holding back the others.
+pub const SEAT_HOLD: Duration = Duration::from_millis(500);
+/// The retries that a connection may make in a row: the questions that were open on a session
+/// that the server ended, sent once more on the next. Each answer earns back [`RETRY_RATIO`] of
+/// one. A question that finds no retry left fails with `NotConnected`, and the exchange has
+/// asked the other upstream by then: a server that ends every busy session does not get every
+/// question twice.
+pub const RETRY_BURST: f32 = SESSION_IN_FLIGHT as f32;
+/// The share of a retry that each answer earns back.
+pub const RETRY_RATIO: f32 = 0.1;
+/// A session that answered this many questions is no sign of a failing server, however soon it
+/// ended: the next one is opened after [`REOPEN_JITTER`] at most, and the backoff starts over.
+pub const LIVED_ANSWERS: u64 = SESSION_IN_FLIGHT as u64;
+/// The most random delay before the session that replaces one that the server ended, so that two
+/// connections, or two households, do not come back in step.
+pub const REOPEN_JITTER: Duration = Duration::from_millis(100);
+/// How soon a connection that is down tries again once a question waits for it and every other
+/// connection is down too ([`Conn::hurry`]), if its backoff is longer: the backoff of a server that
+/// failed is no reason to leave a household without answers for half a minute.
+pub const HURRY_AFTER: Duration = Duration::from_secs(1);
 /// The longest question that is taken. A question to an upstream is a header, one name and an
 /// OPT record, which is under 300 bytes; a longer one is refused.
 pub const MAX_QUERY: usize = 4096;
@@ -157,10 +210,17 @@ pub(crate) struct ConnOptions {
     /// How long a session with no question open is kept, unless its server advertises its own
     /// idle timeout.
     pub(crate) idle: Duration,
+    /// How long an unanswered question holds its place in the session's in-flight limit.
+    pub(crate) seat_hold: Duration,
+    /// How soon a connection that is down tries again when it is hurried.
+    pub(crate) hurry: Duration,
+    /// The most random delay before a session replaces one that the server ended.
+    pub(crate) reopen_jitter: Duration,
 }
 
 impl Default for ConnOptions {
-    /// [`STALL_AFTER`], [`BACKOFF_MIN`], [`BACKOFF_MAX`], [`MIN_LIVED`] and [`IDLE_CLOSE`].
+    /// [`STALL_AFTER`], [`BACKOFF_MIN`], [`BACKOFF_MAX`], [`MIN_LIVED`], [`IDLE_CLOSE`],
+    /// [`SEAT_HOLD`], [`HURRY_AFTER`] and [`REOPEN_JITTER`].
     fn default() -> Self {
         Self {
             stall: STALL_AFTER,
@@ -168,6 +228,9 @@ impl Default for ConnOptions {
             backoff_max: BACKOFF_MAX,
             min_lived: MIN_LIVED,
             idle: IDLE_CLOSE,
+            seat_hold: SEAT_HOLD,
+            hurry: HURRY_AFTER,
+            reopen_jitter: REOPEN_JITTER,
         }
     }
 }
@@ -178,6 +241,66 @@ fn backoff(previous: Option<Duration>, options: &ConnOptions) -> Duration {
     previous
         .map_or(options.backoff_min, |last| last.saturating_mul(2))
         .min(options.backoff_max)
+}
+
+/// A random wait from nothing to `most`.
+fn jitter(most: Duration) -> Duration {
+    let nanos = u64::try_from(most.as_nanos()).unwrap_or(u64::MAX);
+    Duration::from_nanos(sys::random_u64() % nanos.saturating_add(1))
+}
+
+/// The most questions out on a connection's session at once, which the connection keeps from one
+/// session to the next. See [`SESSION_IN_FLIGHT_MIN`].
+#[derive(Clone, Copy, Debug)]
+struct Limit {
+    /// The limit now.
+    value: usize,
+    /// The answers since it last grew or was cut.
+    grown: usize,
+    /// When it was last cut, while it is below [`SESSION_IN_FLIGHT`].
+    cut_at: Option<Instant>,
+}
+
+impl Limit {
+    fn new() -> Self {
+        Self {
+            value: SESSION_IN_FLIGHT,
+            grown: 0,
+            cut_at: None,
+        }
+    }
+
+    /// Halves it, for a busy session that the server ended at `now`.
+    fn cut(&mut self, now: Instant) {
+        self.value = (self.value / 2).max(SESSION_IN_FLIGHT_MIN);
+        self.grown = 0;
+        self.cut_at = Some(now);
+    }
+
+    /// Notes an answer: every [`LIMIT_GROWS_AFTER`] of them grow it by one.
+    fn answered(&mut self) {
+        if self.value >= SESSION_IN_FLIGHT {
+            return;
+        }
+        self.grown += 1;
+        if self.grown >= LIMIT_GROWS_AFTER {
+            self.value += 1;
+            self.grown = 0;
+            if self.value >= SESSION_IN_FLIGHT {
+                self.cut_at = None;
+            }
+        }
+    }
+
+    /// Makes it whole at `now` if [`LIMIT_RESETS_AFTER`] passed since the last cut.
+    fn refresh(&mut self, now: Instant) {
+        if self
+            .cut_at
+            .is_some_and(|at| now.duration_since(at) >= LIMIT_RESETS_AFTER)
+        {
+            *self = Self::new();
+        }
+    }
 }
 
 /// The idle time of a session whose server advertised `timeout`: [`KEEPALIVE_MARGIN`] less, and
@@ -217,6 +340,14 @@ struct Shared {
     server_closes: AtomicU64,
     /// The questions that were sent again on a new session, after the server ended theirs.
     retried: AtomicU64,
+    /// The questions that were open on a session that the server ended, and that found no retry
+    /// left in the budget ([`RETRY_BURST`]).
+    unretried: AtomicU64,
+    /// Ends the backoff of a connection that is down sooner ([`Conn::hurry`]).
+    hurry: Notify,
+    /// The limit of questions out on a session, as it was when the last session began or the
+    /// limit was last cut.
+    limit: AtomicUsize,
 }
 
 impl Shared {
@@ -230,6 +361,9 @@ impl Shared {
             idle_closes: AtomicU64::new(0),
             server_closes: AtomicU64::new(0),
             retried: AtomicU64::new(0),
+            unretried: AtomicU64::new(0),
+            hurry: Notify::new(),
+            limit: AtomicUsize::new(SESSION_IN_FLIGHT),
         }
     }
 
@@ -257,6 +391,9 @@ pub struct ConnCounts {
     pub server_closes: u64,
     /// The questions sent again on a new session after the server ended theirs.
     pub retried: u64,
+    /// The questions open on a session that the server ended which found no retry left, and
+    /// failed.
+    pub unretried: u64,
 }
 
 /// A question on its way to the task.
@@ -268,6 +405,8 @@ struct Request {
     reply: oneshot::Sender<io::Result<Vec<u8>>>,
     /// Whether it was open on a session that ended already: it is not sent a third time.
     again: bool,
+    /// Told when the question is written to a session the first time, if anyone asked to be.
+    written: Option<oneshot::Sender<()>>,
 }
 
 /// One TLS connection to one upstream. See the module documentation.
@@ -318,21 +457,42 @@ impl Conn {
     ///   ended.
     ///
     /// There is no other wait here: the caller bounds one, as an exchange does.
+    #[cfg(test)]
     pub(crate) fn ask(
         &self,
         query: Vec<u8>,
     ) -> impl Future<Output = io::Result<Vec<u8>>> + Send + 'static {
-        let queued = self.enqueue(query);
-        async move {
+        self.ask_noting_write(query).0
+    }
+
+    /// [`Conn::ask`], and a receiver that is told when the question is first written to a
+    /// session, which may be a while after it was queued: it waits for room under the limit. It
+    /// ends without a word if the question never is (it failed, or its asker went).
+    pub(crate) fn ask_noting_write(
+        &self,
+        query: Vec<u8>,
+    ) -> (
+        impl Future<Output = io::Result<Vec<u8>>> + Send + 'static,
+        oneshot::Receiver<()>,
+    ) {
+        let (told, written) = oneshot::channel();
+        let queued = self.enqueue(query, Some(told));
+        let answer = async move {
             match queued {
                 Ok(answer) => answer.await.unwrap_or_else(|_| Err(not_connected("ended"))),
                 Err(error) => Err(error),
             }
-        }
+        };
+        (answer, written)
     }
 
-    /// Puts `query` in the queue, if the connection is not down and there is room.
-    fn enqueue(&self, query: Vec<u8>) -> io::Result<oneshot::Receiver<io::Result<Vec<u8>>>> {
+    /// Puts `query` in the queue, if the connection is not down and there is room; `written` is
+    /// told when it is first written.
+    fn enqueue(
+        &self,
+        query: Vec<u8>,
+        written: Option<oneshot::Sender<()>>,
+    ) -> io::Result<oneshot::Receiver<io::Result<Vec<u8>>>> {
         if !(HEADER_LEN..=MAX_QUERY).contains(&query.len()) {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
@@ -352,6 +512,7 @@ impl Conn {
             frame,
             reply,
             again: false,
+            written,
         };
         match self.asks.try_send(request) {
             Ok(()) => Ok(answer),
@@ -383,7 +544,18 @@ impl Conn {
                 frame: Vec::new(),
                 reply,
                 again: false,
+                written: None,
             });
+        }
+    }
+
+    /// Ends the backoff of a connection that is down once [`HURRY_AFTER`] of it has passed (at
+    /// once if it has), for a question that waits because every connection is down. Does nothing
+    /// to a connection that is not down, and nothing is kept for a later backoff. A server that is
+    /// really gone is then tried once a second while questions wait for it, and no more.
+    pub(crate) fn hurry(&self) {
+        if self.link() == Link::Down {
+            self.shared.hurry.notify_waiters();
         }
     }
 
@@ -431,6 +603,12 @@ impl Conn {
         self.shared.resumed.load(Ordering::Relaxed)
     }
 
+    /// The most questions that go out on its session at once now ([`SESSION_IN_FLIGHT`] unless a
+    /// server that ended busy sessions had it lowered).
+    pub(crate) fn limit(&self) -> usize {
+        self.shared.limit.load(Ordering::Relaxed)
+    }
+
     /// Everything that the connection counts.
     pub(crate) fn counts(&self) -> ConnCounts {
         let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
@@ -442,6 +620,7 @@ impl Conn {
             idle_closes: load(&shared.idle_closes),
             server_closes: load(&shared.server_closes),
             retried: load(&shared.retried),
+            unretried: load(&shared.unretried),
         }
     }
 }
@@ -467,14 +646,18 @@ async fn keep_up(
     mut queue: mpsc::Receiver<Request>,
 ) {
     // The wait before the last attempt or short session, since the last session that lived
-    // `min_lived`: a handshake alone does not reset it.
+    // `min_lived` or answered `LIVED_ANSWERS`: a handshake alone does not reset it.
     let mut waited: Option<Duration> = None;
     let mut warned: Option<Instant> = None;
     // The questions that go out first on the next session: those that were open on one that
-    // the server ended, and the one that woke an idle connection.
+    // the server ended, those that were waiting for room on one that ended, and the one that
+    // woke an idle connection.
     let mut first: Vec<Request> = Vec::new();
     // Whether a session is wanted now: the first one is.
     let mut wanted = true;
+    // The most questions out on a session at once, and the retries that may be made.
+    let mut limit = Limit::new();
+    let mut retries = RETRY_BURST;
     loop {
         if !wanted {
             shared.set(Link::Idle);
@@ -503,11 +686,18 @@ async fn keep_up(
         }
         shared.set(Link::Up);
         let began = Instant::now();
-        let mut session = Session::new(conn, tcp, options.idle);
+        limit.refresh(Instant::now());
+        shared.limit.store(limit.value, Ordering::Relaxed);
+        let mut session = Session::new(conn, tcp, options.idle, limit);
         let end = session
             .serve(&mut queue, std::mem::take(&mut first), &options, &shared)
             .await;
         let lived = began.elapsed() >= options.min_lived;
+        let fruitful = lived || session.answered >= LIVED_ANSWERS;
+        limit = session.limit;
+        retries = (retries + session.answered as f32 * RETRY_RATIO).min(RETRY_BURST);
+        // What had no room on it goes out first on the next, as it was never sent.
+        first = session.backlog.drain(..).collect();
         match end {
             End::Abandoned => return,
             End::Idle => {
@@ -515,18 +705,31 @@ async fn keep_up(
                 waited = None;
                 // A session that was used is replaced at once: the household is awake. One that
                 // was not waits for a question.
-                wanted = session.carried;
+                wanted = session.carried || !first.is_empty();
                 continue;
             }
             End::Closed | End::Failed => {
                 shared.server_closes.fetch_add(1, Ordering::Relaxed);
-                first = session.again();
+                // A server that ends a session with this much out may be telling us to send less.
+                let out = session.open.len();
+                if out >= SESSION_IN_FLIGHT_MIN && out * 2 >= limit.value {
+                    limit.cut(Instant::now());
+                    shared.limit.store(limit.value, Ordering::Relaxed);
+                }
+                let (again, unretried) = session.again(&mut retries);
                 shared
                     .retried
-                    .fetch_add(first.len() as u64, Ordering::Relaxed);
-                if lived {
+                    .fetch_add(again.len() as u64, Ordering::Relaxed);
+                shared.unretried.fetch_add(unretried, Ordering::Relaxed);
+                first.splice(0..0, again);
+                if fruitful {
                     waited = None;
                     wanted = session.carried || !first.is_empty();
+                    if wanted {
+                        // Not in step with the other connection, or with other households;
+                        // the questions queue for the session meanwhile.
+                        sleep(jitter(options.reopen_jitter)).await;
+                    }
                     continue;
                 }
             }
@@ -539,25 +742,39 @@ async fn keep_up(
                 }
             }
         }
-        // A session that was too short: the server is failing. What is to be sent again waits
-        // for the next session, within its asker's wait.
+        // A session that was too short and answered too little: the server is failing. What is
+        // to be sent again waits for the next session, within its asker's wait.
         down(&shared, &mut queue, &mut waited, &options).await;
         wanted = true;
     }
 }
 
-/// Marks the connection down, refuses what is queued, and waits out the backoff.
+/// Marks the connection down, refuses what is queued, and waits out the backoff, with up to half
+/// of it again at random so that the connections do not come back in step. A [`Conn::hurry`]
+/// during the wait ends it once `options.hurry` of it has passed.
 async fn down(
     shared: &Shared,
     queue: &mut mpsc::Receiver<Request>,
     waited: &mut Option<Duration>,
     options: &ConnOptions,
 ) {
+    // Listening before the state says down: a hurry that comes as soon as it does is not missed.
+    let hurried = shared.hurry.notified();
+    let mut hurried = pin!(hurried);
+    hurried.as_mut().enable();
     shared.set(Link::Down);
     refuse_queued(queue);
     let wait = backoff(*waited, options);
     *waited = Some(wait);
-    sleep(wait).await;
+    let began = Instant::now();
+    let wait = wait + jitter(wait / 2);
+    tokio::select! {
+        () = sleep(wait) => {}
+        () = async {
+            hurried.as_mut().await;
+            sleep_until(began + options.hurry.min(wait)).await;
+        } => {}
+    }
 }
 
 /// Gives every question that is queued the error of there being no session.
@@ -730,6 +947,8 @@ enum Event {
     Stall,
     /// The idle timer ran out.
     Idle,
+    /// A question stopped holding its place in the in-flight limit.
+    Seat,
 }
 
 /// A question that is out on the session.
@@ -767,11 +986,21 @@ struct Session {
     draining: bool,
     /// Whether a question was sent on it.
     carried: bool,
+    /// The most questions that are out on it at once, of those that hold a place
+    /// ([`Session::seats`]): [`SESSION_IN_FLIGHT`] at most.
+    limit: Limit,
+    /// The answers that it delivered.
+    answered: u64,
+    /// The questions that were taken for it and wait for room, in the order they came: at most
+    /// those that the connection had to send again and its wake, as the queue is read only while
+    /// there is room.
+    backlog: VecDeque<Request>,
 }
 
 impl Session {
-    /// A session that has no question out yet, kept for `idle` with no question open.
-    fn new(conn: ClientConnection, tcp: TcpStream, idle: Duration) -> Self {
+    /// A session that has no question out yet, kept for `idle` with no question open, with
+    /// `limit` questions out at once at most.
+    fn new(conn: ClientConnection, tcp: TcpStream, idle: Duration, limit: Limit) -> Self {
         let now = Instant::now();
         Self {
             conn,
@@ -783,13 +1012,17 @@ impl Session {
             idle,
             draining: false,
             carried: false,
+            limit,
+            answered: 0,
+            backlog: VecDeque::new(),
         }
     }
 
-    /// Sends `first`, then serves the session until it ends, and then tells the shared state that
-    /// no session is up, before whoever has a question open on it is told anything. A session that
-    /// stalled ends its open questions with `TimedOut`; one that the server ended keeps them for
-    /// [`Session::again`].
+    /// Sends `first` as far as the limit allows, then serves the session until it ends, and then
+    /// tells the shared state that no session is up, before whoever has a question open on it is
+    /// told anything. A session that stalled ends its open questions with `TimedOut`; one that the
+    /// server ended keeps them for [`Session::again`]. What is still in the backlog is the
+    /// caller's to send on the next.
     async fn serve(
         &mut self,
         queue: &mut mpsc::Receiver<Request>,
@@ -797,19 +1030,12 @@ impl Session {
         options: &ConnOptions,
         shared: &Shared,
     ) -> End {
-        let mut sent = Ok(());
-        for request in first {
-            if sent.is_ok() {
-                sent = self.send(request, shared);
-            } else {
-                // The stream broke: what is left is sent again on the next one.
-                self.keep(request);
-            }
-        }
-        let end = match sent.and_then(|()| self.flush()) {
-            Ok(()) => self.drive(queue, options.stall, shared).await,
-            Err(_) => End::Failed,
-        };
+        self.backlog.extend(
+            first
+                .into_iter()
+                .filter(|request| !request.frame.is_empty() && !request.reply.is_closed()),
+        );
+        let end = self.drive(queue, options, shared).await;
         // The state changes first: an exchange that waits on it hedges at once.
         shared.set(Link::Opening);
         if let End::Stalled = end {
@@ -822,30 +1048,13 @@ impl Session {
         end
     }
 
-    /// Notes a question that was not written before the stream broke as one that is open, under
-    /// no ID, so that it is sent again like the others.
-    fn keep(&mut self, request: Request) {
-        if request.frame.is_empty() {
-            return;
-        }
-        let id = self.fresh_id();
-        self.open.insert(
-            id,
-            Open {
-                original: [request.frame[2], request.frame[3]],
-                reply: request.reply,
-                sent: Instant::now(),
-                frame: request.frame,
-                again: request.again,
-            },
-        );
-    }
-
     /// The questions that were open when the server ended the session, to be sent once more on
-    /// the next one, under the ID they were asked with; those that had been sent again already,
-    /// and those whose askers are gone, end here.
-    fn again(&mut self) -> Vec<Request> {
+    /// the next one, under the ID they were asked with, each for one of `retries`; those that had
+    /// been sent again already, those that find no retry left, and those whose askers are gone,
+    /// end here. Also the count of those that found no retry.
+    fn again(&mut self, retries: &mut f32) -> (Vec<Request>, u64) {
         let mut again = Vec::new();
+        let mut unretried = 0;
         for (_, open) in self.open.drain() {
             if open.reply.is_closed() {
                 continue;
@@ -854,25 +1063,50 @@ impl Session {
                 let _ = open.reply.send(Err(not_connected("the session ended")));
                 continue;
             }
+            if *retries < 1.0 {
+                unretried += 1;
+                let _ = open.reply.send(Err(not_connected("the session ended")));
+                continue;
+            }
+            *retries -= 1.0;
             let mut frame = open.frame;
             frame[2..4].copy_from_slice(&open.original);
             again.push(Request {
                 frame,
                 reply: open.reply,
                 again: true,
+                written: None,
             });
         }
-        again
+        (again, unretried)
     }
 
-    /// The session loop: takes questions, moves bytes, and watches the oldest question and the
-    /// idle time.
+    /// The questions that hold a place in the limit at `now`: those sent less than `hold` ago
+    /// whose askers still wait. Also when the first of them stops holding it. At most
+    /// [`MAX_FORWARDS`] are looked at.
+    fn seats(&self, now: Instant, hold: Duration) -> (usize, Option<Instant>) {
+        let mut taken = 0;
+        let mut first_free: Option<Instant> = None;
+        for open in self.open.values() {
+            let until = open.sent + hold;
+            if until > now && !open.reply.is_closed() {
+                taken += 1;
+                first_free = Some(first_free.map_or(until, |at| at.min(until)));
+            }
+        }
+        (taken, first_free)
+    }
+
+    /// The session loop: takes questions while the limit has room (the backlog first, then the
+    /// queue), moves bytes, and watches the oldest question, the places in the limit and the idle
+    /// time.
     async fn drive(
         &mut self,
         queue: &mut mpsc::Receiver<Request>,
-        stall: Duration,
+        options: &ConnOptions,
         shared: &Shared,
     ) -> End {
+        let stall = options.stall;
         loop {
             // A socket that is readable every time (a peer that writes as fast as we read) never
             // makes this loop wait: readiness is not counted against the task's budget of tokio's
@@ -882,11 +1116,26 @@ impl Session {
             let stall_at = self.oldest().map(|sent| sent + stall);
             // While output waits for the socket, no new question is taken: a peer that does not
             // read holds the queue (which then refuses) and not our memory. Nor is one taken on a
-            // session that the server asked to be closed.
+            // session that the server asked to be closed, nor past the limit: those wait, in the
+            // queue, for an answer or for a place to come free.
             let blocked = self.conn.wants_write();
-            let taking = !blocked && !self.draining;
-            let idle_at = (self.open.is_empty() && !blocked)
-                .then(|| self.last_read.max(self.last_sent) + self.idle);
+            let (seated, first_free) = self.seats(Instant::now(), options.seat_hold);
+            let room = seated < self.limit.value;
+            let taking = !blocked && !self.draining && room;
+            if taking && let Some(request) = self.backlog.pop_front() {
+                if self
+                    .send(request, shared)
+                    .and_then(|()| self.flush())
+                    .is_err()
+                {
+                    return End::Failed;
+                }
+                continue;
+            }
+            let seat_at = first_free.filter(|_| !room && !self.draining);
+            let idle_at =
+                (self.open.is_empty() && !blocked && (self.draining || self.backlog.is_empty()))
+                    .then(|| self.last_read.max(self.last_sent) + self.idle);
             let interest = if blocked {
                 Interest::READABLE | Interest::WRITABLE
             } else {
@@ -899,6 +1148,8 @@ impl Session {
                     if stall_at.is_some() => Event::Stall,
                 () = sleep_until(idle_at.unwrap_or_else(|| Instant::now() + FAR)),
                     if idle_at.is_some() => Event::Idle,
+                () = sleep_until(seat_at.unwrap_or_else(|| Instant::now() + FAR)),
+                    if seat_at.is_some() => Event::Seat,
             };
             let step = match event {
                 Event::Request(None) => return End::Abandoned,
@@ -906,7 +1157,7 @@ impl Session {
                     self.send(request, shared).and_then(|()| self.flush())
                 }
                 Event::Stall if self.stall_ran_out(stall) => return End::Stalled,
-                Event::Stall => Ok(()),
+                Event::Stall | Event::Seat => Ok(()),
                 // A question that came at the last moment keeps the session.
                 Event::Idle if !self.draining && !queue.is_empty() => Ok(()),
                 Event::Idle => {
@@ -987,6 +1238,7 @@ impl Session {
             mut frame,
             reply,
             again,
+            written: told,
         } = request;
         // A wake, or a question whose asker is gone.
         if frame.is_empty() || reply.is_closed() {
@@ -1014,6 +1266,9 @@ impl Session {
         self.last_sent = now;
         self.carried = true;
         shared.asked.fetch_add(1, Ordering::Relaxed);
+        if let Some(told) = told {
+            let _ = told.send(());
+        }
         written
     }
 
@@ -1092,6 +1347,8 @@ impl Session {
                         self.idle = idle_for(timeout);
                         self.draining = timeout.is_zero();
                     }
+                    self.answered += 1;
+                    self.limit.answered();
                     let mut answer = frame.to_vec();
                     answer[..2].copy_from_slice(&open.original);
                     // The asker may have given up on it: then there is nobody to tell.
@@ -1236,6 +1493,9 @@ mod tests {
             backoff_max: ms(200),
             min_lived: Duration::ZERO,
             idle: Duration::from_secs(60),
+            seat_hold: ms(50),
+            hurry: ms(100),
+            reopen_jitter: ms(10),
         }
     }
 
@@ -2005,6 +2265,242 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::NotConnected);
         assert_eq!(fake.queries(), 2);
         assert_eq!(conn.counts().retried, 1);
+    }
+
+    #[tokio::test]
+    async fn a_burst_goes_out_a_limit_at_a_time_and_every_question_is_answered() {
+        // A server that ends a session as it reads a question while more than the limit are out.
+        let mode = TlsMode {
+            max_in_flight: Some(SESSION_IN_FLIGHT + 1),
+            ..TlsMode::default()
+        };
+        let fake = TlsFakeUpstream::start_with(Reply::After(ms(20), ip("192.0.2.10")), mode);
+        let options = ConnOptions {
+            seat_hold: Duration::from_secs(2),
+            ..quick()
+        };
+        let conn = Conn::spawn(fake.addr, tls_for_fake(&fake), options);
+        until("the session", || conn.is_up()).await;
+        let asks: Vec<_> = (0..200)
+            .map(|n| conn.ask(question(&format!("n{n}.example.com"))))
+            .collect();
+        for answer in futures_join(asks).await {
+            assert!(read_answer(&answer.unwrap(), 0).is_some());
+        }
+        assert_eq!(
+            (fake.closed(), conn.connects(), fake.queries()),
+            (0, 1, 200)
+        );
+        assert_eq!(conn.counts().retried, 0);
+    }
+
+    /// Waits for every one of `futures`, in order.
+    async fn futures_join<T>(futures: Vec<impl Future<Output = T>>) -> Vec<T> {
+        let handles: Vec<_> = futures.into_iter().map(|future| Box::pin(future)).collect();
+        let mut out = Vec::new();
+        for handle in handles {
+            out.push(handle.await);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ends_busy_sessions_gets_fewer_questions_at_once() {
+        // Ends a session as it reads a question while 5 are out: only a limit of 4 is safe.
+        let mode = TlsMode {
+            max_in_flight: Some(5),
+            ..TlsMode::default()
+        };
+        let fake = TlsFakeUpstream::start_with(Reply::After(ms(20), ip("192.0.2.10")), mode);
+        let options = ConnOptions {
+            seat_hold: Duration::from_secs(2),
+            ..quick()
+        };
+        let conn = Conn::spawn(fake.addr, tls_for_fake(&fake), options);
+        until("the session", || conn.is_up()).await;
+        // Each round: 16, then 8, then 4 out at once.
+        for round in 0..3 {
+            let asks: Vec<_> = (0..32)
+                .map(|n| conn.ask(question(&format!("r{round}n{n}.example.com"))))
+                .collect();
+            futures_join(asks).await;
+        }
+        let closed = fake.closed();
+        assert!((1..=4).contains(&closed), "{closed} sessions ended");
+        // Once it is down to 4, a burst passes whole. The limit tries one more every
+        // `LIMIT_GROWS_AFTER` answers, which this server answers with one more close at most, and
+        // the retry carries those questions.
+        let asks: Vec<_> = (0..64)
+            .map(|n| conn.ask(question(&format!("last{n}.example.com"))))
+            .collect();
+        for answer in futures_join(asks).await {
+            assert!(read_answer(&answer.unwrap(), 0).is_some());
+        }
+        assert!(
+            fake.closed() <= closed + 1,
+            "{} after {closed}",
+            fake.closed()
+        );
+        assert!(conn.limit() <= SESSION_IN_FLIGHT_MIN + 1);
+    }
+
+    #[test]
+    fn a_cut_limit_grows_back_with_answers_and_is_whole_after_ten_quiet_minutes() {
+        let start = Instant::now();
+        let mut limit = Limit::new();
+        limit.cut(start);
+        limit.cut(start);
+        assert_eq!(limit.value, SESSION_IN_FLIGHT / 4);
+        limit.cut(start);
+        assert_eq!(limit.value, SESSION_IN_FLIGHT_MIN);
+        for _ in 0..LIMIT_GROWS_AFTER - 1 {
+            limit.answered();
+        }
+        assert_eq!(limit.value, SESSION_IN_FLIGHT_MIN);
+        limit.answered();
+        assert_eq!(limit.value, SESSION_IN_FLIGHT_MIN + 1);
+        // Whole again by answers alone, given enough of them.
+        let mut grown = limit;
+        for _ in 0..LIMIT_GROWS_AFTER * SESSION_IN_FLIGHT {
+            grown.answered();
+        }
+        assert_eq!(grown.value, SESSION_IN_FLIGHT);
+        // Or by ten minutes without a cut, whatever was answered.
+        limit.refresh(start + LIMIT_RESETS_AFTER - ms(1));
+        assert_eq!(limit.value, SESSION_IN_FLIGHT_MIN + 1);
+        limit.refresh(start + LIMIT_RESETS_AFTER);
+        assert_eq!(limit.value, SESSION_IN_FLIGHT);
+    }
+
+    #[tokio::test]
+    async fn a_cut_limit_is_kept_from_one_session_to_the_next_and_grows_over_them() {
+        // Ends a session as it reads a question while 5 are out; idle sessions end after 150 ms.
+        let mode = TlsMode {
+            max_in_flight: Some(5),
+            ..TlsMode::default()
+        };
+        let fake = TlsFakeUpstream::start_with(Reply::After(ms(10), ip("192.0.2.10")), mode);
+        let options = ConnOptions {
+            seat_hold: Duration::from_secs(2),
+            ..idling(ms(150))
+        };
+        let conn = Conn::spawn(fake.addr, tls_for_fake(&fake), options);
+        until("the session", || conn.is_up()).await;
+        for round in 0..3 {
+            let asks: Vec<_> = (0..32)
+                .map(|n| conn.ask(question(&format!("r{round}n{n}.example.com"))))
+                .collect();
+            futures_join(asks).await;
+        }
+        until("the limit to come down", || {
+            conn.limit() == SESSION_IN_FLIGHT_MIN
+        })
+        .await;
+        // Sessions come and go (idle closes), and the limit stays down until enough answers.
+        let mut answered = 0;
+        while answered < LIMIT_GROWS_AFTER + SESSION_IN_FLIGHT_MIN {
+            let asks: Vec<_> = (0..SESSION_IN_FLIGHT_MIN)
+                .map(|n| conn.ask(question(&format!("a{answered}n{n}.example.com"))))
+                .collect();
+            answered += futures_join(asks)
+                .await
+                .into_iter()
+                .filter(Result::is_ok)
+                .count();
+            if answered % 16 == 0 {
+                until("an idle close", || conn.link() == Link::Idle).await;
+                // Not made whole by a new session.
+                assert!(conn.limit() < SESSION_IN_FLIGHT, "{}", conn.limit());
+            }
+        }
+        assert!(conn.counts().idle_closes >= 3, "{:?}", conn.counts());
+        // The next session starts with the limit grown, by the answers of the sessions before it
+        // (those after the cut, of the first rounds, too), and far from whole.
+        until("an idle close", || conn.link() == Link::Idle).await;
+        conn.wake();
+        until("the next session", || conn.is_up()).await;
+        let limit = conn.limit();
+        assert!(
+            (SESSION_IN_FLIGHT_MIN + 1..=SESSION_IN_FLIGHT_MIN + 3).contains(&limit),
+            "{limit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_retries_after_busy_sessions_ended_are_held_to_a_budget() {
+        // Every session ends as the server reads its first question: nothing is ever answered.
+        let mode = TlsMode {
+            close_on_query: Some(1),
+            ..TlsMode::default()
+        };
+        let fake = TlsFakeUpstream::start_with(Reply::Answer(ip("192.0.2.10")), mode);
+        let conn = Conn::spawn(fake.addr, tls_for_fake(&fake), quick());
+        until("the session", || conn.is_up()).await;
+        let mut failed = 0;
+        for round in 0..4 {
+            let asks: Vec<_> = (0..SESSION_IN_FLIGHT)
+                .map(|n| conn.ask(question(&format!("r{round}n{n}.example.com"))))
+                .collect();
+            failed += futures_join(asks)
+                .await
+                .into_iter()
+                .filter(Result::is_err)
+                .count();
+            until("a session", || conn.link() != Link::Down).await;
+        }
+        assert_eq!(failed, 4 * SESSION_IN_FLIGHT);
+        // One budget's worth, and no more: no answer earned any back.
+        let counts = conn.counts();
+        assert!(
+            counts.retried <= RETRY_BURST as u64,
+            "{} retries, {} without",
+            counts.retried,
+            counts.unretried
+        );
+        assert!(counts.unretried > 0);
+    }
+
+    #[tokio::test]
+    async fn a_down_connection_tries_again_soon_when_hurried() {
+        // A server that takes every connection and drops it: every open fails.
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counting = attempts.clone();
+        let acceptor = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counting.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let fake = TlsFakeUpstream::start(Reply::Silent);
+        let options = ConnOptions {
+            backoff_min: Duration::from_secs(30),
+            backoff_max: Duration::from_secs(30),
+            hurry: ms(200),
+            ..quick()
+        };
+        let conn = Conn::spawn(addr, tls_for_fake(&fake), options);
+        until("the first attempt to fail", || conn.link() == Link::Down).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        // Left alone, it waits out its 30 s.
+        sleep(ms(400)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        // Hurried, it tries again at once, as 200 ms of its wait have passed: once.
+        let hurried = StdInstant::now();
+        conn.hurry();
+        until("the hurried attempt", || {
+            attempts.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert!(hurried.elapsed() < ms(150), "took {:?}", hurried.elapsed());
+        until("the next backoff", || conn.link() == Link::Down).await;
+        // A hurry while it is not down does nothing, and none is kept for the next backoff.
+        sleep(ms(400)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        acceptor.abort();
     }
 
     #[tokio::test]

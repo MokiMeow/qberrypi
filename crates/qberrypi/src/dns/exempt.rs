@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{PoisonError, RwLock};
 
 /// The most addresses a set holds; a longer list is cut to its first ones. The device watch
-/// gives no more than this: two lists of 64 devices, each with four addresses at most, and the
-/// router's and the Pi's own.
-pub const MAX_ADDRS: usize = 2 * 64 * 4 + 2;
+/// gives no more than this: two lists of 64 devices and 64 open gates, each device with four
+/// addresses at most, and the router's and the Pi's own.
+pub const MAX_ADDRS: usize = 3 * 64 * 4 + 2;
 
 /// Who is exempt from the ads lists right now: the mode and the two sets that it reads.
 #[derive(Default)]
@@ -218,9 +218,9 @@ mod tests {
     }
 
     #[test]
-    fn the_set_keeps_the_first_514_addresses_it_is_given() {
+    fn the_set_keeps_the_first_max_addresses_it_is_given() {
         let set = AddrSet::new();
-        // 514 entries that name 128 addresses four times over and two more, then 88 that are new.
+        // `MAX_ADDRS` entries that name 128 addresses over and over, then 88 that are new.
         let mut many: Vec<Ipv4Addr> = (0..MAX_ADDRS).map(|n| ip((n % 128) as u8)).collect();
         many.extend((128..216).map(ip));
         set.replace(&many);

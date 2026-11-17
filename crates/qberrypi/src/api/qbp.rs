@@ -14,10 +14,12 @@
 //! | `GET alerts[?since=R]` | `{"rev", "suppressed", "alerts": [...]}`: the alerts that changed after revision `R` |
 //! | `POST alerts/{id}/ack` | `{"acked": true}`, or 404 for an id that no alert has |
 //! | `PUT alerts/acked` | `{"restored": n}` for `{"acked": ["<16 hex>", ...]}` |
-//! | `GET devices` | `{"known_list", "devices": [...], "exempt_macs": [...], "exempt_default", "block_macs": [...]}` |
+//! | `GET devices` | `{"rev", "known_list", "devices": [...], "exempt_macs": [...], "exempt_pushed": [...], "exempt_default", "block_macs": [...], "block_pushed": [...], "own_mac"}` |
 //! | `PUT devices/known` | `{"known": n}` for `{"known": ["02:00:00:00:00:01", ...], "append": false, "complete": true}` |
-//! | `PUT devices/exempt` | `{"exempt": n}` for `{"exempt": ["02:00:00:00:00:01", ...]}` |
-//! | `PUT devices/policy` | `{"exempt_default": b, "block": n}` for `{"exempt_default": b, "block": ["02:00:00:00:00:01", ...]}` |
+//! | `PUT devices/exempt` | `{"exempt": n, "rev"}` for `{"exempt": ["02:00:00:00:00:01", ...], "if_rev": r}` |
+//! | `PUT devices/policy` | `{"exempt_default": b, "block": n, "rev"}` for `{"exempt_default": b, "block": ["02:00:00:00:00:01", ...], "if_rev": r}` |
+//! | `PUT devices/labels` | `{"labels": n, "rev"}` for `{"labels": [["02:00:00:00:00:01", "Desk PC"], ...], "append": false, "complete": true}` |
+//! | `PUT devices/gate` | `{"gate_left_secs": n, "rev"}` for `{"mac": "02:00:00:00:00:01", "secs": 300}` |
 //!
 //! The known list may be longer than a body can be (4 KiB, about 230 addresses), so it can be sent in
 //! chunks: `append` (default false) says whether the chunk is added to the list that is being sent
@@ -48,6 +50,41 @@
 //! whether it is exempt in the mode in force: on an exempt list in the list mode, and in the
 //! exempt-by-default mode on no block list and claiming neither the router's address nor the Pi's.
 //!
+//! The inventory has a revision, `rev`, that moves with every change of the pushed exempt list, the
+//! pushed block list, the mode, the labels and the gates, whoever makes it: the desktop through
+//! these endpoints, the front panel, or a gate that shuts. `PUT devices/exempt` and
+//! `devices/policy` take an optional `"if_rev"`: with it, they change nothing and answer a 409
+//! `{"error": ..., "rev": current}` unless `if_rev` is the revision now, so that a desktop that
+//! read the lists, and was overtaken by the panel meanwhile, reads them again before it pushes.
+//! Their answers, and the labels' and the gate's, give the revision after the change. A push that
+//! changes nothing does not move it.
+//!
+//! Each device in `GET devices` also has `label` (what the desktop calls it, or `null`),
+//! `gate_left_secs` (the seconds its gate stays open, or `null` while it is shut) and `fixed`
+//! (the configuration's list of the mode in force names it, so that no edit of the panel changes
+//! it). `exempt_pushed` and `block_pushed` are the lists the desktop pushed, as the panel has
+//! edited them, without the configuration's: the ones the desktop adopts when `rev` moved. A device
+//! is `exempt` while its gate is open, in either mode.
+//!
+//! What the desktop needs to draw the panel's wall as the panel does: each device also has
+//! `label_rank` (the place of its label in the desktop's list, which is the order the wall shows
+//! labelled devices in, or `null` without a label) and `always` (it is the router, or claims the
+//! router's or the Pi's address, so it is never exempt and has no gate), and the top level has
+//! `own_mac`, the Pi's own hardware address as text, or `null` until it is known: the Pi is no
+//! device of the list, and its place on the wall is made from it.
+//!
+//! `PUT devices/labels` sends the desktop's names for its devices, in its order, which the panel
+//! keeps: at most 64 pairs in all, each a MAC and a label of 1 to 24 printable ASCII characters,
+//! chunked with `append` and `complete` as the known list is. The labels live in memory only, and
+//! the desktop sends them again after the board starts.
+//!
+//! `PUT devices/gate` opens the gate of one device for `secs` seconds, 1 to 3600, which lets its
+//! ads pass in either mode, or shuts it with 0. The device must be one that the inventory lists
+//! (404 otherwise). A gate on a device that the configuration's list of the mode in force names, on
+//! the router or the Pi, or past 64 open gates, is a 409 with the word `fixed`, `always` or
+//! `full`, and a refusal never repeats the address. Gates live in memory only, are not pushed back
+//! by the desktop and shut by themselves, also when the board restarts.
+//!
 //! A body is read whole before anything changes: one bad key or address, or a flag that is not
 //! `true` or `false`, is a 400 and nothing is restored or replaced. No answer to a bad body repeats a piece of it. The lock of the device
 //! inventory is held for a copy of its view, for `set_known`, `set_exempt` or `set_policy`, and
@@ -66,7 +103,10 @@ use serde_json::{Value, json};
 use super::hex;
 use super::http::Reply;
 use super::routes::{Error, METHOD_NOT_ALLOWED, NO_VALID_JSON, NOT_FOUND, error, ok};
-use crate::watch::devices::{DeviceView, Devices, MAX_BLOCK, MAX_EXEMPT, with_devices};
+use crate::watch::devices::{
+    DeviceView, Devices, EditError, Label, MAX_BLOCK, MAX_EXEMPT, MAX_GATE_SECS, MAX_LABELS,
+    with_devices,
+};
 use crate::watch::frames::Mac;
 use crate::watch::store::{AlertStore, AlertView, key_hex};
 
@@ -95,6 +135,29 @@ const BAD_POLICY: Error = (
     "bad_request",
     "\"exempt_default\" must be true or false and \"block\" a list of at most 64 different Ethernet addresses",
 );
+/// A body of `PUT devices/labels` that is not an object with `labels` a list of at most 64 pairs
+/// of an Ethernet address and a label of 1 to 24 printable ASCII characters.
+const BAD_LABELS: Error = (
+    "bad_request",
+    "\"labels\" must be a list of at most 64 pairs of an Ethernet address and a label of 1 to 24 printable ASCII characters",
+);
+/// A body of `PUT devices/gate` that is not an object with `mac` an Ethernet address of a device
+/// and `secs` a whole number from 0 to 3600.
+const BAD_GATE: Error = (
+    "bad_request",
+    "\"mac\" must be an Ethernet address and \"secs\" a whole number of seconds from 0 to 3600",
+);
+/// A body whose `if_rev` is there and is not a whole number.
+const BAD_IF_REV: Error = ("bad_request", "\"if_rev\" must be a whole revision number");
+/// A push made on a revision that the inventory has left behind.
+const STALE: Error = (
+    "stale",
+    "The lists changed since this revision; read them again",
+);
+/// A gate or an edit that the inventory refuses, by [`EditError`]: the word, and what it means.
+const REFUSED_FIXED: Error = ("fixed", "The configuration decides this device");
+const REFUSED_ALWAYS: Error = ("always", "The router and the Pi are never exempt");
+const REFUSED_FULL: Error = ("full", "No room for another");
 /// A body of `PUT devices/known` whose `append` or `complete` is there and is not true or false.
 const BAD_FLAG: Error = (
     "bad_request",
@@ -135,6 +198,10 @@ enum Route {
     Exempt,
     /// `devices/policy`.
     Policy,
+    /// `devices/labels`.
+    Labels,
+    /// `devices/gate`.
+    Gate,
 }
 
 impl Route {
@@ -148,6 +215,8 @@ impl Route {
             "devices/known" => Route::Known,
             "devices/exempt" => Route::Exempt,
             "devices/policy" => Route::Policy,
+            "devices/labels" => Route::Labels,
+            "devices/gate" => Route::Gate,
             _ => {
                 let id = rest.strip_prefix("alerts/")?.strip_suffix("/ack")?;
                 if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -163,7 +232,12 @@ impl Route {
         match self {
             Route::Alerts | Route::Devices => "GET",
             Route::Ack(_) => "POST",
-            Route::Restore | Route::Known | Route::Exempt | Route::Policy => "PUT",
+            Route::Restore
+            | Route::Known
+            | Route::Exempt
+            | Route::Policy
+            | Route::Labels
+            | Route::Gate => "PUT",
         }
     }
 }
@@ -196,6 +270,8 @@ pub(super) fn handle(
         Route::Known => known(watch, body, started),
         Route::Exempt => exempt(watch, body, started),
         Route::Policy => policy(watch, body, started),
+        Route::Labels => labels(watch, body, started),
+        Route::Gate => gate(watch, body, started),
     }
 }
 
@@ -273,8 +349,9 @@ fn restore(store: &AlertStore, body: &[u8], started: Instant) -> Reply {
     ok(json!({ "restored": store.restore_acked(&keys) }), started)
 }
 
-/// `GET devices`: whether a known list has come, every device, the one seen last first, the MACs
-/// of both exempt lists, the mode in force and the MACs of both block lists.
+/// `GET devices`: the revision, whether a known list has come, every device, the one seen last
+/// first, the MACs of both exempt lists and of the pushed one, the mode in force, the MACs of
+/// both block lists and of the pushed one, and the Pi's own hardware address (`own_mac`, or `null`).
 ///
 /// The inventory is locked for the copy of its view, and the JSON is made after.
 fn devices(devices: &Mutex<Devices>, started: Instant) -> Reply {
@@ -282,13 +359,18 @@ fn devices(devices: &Mutex<Devices>, started: Instant) -> Reply {
     let list: Vec<Value> = view.devices.iter().map(device_json).collect();
     let exempt: Vec<String> = view.exempt_macs.iter().map(ToString::to_string).collect();
     let block: Vec<String> = view.block_macs.iter().map(ToString::to_string).collect();
+    let texts = |macs: &[Mac]| -> Vec<String> { macs.iter().map(ToString::to_string).collect() };
     ok(
         json!({
+            "rev": view.rev,
             "known_list": view.known_list.as_str(),
             "devices": list,
             "exempt_macs": exempt,
+            "exempt_pushed": texts(&view.exempt_pushed),
             "exempt_default": view.exempt_default,
             "block_macs": block,
+            "block_pushed": texts(&view.block_pushed),
+            "own_mac": view.own_mac.map(|mac| mac.to_string()),
         }),
         started,
     )
@@ -306,6 +388,11 @@ fn device_json(device: &DeviceView) -> Value {
         "known": device.known,
         "exempt": device.exempt,
         "blocked": device.blocked,
+        "label": device.label.as_deref(),
+        "gate_left_secs": device.gate_left_secs,
+        "fixed": device.fixed,
+        "label_rank": device.label_rank,
+        "always": device.always,
     })
 }
 
@@ -343,11 +430,17 @@ fn known(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
 }
 
 /// `PUT devices/exempt`: replaces the pushed exempt list with the addresses of the body, each once,
-/// and answers how many different ones it holds now. They are all read before the inventory is
-/// touched: one that is not an Ethernet address, or more than [`MAX_EXEMPT`] different ones, is a
-/// 400 and the list stays as it was.
+/// and answers how many different ones it holds now and the revision after. They are all read
+/// before the inventory is touched: one that is not an Ethernet address, or more than
+/// [`MAX_EXEMPT`] different ones, is a 400 and the list stays as it was. With `if_rev` the list is
+/// replaced only if that is the revision now; if it is not, nothing changes and the answer is a 409
+/// with the revision that is.
 fn exempt(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
-    let texts = match strings(body, "exempt", BAD_EXEMPT) {
+    let value = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return error(400, NO_VALID_JSON, started),
+    };
+    let texts = match string_list(&value, "exempt", BAD_EXEMPT) {
         Ok(texts) => texts,
         Err(refusal) => return error(400, refusal, started),
     };
@@ -361,17 +454,26 @@ fn exempt(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
             return error(400, BAD_EXEMPT, started);
         }
     }
-    let kept = with_devices(&watch.devices, &*watch.alerts, |devices| {
-        devices.set_exempt(macs.into_iter().collect())
+    let Some(if_rev) = if_rev(&value) else {
+        return error(400, BAD_IF_REV, started);
+    };
+    let pushed = with_devices(&watch.devices, &*watch.alerts, |devices| {
+        devices.check_rev(if_rev)?;
+        let kept = devices.set_exempt(macs.into_iter().collect());
+        Ok((kept, devices.rev()))
     });
-    ok(json!({ "exempt": kept }), started)
+    match pushed {
+        Ok((kept, rev)) => ok(json!({ "exempt": kept, "rev": rev }), started),
+        Err(current) => stale(current, started),
+    }
 }
 
 /// `PUT devices/policy`: replaces the pushed mode with `exempt_default` and the pushed block list
-/// with the addresses of `block`, each once, and answers the mode and how many different addresses
-/// the list holds now. Both keys are required, and all is read before the inventory is touched: a
-/// mode that is not true or false, an address that is not an Ethernet address, or more than
-/// [`MAX_BLOCK`] different ones, is a 400 and the policy stays as it was.
+/// with the addresses of `block`, each once, and answers the mode, how many different addresses
+/// the list holds now and the revision after. Both keys are required, and all is read before the
+/// inventory is touched: a mode that is not true or false, an address that is not an Ethernet
+/// address, or more than [`MAX_BLOCK`] different ones, is a 400 and the policy stays as it was.
+/// `if_rev` is as for [`exempt`].
 fn policy(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
     let value = match serde_json::from_slice::<Value>(body) {
         Ok(value) => value,
@@ -394,13 +496,126 @@ fn policy(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
             return error(400, BAD_POLICY, started);
         }
     }
-    let kept = with_devices(&watch.devices, &*watch.alerts, |devices| {
-        devices.set_policy(exempt_default, macs.into_iter().collect())
+    let Some(if_rev) = if_rev(&value) else {
+        return error(400, BAD_IF_REV, started);
+    };
+    let pushed = with_devices(&watch.devices, &*watch.alerts, |devices| {
+        devices.check_rev(if_rev)?;
+        let kept = devices.set_policy(exempt_default, macs.into_iter().collect());
+        Ok((kept, devices.rev()))
     });
-    ok(
-        json!({ "exempt_default": exempt_default, "block": kept }),
-        started,
-    )
+    match pushed {
+        Ok((kept, rev)) => ok(
+            json!({ "exempt_default": exempt_default, "block": kept, "rev": rev }),
+            started,
+        ),
+        Err(current) => stale(current, started),
+    }
+}
+
+/// `PUT devices/labels`: takes a chunk of the desktop's labels, as [`Devices::load_labels`] says
+/// with the flags `append` (default false) and `complete` (default true), and answers how many
+/// labels the set holds now and the revision after. The pairs and the flags are all read before
+/// the inventory is touched: more than [`MAX_LABELS`] pairs, an address that is no device's, a
+/// label that is not 1 to 24 printable ASCII characters, or a pair that is not two strings is a
+/// 400, and no answer repeats a piece of the body.
+fn labels(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
+    let value = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return error(400, NO_VALID_JSON, started),
+    };
+    let Some(Value::Array(items)) = value.get("labels") else {
+        return error(400, BAD_LABELS, started);
+    };
+    if items.len() > MAX_LABELS {
+        return error(400, BAD_LABELS, started);
+    }
+    let (Some(append), Some(complete)) = (
+        flag(&value, "append", false),
+        flag(&value, "complete", true),
+    ) else {
+        return error(400, BAD_FLAG, started);
+    };
+    let mut pairs = Vec::with_capacity(items.len());
+    for item in items {
+        let Value::Array(pair) = item else {
+            return error(400, BAD_LABELS, started);
+        };
+        let [Value::String(mac), Value::String(label)] = pair.as_slice() else {
+            return error(400, BAD_LABELS, started);
+        };
+        let (Ok(mac), Some(label)) = (mac.parse::<Mac>(), Label::new(label)) else {
+            return error(400, BAD_LABELS, started);
+        };
+        if !mac.can_be_a_device() {
+            return error(400, BAD_LABELS, started);
+        }
+        pairs.push((mac, label));
+    }
+    let (kept, rev) = with_devices(&watch.devices, &*watch.alerts, |devices| {
+        (devices.load_labels(pairs, append, complete), devices.rev())
+    });
+    ok(json!({ "labels": kept, "rev": rev }), started)
+}
+
+/// `PUT devices/gate`: opens the gate of the device `mac` for `secs` seconds, or shuts it with 0,
+/// and answers the seconds and the revision after. A body that is not a MAC of a device and a whole
+/// number of seconds from 0 to 3600 is a 400, a device that the inventory does not list a 404, and
+/// an edit that the inventory refuses (the configuration decides the device, it is the router or
+/// the Pi, or the gates are full) a 409 with a word for it and without the address.
+fn gate(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
+    let value = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return error(400, NO_VALID_JSON, started),
+    };
+    let mac = value
+        .get("mac")
+        .and_then(Value::as_str)
+        .and_then(|text| text.parse::<Mac>().ok())
+        .filter(|mac| mac.can_be_a_device());
+    let secs = value
+        .get("secs")
+        .and_then(Value::as_u64)
+        .and_then(|secs| u16::try_from(secs).ok())
+        .filter(|&secs| secs <= MAX_GATE_SECS);
+    let (Some(mac), Some(secs)) = (mac, secs) else {
+        return error(400, BAD_GATE, started);
+    };
+    let done = with_devices(&watch.devices, &*watch.alerts, |devices| {
+        devices.open_gate(mac, secs).map(|()| devices.rev())
+    });
+    match done {
+        Ok(rev) => ok(json!({ "gate_left_secs": secs, "rev": rev }), started),
+        Err(EditError::Unknown) => error(404, NOT_FOUND, started),
+        Err(EditError::Fixed) => error(409, REFUSED_FIXED, started),
+        Err(EditError::Always) => error(409, REFUSED_ALWAYS, started),
+        Err(EditError::Full) => error(409, REFUSED_FULL, started),
+        Err(EditError::Invalid) => error(400, BAD_GATE, started),
+    }
+}
+
+/// The 409 for a push made on a revision that is not the one now: Pi-hole's error object, and the
+/// revision that is, which is what the desktop reads the lists again on.
+fn stale(current: u64, started: Instant) -> Reply {
+    let (key, message) = STALE;
+    let body = json!({
+        "error": { "key": key, "message": message, "hint": null },
+        "rev": current,
+        "took": started.elapsed().as_secs_f64(),
+    });
+    Reply {
+        status: 409,
+        body: serde_json::to_vec(&body).unwrap_or_default(),
+    }
+}
+
+/// The `if_rev` of a push: `Some(None)` when the body has none, the revision when it has one, and
+/// `None` when it has one that is not a whole number.
+fn if_rev(body: &Value) -> Option<Option<u64>> {
+    match body.get("if_rev") {
+        None => Some(None),
+        Some(value) => value.as_u64().map(Some),
+    }
 }
 
 /// The boolean field `field` of the JSON object `body`: `default` when it is not there, and `None`
@@ -797,7 +1012,14 @@ mod tests {
             (&body["exempt_default"], &body["block_macs"]),
             (&json!(false), &json!([]))
         );
+        assert_eq!(
+            (&body["rev"], &body["exempt_pushed"], &body["block_pushed"]),
+            (&json!(0), &json!([]), &json!([]))
+        );
         assert!(body["took"].is_number());
+        // The Pi's own address is not known yet: the field is there, and says so.
+        assert_eq!(body["own_mac"], json!(null));
+        assert!(body.as_object().unwrap().contains_key("own_mac"));
 
         setup.hear(mac(5), "laptop");
         let (_, body) = setup.send("GET", "/api/qbp/devices", "");
@@ -807,8 +1029,84 @@ mod tests {
             json!([{
                 "mac": "02:00:00:00:00:05", "ipv4": ["192.0.2.40"], "hostname": "laptop",
                 "first_unix": UNIX, "last_unix": UNIX, "known": false, "exempt": false,
-                "blocked": false,
+                "blocked": false, "label": null, "gate_left_secs": null, "fixed": false,
+                "label_rank": null, "always": false,
             }])
+        );
+    }
+
+    #[test]
+    fn the_devices_tell_the_pis_own_address_and_each_ones_label_place_and_whether_it_is_always() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        setup.hear(mac(6), "phone");
+        // The router, which asks by ARP for its own address and so is the one that claims it first; and
+        // the Pi's own address, once it is known.
+        with_devices(&setup.watch.devices, &*setup.watch.alerts, |devices| {
+            devices.on_arp(&Arp {
+                op: 1,
+                sender_mac: mac(0xa1),
+                sender_ip: Ipv4Addr::new(192, 0, 2, 1),
+                target_ip: Ipv4Addr::new(192, 0, 2, 1),
+            });
+            devices.set_own_mac(mac(0xee));
+        });
+        // The desktop's order: the phone first, then the laptop; the router has no label.
+        let (status, _) = put_labels(
+            &setup,
+            r#"{"labels": [["02:00:00:00:00:06", "Phone"], ["02:00:00:00:00:05", "Desk PC"]]}"#,
+        );
+        assert_eq!(status, 200);
+
+        let body = get_devices(&setup);
+        assert_eq!(body["own_mac"], json!("02:00:00:00:00:ee"));
+        let of = |n: u8| -> (Value, Value, Value) {
+            let device = body["devices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["mac"] == json!(mac_text(n)))
+                .unwrap_or_else(|| panic!("device {n}"));
+            (
+                device["label"].clone(),
+                device["label_rank"].clone(),
+                device["always"].clone(),
+            )
+        };
+        assert_eq!(of(6), (json!("Phone"), json!(0), json!(false)));
+        assert_eq!(of(5), (json!("Desk PC"), json!(1), json!(false)));
+        assert_eq!(of(0xa1), (json!(null), json!(null), json!(true)));
+        // Every field it had is still there, with the same names.
+        let phone = body["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["mac"] == json!(mac_text(6)))
+            .unwrap();
+        let mut keys: Vec<&str> = phone
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "always",
+                "blocked",
+                "exempt",
+                "first_unix",
+                "fixed",
+                "gate_left_secs",
+                "hostname",
+                "ipv4",
+                "known",
+                "label",
+                "label_rank",
+                "last_unix",
+                "mac"
+            ]
         );
     }
 
@@ -1278,6 +1576,386 @@ mod tests {
         assert!(setup.listed().is_empty());
     }
 
+    /// Sends `body` to `PUT devices/labels`, and gives the status and the answer.
+    fn put_labels(setup: &Setup, body: &str) -> (u16, Value) {
+        setup.send("PUT", "/api/qbp/devices/labels", body)
+    }
+
+    /// Sends `body` to `PUT devices/gate`, and gives the status and the answer.
+    fn put_gate(setup: &Setup, body: &str) -> (u16, Value) {
+        setup.send("PUT", "/api/qbp/devices/gate", body)
+    }
+
+    /// The body of `GET devices`.
+    fn get_devices(setup: &Setup) -> Value {
+        let (status, body) = setup.send("GET", "/api/qbp/devices", "");
+        assert_eq!(status, 200);
+        body
+    }
+
+    /// What `GET devices` tells of the device `n`: its label, its gate's seconds, `exempt`, `fixed`.
+    fn device_facts(setup: &Setup, n: u8) -> (Value, Value, Value, Value) {
+        let body = get_devices(setup);
+        let device = body["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["mac"] == json!(mac_text(n)))
+            .unwrap()
+            .clone();
+        (
+            device["label"].clone(),
+            device["gate_left_secs"].clone(),
+            device["exempt"].clone(),
+            device["fixed"].clone(),
+        )
+    }
+
+    #[test]
+    fn labels_come_in_the_desktops_order_and_show_on_the_devices_they_name() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        setup.hear(mac(6), "phone");
+        let (status, body) = put_labels(
+            &setup,
+            r#"{"labels": [["02:00:00:00:00:06", "Phone"], ["02-00-00-00-00-05", "Desk PC"], ["02:00:00:00:00:AA", "Not heard"], ["02:00:00:00:00:06", "Again"]], "other": 1}"#,
+        );
+        // Three different addresses: the first of a repeat stays. The labels moved the revision.
+        assert_eq!(
+            (status, &body["labels"], &body["rev"]),
+            (200, &json!(3), &json!(1))
+        );
+        assert!(body["took"].is_number());
+        assert_eq!(device_facts(&setup, 5).0, json!("Desk PC"));
+        assert_eq!(device_facts(&setup, 6).0, json!("Phone"));
+        assert_eq!(get_devices(&setup)["rev"], json!(1));
+        // The same list again changes nothing, and the revision stays.
+        let (_, body) = put_labels(
+            &setup,
+            r#"{"labels": [["02:00:00:00:00:06", "Phone"], ["02:00:00:00:00:05", "Desk PC"], ["02:00:00:00:00:aa", "Not heard"]]}"#,
+        );
+        assert_eq!((&body["labels"], &body["rev"]), (&json!(3), &json!(1)));
+        // The next whole list replaces them.
+        let (_, body) = put_labels(&setup, r#"{"labels": []}"#);
+        assert_eq!((&body["labels"], &body["rev"]), (&json!(0), &json!(2)));
+        assert_eq!(device_facts(&setup, 5).0, json!(null));
+        // A label is not an exemption, and raises nothing.
+        assert!(setup.listed().is_empty());
+    }
+
+    #[test]
+    fn labels_in_chunks_take_effect_with_the_last_one() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        setup.hear(mac(6), "phone");
+        let (_, body) = put_labels(
+            &setup,
+            r#"{"labels": [["02:00:00:00:00:05", "Desk PC"]], "append": false, "complete": false}"#,
+        );
+        assert_eq!((&body["labels"], &body["rev"]), (&json!(1), &json!(0)));
+        assert_eq!(device_facts(&setup, 5).0, json!(null));
+        let (_, body) = put_labels(
+            &setup,
+            r#"{"labels": [["02:00:00:00:00:06", "Phone"]], "append": true, "complete": true}"#,
+        );
+        assert_eq!((&body["labels"], &body["rev"]), (&json!(2), &json!(1)));
+        assert_eq!(device_facts(&setup, 5).0, json!("Desk PC"));
+        assert_eq!(device_facts(&setup, 6).0, json!("Phone"));
+    }
+
+    #[test]
+    fn a_bad_list_of_labels_is_a_400_and_changes_nothing_and_repeats_nothing() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        put_labels(&setup, r#"{"labels": [["02:00:00:00:00:05", "Desk PC"]]}"#);
+        let sixty_five: Vec<Value> = (0..65).map(|n| json!([mac_text(n + 1), "x"])).collect();
+        let sixty_five = json!({ "labels": sixty_five }).to_string();
+        let long = format!(
+            r#"{{"labels": [["02:00:00:00:00:06", "{}"]]}}"#,
+            "x".repeat(25)
+        );
+        let bad = [
+            "",
+            "[]",
+            "{}",
+            r#"{"labels": ["#,
+            r#"{"labels": null}"#,
+            r#"{"labels": "02:00:00:00:00:06"}"#,
+            r#"{"labels": [5]}"#,
+            r#"{"labels": ["02:00:00:00:00:06"]}"#,
+            r#"{"labels": [["02:00:00:00:00:06"]]}"#,
+            r#"{"labels": [["02:00:00:00:00:06", "Phone", "more"]]}"#,
+            r#"{"labels": [["02:00:00:00:00:06", 5]]}"#,
+            r#"{"labels": [[5, "Phone"]]}"#,
+            r#"{"labels": [["02:00:00:00:00:0g", "Phone"]]}"#,
+            r#"{"labels": [["020000000006", "Phone"]]}"#,
+            r#"{"labels": [["02:00:00:00:00:06", ""]]}"#,
+            r#"{"labels": [["02:00:00:00:00:06", "caf\u00e9"]]}"#,
+            r#"{"labels": [["02:00:00:00:00:06", "tab\there"]]}"#,
+            r#"{"labels": [["01:00:00:00:00:06", "Phone"]]}"#,
+            r#"{"labels": [["00:00:00:00:00:00", "Phone"]]}"#,
+            r#"{"labels": [["02:00:00:00:00:06", "Phone"], ["02:00:00:00:00:07", "bad\u0007"]]}"#,
+            r#"{"labels": [], "append": "yes"}"#,
+            r#"{"labels": [], "complete": 0}"#,
+            &long,
+            &sixty_five,
+        ];
+        for body in bad {
+            let (status, answer) = put_labels(&setup, body);
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(error_key(&answer), "bad_request", "{body}");
+            // The refusal repeats neither an address nor a label.
+            let text = answer.to_string();
+            assert!(!text.contains("02:00") && !text.contains("Phone"), "{body}");
+        }
+        // The labels there were stay, and the revision with them.
+        assert_eq!(device_facts(&setup, 5).0, json!("Desk PC"));
+        assert_eq!(get_devices(&setup)["rev"], json!(1));
+        // 64 pairs and a label of 24 characters are the most.
+        let sixty_four: Vec<Value> = (0..64)
+            .map(|n| json!([mac_text(n + 1), "x".repeat(24)]))
+            .collect();
+        let (status, body) = put_labels(&setup, &json!({ "labels": sixty_four }).to_string());
+        assert_eq!((status, &body["labels"]), (200, &json!(64)));
+    }
+
+    #[test]
+    fn a_gate_opens_and_shows_on_the_device_and_shuts_with_zero() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        assert_eq!(
+            device_facts(&setup, 5),
+            (json!(null), json!(null), json!(false), json!(false))
+        );
+
+        let (status, body) = put_gate(&setup, r#"{"mac": "02:00:00:00:00:05", "secs": 300}"#);
+        assert_eq!(
+            (status, &body["gate_left_secs"], &body["rev"]),
+            (200, &json!(300), &json!(1))
+        );
+        assert!(body["took"].is_number());
+        // The device is exempt for now; no list names it.
+        assert_eq!(
+            device_facts(&setup, 5),
+            (json!(null), json!(300), json!(true), json!(false))
+        );
+        let devices = get_devices(&setup);
+        assert_eq!(
+            (
+                &devices["exempt_macs"],
+                &devices["exempt_pushed"],
+                &devices["rev"]
+            ),
+            (&json!([]), &json!([]), &json!(1))
+        );
+
+        // An hour is the most, and a gate that is open takes a new time.
+        let (status, body) = put_gate(&setup, r#"{"mac": "02-00-00-00-00-05", "secs": 3600}"#);
+        assert_eq!(
+            (status, &body["gate_left_secs"], &body["rev"]),
+            (200, &json!(3600), &json!(2))
+        );
+        assert_eq!(device_facts(&setup, 5).1, json!(3600));
+
+        // 0 shuts it, and shutting a gate that is shut is fine and moves nothing.
+        let (status, body) = put_gate(&setup, r#"{"mac": "02:00:00:00:00:05", "secs": 0}"#);
+        assert_eq!(
+            (status, &body["gate_left_secs"], &body["rev"]),
+            (200, &json!(0), &json!(3))
+        );
+        assert_eq!(
+            device_facts(&setup, 5),
+            (json!(null), json!(null), json!(false), json!(false))
+        );
+        let (status, body) = put_gate(&setup, r#"{"mac": "02:00:00:00:00:05", "secs": 0}"#);
+        assert_eq!((status, &body["rev"]), (200, &json!(3)));
+        assert!(setup.listed().is_empty());
+    }
+
+    #[test]
+    fn a_gate_that_the_inventory_refuses_is_a_409_with_a_word_and_never_the_address() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        setup.hear(mac(6), "phone");
+        with_devices(&setup.watch.devices, &*setup.watch.alerts, |devices| {
+            devices.set_exempt_config(vec![mac(5)]);
+            // The first message that claims the router's address fixes the router's MAC.
+            devices.on_arp(&Arp {
+                op: 1,
+                sender_mac: mac(9),
+                sender_ip: Ipv4Addr::new(192, 0, 2, 1),
+                target_ip: Ipv4Addr::new(192, 0, 2, 1),
+            });
+            devices.set_own_mac(mac(0xee));
+        });
+        for (n, word) in [(5, "fixed"), (9, "always"), (0xee, "always")] {
+            let body = format!(r#"{{"mac": "{}", "secs": 60}}"#, mac_text(n));
+            let (status, answer) = put_gate(&setup, &body);
+            assert_eq!(status, 409, "{n}");
+            assert_eq!(error_key(&answer), word, "{n}");
+            assert!(!answer.to_string().contains("02:00"), "{answer}");
+            // Shutting is refused the same way.
+            let body = format!(r#"{{"mac": "{}", "secs": 0}}"#, mac_text(n));
+            assert_eq!(put_gate(&setup, &body).0, 409, "{n}");
+        }
+        // A device that the inventory does not list is a 404, to open and to shut.
+        for secs in [60, 0] {
+            let body = format!(r#"{{"mac": "02:00:00:00:00:77", "secs": {secs}}}"#);
+            let (status, answer) = put_gate(&setup, &body);
+            assert_eq!((status, error_key(&answer)), (404, "not_found"), "{secs}");
+        }
+        assert_eq!(get_devices(&setup)["rev"], json!(0));
+
+        // 64 gates open; the 65th is a 409, and a gate that is open may take a new time.
+        for n in 0..65u8 {
+            with_devices(&setup.watch.devices, &*setup.watch.alerts, |devices| {
+                devices.on_arp(&Arp {
+                    op: 1,
+                    sender_mac: Mac([2, 0, 0, 0, 1, n]),
+                    sender_ip: Ipv4Addr::new(192, 0, 2, 100 + n),
+                    target_ip: Ipv4Addr::new(192, 0, 2, 1),
+                });
+            });
+        }
+        let gate_of = |n: u8| format!(r#"{{"mac": "02:00:00:00:01:{n:02x}", "secs": 60}}"#);
+        for n in 0..64 {
+            assert_eq!(put_gate(&setup, &gate_of(n)).0, 200, "{n}");
+        }
+        let (status, answer) = put_gate(&setup, &gate_of(64));
+        assert_eq!((status, error_key(&answer)), (409, "full"));
+        assert_eq!(put_gate(&setup, &gate_of(3)).0, 200);
+    }
+
+    #[test]
+    fn a_bad_gate_body_is_a_400_and_changes_nothing_and_repeats_nothing() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        let bad = [
+            "",
+            "[]",
+            "{}",
+            r#"{"mac": "02:00:00:00:00:05"}"#,
+            r#"{"secs": 60}"#,
+            r#"{"mac": null, "secs": 60}"#,
+            r#"{"mac": 5, "secs": 60}"#,
+            r#"{"mac": "02:00:00:00:00:0g", "secs": 60}"#,
+            r#"{"mac": "020000000005", "secs": 60}"#,
+            r#"{"mac": "01:00:00:00:00:05", "secs": 60}"#,
+            r#"{"mac": "00:00:00:00:00:00", "secs": 60}"#,
+            r#"{"mac": "02:00:00:00:00:05", "secs": null}"#,
+            r#"{"mac": "02:00:00:00:00:05", "secs": "60"}"#,
+            r#"{"mac": "02:00:00:00:00:05", "secs": -1}"#,
+            r#"{"mac": "02:00:00:00:00:05", "secs": 60.5}"#,
+            r#"{"mac": "02:00:00:00:00:05", "secs": 60.0}"#,
+            r#"{"mac": "02:00:00:00:00:05", "secs": 3601}"#,
+            r#"{"mac": "02:00:00:00:00:05", "secs": 65536}"#,
+            r#"{"mac": "02:00:00:00:00:05", "secs": 18446744073709551616}"#,
+        ];
+        for body in bad {
+            let (status, answer) = put_gate(&setup, body);
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(error_key(&answer), "bad_request", "{body}");
+            assert!(!answer.to_string().contains("02:00"), "{body}");
+        }
+        assert_eq!(device_facts(&setup, 5).1, json!(null));
+        assert_eq!(get_devices(&setup)["rev"], json!(0));
+    }
+
+    #[test]
+    fn if_rev_makes_a_push_conditional_and_a_stale_one_is_a_409_with_the_revision_now() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        let (status, body) = put_exempt(&setup, r#"{"exempt": ["02:00:00:00:00:05"]}"#);
+        assert_eq!(
+            (status, &body["exempt"], &body["rev"]),
+            (200, &json!(1), &json!(1))
+        );
+
+        // A push on an old revision changes nothing and says which revision it is.
+        let (status, body) = put_exempt(&setup, r#"{"exempt": [], "if_rev": 0}"#);
+        assert_eq!(status, 409);
+        assert_eq!((&body["rev"], error_key(&body)), (&json!(1), "stale"));
+        assert!(body["took"].is_number());
+        assert_eq!(exempt_state(&setup).0, json!(["02:00:00:00:00:05"]));
+        // On the revision now it goes through, and says the revision after.
+        let (status, body) = put_exempt(&setup, r#"{"exempt": [], "if_rev": 1}"#);
+        assert_eq!(
+            (status, &body["exempt"], &body["rev"]),
+            (200, &json!(0), &json!(2))
+        );
+        // A push that changes nothing, on the revision now, moves nothing.
+        let (_, body) = put_exempt(&setup, r#"{"exempt": [], "if_rev": 2}"#);
+        assert_eq!(body["rev"], json!(2));
+
+        // The policy is conditional the same way, and changes the revision with its mode.
+        let (status, body) = put_policy(
+            &setup,
+            r#"{"exempt_default": true, "block": [], "if_rev": 1}"#,
+        );
+        assert_eq!(
+            (status, &body["rev"], error_key(&body)),
+            (409, &json!(2), "stale")
+        );
+        assert_eq!(policy_state(&setup).0, json!(false));
+        let (status, body) = put_policy(
+            &setup,
+            r#"{"exempt_default": true, "block": [], "if_rev": 2}"#,
+        );
+        assert_eq!(
+            (status, &body["block"], &body["rev"]),
+            (200, &json!(0), &json!(3))
+        );
+
+        // An edit of the panel moves it, and so does a gate: the desktop's push is stale.
+        with_devices(&setup.watch.devices, &*setup.watch.alerts, |devices| {
+            devices.set_ads_pass(mac(5), false).unwrap();
+        });
+        let (status, body) = put_exempt(&setup, r#"{"exempt": [], "if_rev": 3}"#);
+        assert_eq!((status, &body["rev"]), (409, &json!(4)));
+        assert_eq!(
+            put_gate(&setup, r#"{"mac": "02:00:00:00:00:05", "secs": 60}"#).1["rev"],
+            json!(5)
+        );
+        let (status, body) = put_policy(
+            &setup,
+            r#"{"exempt_default": true, "block": [], "if_rev": 4}"#,
+        );
+        assert_eq!((status, &body["rev"]), (409, &json!(5)));
+        // The list the panel made is what `GET devices` tells as pushed.
+        let devices = get_devices(&setup);
+        assert_eq!(
+            (&devices["rev"], &devices["block_pushed"]),
+            (&json!(5), &json!(["02:00:00:00:00:05"]))
+        );
+    }
+
+    #[test]
+    fn an_if_rev_that_is_not_a_whole_number_is_a_400_and_changes_nothing() {
+        let setup = Setup::new();
+        for if_rev in ["\"x\"", "-1", "1.5", "null", "[]", "18446744073709551616"] {
+            let body = format!(r#"{{"exempt": ["02:00:00:00:00:05"], "if_rev": {if_rev}}}"#);
+            let (status, answer) = put_exempt(&setup, &body);
+            assert_eq!(
+                (status, error_key(&answer)),
+                (400, "bad_request"),
+                "{if_rev}"
+            );
+            let body = format!(r#"{{"exempt_default": true, "block": [], "if_rev": {if_rev}}}"#);
+            let (status, answer) = put_policy(&setup, &body);
+            assert_eq!(
+                (status, error_key(&answer)),
+                (400, "bad_request"),
+                "{if_rev}"
+            );
+        }
+        let devices = get_devices(&setup);
+        assert_eq!(
+            (&devices["rev"], &devices["exempt_macs"]),
+            (&json!(0), &json!([]))
+        );
+        assert_eq!(devices["exempt_default"], json!(false));
+    }
+
     #[test]
     fn a_known_path_with_another_method_is_a_405_and_changes_nothing() {
         let setup = Setup::new();
@@ -1291,6 +1969,8 @@ mod tests {
             ("PUT", "/api/qbp/devices/known"),
             ("PUT", "/api/qbp/devices/exempt"),
             ("PUT", "/api/qbp/devices/policy"),
+            ("PUT", "/api/qbp/devices/labels"),
+            ("PUT", "/api/qbp/devices/gate"),
         ];
         for (right, path) in paths {
             for method in [
@@ -1299,7 +1979,7 @@ mod tests {
                 if method == right {
                     continue;
                 }
-                let body = r#"{"acked": [], "known": [], "exempt": [], "exempt_default": true, "block": []}"#;
+                let body = r#"{"acked": [], "known": [], "exempt": [], "exempt_default": true, "block": [], "labels": [], "mac": "02:00:00:00:00:05", "secs": 60}"#;
                 let (status, body) = setup.send(method, path, body);
                 assert_eq!(status, 405, "{method} {path}");
                 assert_eq!(error_key(&body), "method_not_allowed", "{method} {path}");
@@ -1338,6 +2018,12 @@ mod tests {
             ("PUT", "/api/qbp/devices/policy/"),
             ("PUT", "/api/qbp/devices/Policy"),
             ("PUT", "/api/qbp/policy"),
+            ("PUT", "/api/qbp/devices/labels/"),
+            ("PUT", "/api/qbp/devices/Labels"),
+            ("PUT", "/api/qbp/labels"),
+            ("PUT", "/api/qbp/devices/gate/"),
+            ("PUT", "/api/qbp/devices/Gate"),
+            ("PUT", "/api/qbp/gate"),
             ("DELETE", "/api/qbp/nope"),
             // A query on any path but `GET alerts` is no such path.
             ("GET", "/api/qbp/devices?x=1"),
@@ -1345,12 +2031,13 @@ mod tests {
             ("PUT", "/api/qbp/devices/known?x=1"),
             ("PUT", "/api/qbp/devices/exempt?x=1"),
             ("PUT", "/api/qbp/devices/policy?x=1"),
+            ("PUT", "/api/qbp/devices/labels?x=1"),
+            ("PUT", "/api/qbp/devices/gate?x=1"),
             ("PUT", "/api/qbp/alerts/acked?since=0"),
             ("POST", "/api/qbp/alerts/1/ack?x=1"),
         ];
         for (method, path) in paths {
-            let body =
-                r#"{"acked": [], "known": [], "exempt": [], "exempt_default": true, "block": []}"#;
+            let body = r#"{"acked": [], "known": [], "exempt": [], "exempt_default": true, "block": [], "labels": [], "mac": "02:00:00:00:00:05", "secs": 60}"#;
             let (status, body) = setup.send(method, path, body);
             assert_eq!(status, 404, "{method} {path}");
             assert_eq!(error_key(&body), "not_found", "{method} {path}");
@@ -1366,7 +2053,7 @@ mod tests {
         let setup = Setup::new();
         setup.raise("dga", Some(client(7)), "random NXDOMAIN names");
         setup.hear(mac(5), "laptop");
-        let body = br#"{"acked": ["0123456789abcdef"], "known": ["02:00:00:00:00:05"], "exempt": ["02:00:00:00:00:05"], "exempt_default": true, "block": ["02:00:00:00:00:05"]}"#;
+        let body = br#"{"acked": ["0123456789abcdef"], "known": ["02:00:00:00:00:05"], "exempt": ["02:00:00:00:00:05"], "exempt_default": true, "block": ["02:00:00:00:00:05"], "labels": [["02:00:00:00:00:05", "Desk PC"]], "mac": "02:00:00:00:00:05", "secs": 60}"#;
         let requests = [
             ("GET", "/api/qbp/alerts"),
             ("GET", "/api/qbp/alerts?since=0"),
@@ -1376,6 +2063,8 @@ mod tests {
             ("PUT", "/api/qbp/devices/known"),
             ("PUT", "/api/qbp/devices/exempt"),
             ("PUT", "/api/qbp/devices/policy"),
+            ("PUT", "/api/qbp/devices/labels"),
+            ("PUT", "/api/qbp/devices/gate"),
             ("GET", "/api/qbp/nope"),
             ("GET", "/api/qbp/"),
             ("DELETE", "/api/qbp/alerts"),
@@ -1401,6 +2090,10 @@ mod tests {
             (&devices["exempt_default"], &devices["block_macs"]),
             (&json!(false), &json!([]))
         );
+        // No label, no gate and no revision moved.
+        assert_eq!(devices["rev"], json!(0));
+        assert_eq!(devices["devices"][0]["label"], json!(null));
+        assert_eq!(devices["devices"][0]["gate_left_secs"], json!(null));
     }
 
     #[test]
@@ -1413,6 +2106,8 @@ mod tests {
             ("PUT", "/api/qbp/devices/known"),
             ("PUT", "/api/qbp/devices/exempt"),
             ("PUT", "/api/qbp/devices/policy"),
+            ("PUT", "/api/qbp/devices/labels"),
+            ("PUT", "/api/qbp/devices/gate"),
             ("GET", "/api/qbp/"),
         ] {
             let (status, body) = ask(&api, method, path, Some(&sid), b"{}");

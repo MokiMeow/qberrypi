@@ -27,7 +27,7 @@ mod stamps;
 pub use fixture::{Fixture, drain_fixture};
 pub use paint::Painter;
 
-use look::{DRIP_BASE, DRIP_KINDS, DRIP_STEP, FUNNEL_CELLS, GATE_CELL, LANE_CELLS};
+use look::{DRIP_BASE, DRIP_KINDS, DRIP_STEP, FUNNEL_CELLS, GATE_CELL, LANE_CELLS, LANE_END};
 
 /// How many cells of the lane a name may fill as it passes: all of it.
 const NAME_CELLS: usize = LANE_CELLS as usize;
@@ -99,7 +99,7 @@ pub enum Melt {
 /// The letter is a character of a name: this type says nothing of it when it is printed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Tile {
-    /// The lane cell, 0 to 19; `look::cell_x` gives its left edge.
+    /// The lane cell, 0 to 15 (the cells under `HOME` show no tile); `look::cell_x` gives its left edge.
     pub cell: u8,
     /// The letter: lower-case printable ASCII, a `?`, or the `~` that ends a cut name.
     pub ch: char,
@@ -292,7 +292,7 @@ impl OnLane {
             let k = last - i;
             let melt = self.melt(k)?;
             let at = first + i32::try_from(i).ok()?;
-            let cell = u8::try_from(at).ok().filter(|&c| c < LANE_CELLS)?;
+            let cell = u8::try_from(at).ok().filter(|&c| c < LANE_END)?;
             // The door covers the gate's cell while it is shut.
             if door && cell == GATE_CELL {
                 return None;
@@ -515,7 +515,9 @@ impl Drain {
         if let Some(count) = landing {
             self.land(count);
         }
-        let past = i32::from(LANE_CELLS);
+        // A name leaves the lane when its last letter is under `HOME`: the cells at the left edge say `HOME`, so a
+        // passing name is gone at the gate's own cell instead of running on to the edge.
+        let past = i32::from(LANE_END);
         self.names.retain(|name| name.tail() < past);
         self.door = shut;
         let clear = self.names.last().is_none_or(|last| last.tail() >= 1);
@@ -611,8 +613,8 @@ impl Drain {
 
     /// The tiles on the lane, each name's last letter first. A name that has melted away has none.
     ///
-    /// Tiles off the lane are left out, and so is any tile in the gate's cell while the door is shut, so
-    /// the painter draws every tile it gets.
+    /// Tiles off the lane are left out: those under `HOME` (from `look::LANE_END`, the cell past the gate) and,
+    /// while the door is shut, any in the gate's cell, so the painter draws every tile it gets.
     pub fn lane(&self) -> impl Iterator<Item = Tile> + '_ {
         let (paused, door) = (self.paused, self.door);
         self.names
@@ -639,41 +641,6 @@ impl Drain {
     }
 }
 
-/// An alert, as the takeover card shows it.
-///
-/// The subject is a DNS name: this type says nothing of it, or of who, when it is printed.
-#[derive(Clone, PartialEq, Eq)]
-pub struct AlertCard {
-    /// Whether the card is white (high severity) rather than blue.
-    pub high: bool,
-    /// The two title lines.
-    pub title: [String; 2],
-    /// What the alert is about, as a name on one line of the card's width, or on two broken after a dot.
-    /// The second line is empty when the first is enough.
-    pub subject: [String; 2],
-    /// Who it concerns: `asked by <ip>`, `at <ip>`, or empty.
-    pub who: String,
-}
-
-impl AlertCard {
-    /// The subject's lines that have something on them: one, or two.
-    pub fn subject_lines(&self) -> impl Iterator<Item = &str> {
-        self.subject
-            .iter()
-            .map(String::as_str)
-            .filter(|line| !line.is_empty())
-    }
-}
-
-impl fmt::Debug for AlertCard {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AlertCard")
-            .field("high", &self.high)
-            .field("title", &self.title)
-            .finish_non_exhaustive()
-    }
-}
-
 /// The slow figures of the panel, which change one region per write.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Stills {
@@ -688,8 +655,9 @@ pub struct Stills {
     pub gate_fill: u8,
     /// The refused count; `None` while unknown.
     pub count: Option<u32>,
-    /// The alert that covers part of the screen, if any.
-    pub alert: Option<AlertCard>,
+    /// Whether the gate ask is unfolded over the field (the key's choices, 5 min, 30 min, 1 hour): it covers
+    /// the funnel and the count, and its opening and closing are one write of its 240 rows, as a pause toggle's.
+    pub gate_ask: bool,
     /// The words the lane says while it has no names, if any; the painter shows them only while the
     /// Drain is `idle`.
     pub words: Option<LaneWords>,
@@ -698,7 +666,7 @@ pub struct Stills {
 impl Stills {
     /// Copies one field that differs from `wanted`, and says whether there was one.
     ///
-    /// The order is the blocking switch, the gate's refill, the alert, the count, the share, the clock
+    /// The order is the blocking switch, the gate's refill, the gate ask, the count, the share, the clock
     /// and the lane's words. Calling it until it says `false` makes `self` equal `wanted`, and each call
     /// changes one region of the screen, so that every still region is written on its own.
     pub fn step_toward(&mut self, wanted: &Stills) -> bool {
@@ -706,8 +674,8 @@ impl Stills {
             self.blocking = wanted.blocking;
         } else if self.gate_fill != wanted.gate_fill {
             self.gate_fill = wanted.gate_fill;
-        } else if self.alert != wanted.alert {
-            self.alert.clone_from(&wanted.alert);
+        } else if self.gate_ask != wanted.gate_ask {
+            self.gate_ask = wanted.gate_ask;
         } else if self.count != wanted.count {
             self.count = wanted.count;
         } else if self.percent != wanted.percent {
@@ -725,11 +693,9 @@ impl Stills {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-
     use super::look::{FUNNEL_CENTRES, FUNNEL_ROWS};
     use super::*;
-    use crate::format::{alert_card, fit_name};
+    use crate::format::fit_name;
 
     /// Ticks until the stopped name is at `step`; fails if it never gets there.
     fn tick_to_step(d: &mut Drain, step: u8) {
@@ -1123,7 +1089,7 @@ mod tests {
         let funnel = *d.funnel();
         d.offer("example.org", NameKind::Plain);
         assert!(d.moving());
-        let mut seen = [false; 20];
+        let mut seen = [false; LANE_END as usize];
         for _ in 0..100 {
             if !d.moving() {
                 break;
@@ -1136,10 +1102,43 @@ mod tests {
             assert_eq!(d.refusal_step(), None);
             assert!(!d.door_shut());
         }
-        assert!(seen.iter().all(|&cell| cell), "it crossed cells 0 to 19");
+        assert!(
+            seen.iter().all(|&cell| cell),
+            "it crossed cells 0 to 15, the gate's the last that shows"
+        );
         assert!(!d.moving());
         assert_eq!(d.lane().count(), 0);
         assert_eq!(*d.funnel(), funnel, "a plain name leaves no trace");
+    }
+
+    #[test]
+    fn a_passing_name_leaves_at_the_gates_cell_not_at_the_left_edge() {
+        // Seven letters: it enters at the right edge in the tick that takes it from the queue (head -1),
+        // moves a cell a tick, and is gone once its last letter is under `HOME`, from cell 16 (`LANE_END`).
+        // Running on to the left edge it would take four ticks more.
+        let mut d = Drain::new(7);
+        d.offer("abc.org", NameKind::Plain);
+        let (mut ticks, mut furthest) = (0, 0);
+        while d.moving() && ticks < 100 {
+            d.tick(false);
+            ticks += 1;
+            furthest = furthest.max(d.lane().map(|t| t.cell).max().unwrap_or(0));
+            assert!(
+                d.lane().all(|t| t.cell < LANE_END),
+                "no tile under `HOME`, tick {ticks}"
+            );
+        }
+        assert_eq!(
+            furthest, GATE_CELL,
+            "the gate's cell is the last it shows in"
+        );
+        assert_eq!(ticks, 24);
+        assert!(d.idle() && !d.moving());
+        // A refused name is not changed by it: it stops one cell before the gate, as before.
+        let mut d = Drain::new(7);
+        d.offer("doubleclick.net", NameKind::Refused);
+        tick_to_step(&mut d, 1);
+        assert_eq!(d.names[0].head, 14);
     }
 
     #[test]
@@ -1729,12 +1728,7 @@ mod tests {
             blocking: Blocking::Paused { left_secs: 277 },
             gate_fill: 1,
             count: Some(4780),
-            alert: Some(alert_card(
-                "threat",
-                true,
-                "secure-login-verify.example.org",
-                None,
-            )),
+            gate_ask: true,
             words: Some(LaneWords::Quiet { minutes: 47 }),
         };
         let mut shown = Stills::default();
@@ -1744,7 +1738,7 @@ mod tests {
             let changed = [
                 ("blocking", shown.blocking != now.blocking),
                 ("gate_fill", shown.gate_fill != now.gate_fill),
-                ("alert", shown.alert != now.alert),
+                ("gate_ask", shown.gate_ask != now.gate_ask),
                 ("count", shown.count != now.count),
                 ("percent", shown.percent != now.percent),
                 ("clock", shown.clock != now.clock),
@@ -1761,7 +1755,7 @@ mod tests {
             [
                 "blocking",
                 "gate_fill",
-                "alert",
+                "gate_ask",
                 "count",
                 "percent",
                 "clock",
@@ -1795,156 +1789,13 @@ mod tests {
     }
 
     #[test]
-    fn alert_cards_for_every_kind() {
-        let v4 = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 23)));
-        let v6 = Some(IpAddr::V6(Ipv6Addr::new(
-            0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x17,
-        )));
-        let titles = [
-            ("threat", "THREAT", "BLOCKED"),
-            ("rebind", "REBIND", "BLOCKED"),
-            ("dga", "RANDOM", "NAMES"),
-            ("tunnel", "DNS", "TUNNEL"),
-            ("beacon", "BEACON", "SEEN"),
-            ("burst", "QUERY", "BURST"),
-            ("new_device", "NEW", "DEVICE"),
-            ("arp_spoof", "ARP", "SPOOF"),
-            ("odd_kind_of_thing", "ODD", "KIND_OF_THING"),
-            ("solo", "SOLO", ""),
-            ("", "", ""),
-        ];
-        for (kind, one, two) in titles {
-            let card = alert_card(kind, true, "secure-login-verify.example.org", v4);
-            assert_eq!(card.title, [one.to_string(), two.to_string()], "{kind}");
-            assert!(card.high);
-        }
-        let card = alert_card("threat", false, "ads.example.org", v4);
-        assert!(!card.high);
-        assert_eq!(card.subject, ["ads.example.org", ""]);
-        assert_eq!(card.who, "asked by 192.0.2.23");
-        assert_eq!(
-            alert_card("dga", true, "x", v6).who,
-            "asked by 2001:db8::17"
-        );
-        assert_eq!(alert_card("dga", true, "x", None).who, "");
-        // A device is "at" an address, it has asked nothing.
-        assert_eq!(
-            alert_card("new_device", false, "x", v4).who,
-            "at 192.0.2.23"
-        );
-        assert_eq!(
-            alert_card("arp_spoof", true, "x", v6).who,
-            "at 2001:db8::17"
-        );
-        assert_eq!(alert_card("new_device", false, "x", None).who, "");
-        // The subject is lower-cased and made safe like a lane name, and set on two lines of 26 cells.
-        // Past 52 cells the start goes and a `~` leads.
-        let long = format!("Secure-Login-Verify.{}.EXAMPLE.org.", "a".repeat(40));
-        let card = alert_card("threat", true, &long, None);
-        assert_eq!(
-            card.subject,
-            [
-                format!("~{}", "a".repeat(25)),
-                format!("{}.example.org", "a".repeat(14))
-            ]
-        );
-        assert_eq!(
-            alert_card("threat", true, "bücher.example", None).subject,
-            ["b?cher.example", ""]
-        );
-        // Nothing is wider than its place, whatever the kind or the address.
-        let wide = alert_card(&"x_".repeat(100), true, "", v6);
-        assert!(wide.title.iter().all(|t| t.chars().count() <= 13));
-        let widest = IpAddr::V6(Ipv6Addr::new(
-            0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
-        ));
-        let wide = alert_card("dga", true, "", Some(widest));
-        assert_eq!(wide.who.chars().count(), 29);
-        assert!(wide.who.ends_with('~'));
-        // The card is clone and equal, and says nothing of a name when it is printed.
-        assert!(card.clone() == card);
-        assert!(!format!("{card:?}").contains("secure"));
-        assert!(!format!("{card:?}").contains("aaaa"));
-    }
-
-    #[test]
-    fn alert_subject_wraps_after_a_dot() {
-        let lines = |name: &str| alert_card("threat", true, name, None).subject;
-        // One line when it fits, with nothing on the second.
-        assert_eq!(
-            lines("secure-login-verify.top"),
-            ["secure-login-verify.top", ""]
-        );
-        assert_eq!(lines(&"x".repeat(26)), ["x".repeat(26), String::new()]);
-        // Past 26 it breaks after the last dot that leaves the second line no more than 26.
-        assert_eq!(
-            lines("secure-login-verify.example.org"),
-            ["secure-login-verify.", "example.org"]
-        );
-        assert_eq!(
-            lines("secure-login-verify.accounts-billing.example"),
-            ["secure-login-verify.", "accounts-billing.example"]
-        );
-        // The dot at cell 20 would leave 28 for the second line, so it breaks at 26.
-        assert_eq!(
-            lines("secure-login-verify.accounts-billing.example.org"),
-            ["secure-login-verify.accoun", "ts-billing.example.org"]
-        );
-        // No such dot: break at 26.
-        assert_eq!(lines(&"a".repeat(40)), ["a".repeat(26), "a".repeat(14)]);
-        assert_eq!(
-            lines(&format!("{}.org", "a".repeat(30))),
-            ["a".repeat(26), "aaaa.org".to_string()]
-        );
-        assert_eq!(
-            lines(&format!("ab.{}", "c".repeat(40))),
-            [format!("ab.{}", "c".repeat(23)), "c".repeat(17)],
-            "the dot at cell 3 would leave the second line 40 cells"
-        );
-        // 27 cells is the least that wraps.
-        assert_eq!(lines(&"x".repeat(27)), ["x".repeat(26), "x".to_string()]);
-        // Both lines are never more than 26, whatever the name.
-        for len in 0..120 {
-            for name in [
-                "a".repeat(len),
-                format!("{}.{}.org", "b".repeat(len / 3), "c".repeat(len / 2)),
-                "d.".repeat(len),
-            ] {
-                let [first, second] = lines(&name);
-                assert!(
-                    first.chars().count() <= 26 && second.chars().count() <= 26,
-                    "{len}"
-                );
-                assert!(second.is_empty() || first.chars().count() >= 1);
-            }
-        }
-        // The card says what lines it has.
-        let card = alert_card("threat", true, "secure-login-verify.example.org", None);
-        assert_eq!(card.subject_lines().count(), 2);
-        let card = alert_card("threat", true, "example.org", None);
-        assert_eq!(card.subject_lines().collect::<Vec<_>>(), ["example.org"]);
-        assert_eq!(
-            alert_card("threat", true, "", None).subject_lines().count(),
-            0
-        );
-    }
-
-    #[test]
     fn stills_say_nothing_of_a_name_when_printed() {
+        // The figures hold no name at all: a gate ask is a flag.
         let stills = Stills {
-            alert: Some(alert_card(
-                "threat",
-                true,
-                "secure-login-verify.example.org",
-                Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 23))),
-            )),
+            gate_ask: true,
             ..Stills::default()
         };
-        let shown = format!("{stills:?}");
-        assert!(
-            !shown.contains("secure") && !shown.contains("192.0.2.23"),
-            "{shown}"
-        );
+        assert!(format!("{stills:?}").contains("gate_ask: true"));
         // A tile is one letter of a name.
         let mut d = Drain::new(7);
         d.offer("zzz.example.org", NameKind::Plain);
@@ -1982,7 +1833,7 @@ mod tests {
             }
             assert!(d.queue.len() <= 4);
             assert!(d.names.len() <= 21);
-            assert!(d.lane().all(|t| t.cell < 20 && t.drip <= 12));
+            assert!(d.lane().all(|t| t.cell < LANE_END && t.drip <= 12));
             assert!(d.landing <= FUNNEL_CELLS);
             if d.refusal_step().is_some() {
                 assert!(d.moving());

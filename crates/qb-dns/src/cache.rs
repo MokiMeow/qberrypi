@@ -157,6 +157,15 @@ pub(crate) struct Cache {
     entries: Lru<Key, Entry>,
     /// Whether [`Hit::Fresh`] ever asks for a prefetch.
     prefetch: bool,
+    /// The bytes of every stored answer and of its name, which is held twice: in the map's key
+    /// and in the slot's. Kept as entries come and go, so that [`Cache::heap_bytes`] costs no
+    /// walk over them.
+    boxed: usize,
+}
+
+/// The bytes that `key` and `entry` hold outside the cache's tables.
+fn boxed_bytes(key: &Key, entry: &Entry) -> usize {
+    entry.body.len() + 2 * key.name.len()
 }
 
 impl Cache {
@@ -165,7 +174,14 @@ impl Cache {
         Self {
             entries: Lru::new(capacity),
             prefetch: false,
+            boxed: 0,
         }
+    }
+
+    /// About how many bytes of the heap the cache holds: its tables at their capacity, and the
+    /// answers and names stored in them. The allocator's own overhead is not counted.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.entries.table_bytes() + self.boxed
     }
 
     /// Turns prefetch on or off; it is off until set. On, a fresh hit says so, once per stored
@@ -201,13 +217,21 @@ impl Cache {
             hits: 0,
             prefetch_asked: false,
         };
-        self.entries.insert(key, entry);
+        if let Some(old) = self.entries.peek(&key) {
+            self.boxed -= boxed_bytes(&key, old);
+        }
+        self.boxed += boxed_bytes(&key, &entry);
+        if let Some((gone_key, gone)) = self.entries.insert(key, entry) {
+            self.boxed -= boxed_bytes(&gone_key, &gone);
+        }
         true
     }
 
     /// Drops the entry stored under `key`, fresh, stale or otherwise; nothing if there is none.
     pub(crate) fn remove(&mut self, key: &Key) {
-        self.entries.remove(key);
+        if let Some(gone) = self.entries.remove(key) {
+            self.boxed -= boxed_bytes(key, &gone);
+        }
     }
 
     /// The answer stored under `key`, as it stands at `mono_secs`: fresh, stale, or `None`. A hit
@@ -219,7 +243,7 @@ impl Cache {
         let age = mono_secs.saturating_sub(entry.stored_at);
         let servable_for = u64::from(entry.lifetime).saturating_add(STALE_MAX_SECS);
         if age >= servable_for {
-            self.entries.remove(key);
+            self.remove(key);
             return None;
         }
 
@@ -612,6 +636,33 @@ mod tests {
                 refresh: false
             })
         );
+    }
+
+    #[test]
+    fn the_heap_bytes_follow_the_answers_that_come_and_go() {
+        let mut c = Cache::new(2);
+        let empty = c.heap_bytes();
+        // "example.com" is 11 bytes, held twice.
+        c.insert(key(1, false), vec![0; 100], 60, 0);
+        let one = c.heap_bytes();
+        assert!(one >= empty + 100 + 22, "{empty} {one}");
+        let tables = one - 122;
+        // Replaced, it counts once, at its new length.
+        c.insert(key(1, false), vec![0; 50], 60, 0);
+        assert_eq!(c.heap_bytes(), tables + 72);
+        c.insert(key(2, false), vec![0; 10], 60, 0);
+        // A third evicts the oldest: the first, with its 72.
+        c.insert(key(3, false), vec![0; 10], 60, 0);
+        let tables_now = c.entries.table_bytes();
+        assert_eq!(c.heap_bytes(), tables_now + 2 * 32);
+        // Removed, and gone stale past serving, they count no more.
+        c.remove(&key(2, false));
+        assert_eq!(c.heap_bytes(), c.entries.table_bytes() + 32);
+        assert!(c.get(&key(3, false), 60 + STALE_MAX_SECS).is_none());
+        assert_eq!(c.heap_bytes(), c.entries.table_bytes());
+        // A body over the limit is not stored, and not counted.
+        c.insert(key(4, false), vec![0; MAX_ENTRY_BYTES + 1], 60, 0);
+        assert_eq!(c.heap_bytes(), c.entries.table_bytes());
     }
 
     #[test]

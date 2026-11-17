@@ -166,11 +166,11 @@ impl AlertStore {
     }
 }
 
-/// What the front panel reads of the store: the alert that it takes over its screen for, and the
-/// tap that acknowledges it.
+/// What the front panel reads of the store: the alert that it opens, how many wait, and the tap that
+/// acknowledges one.
 ///
-/// Both take the store's own lock, as `list` and `ack` do, and hold it for one pass over the ring
-/// (at most `CAPACITY` alerts) and one copy. Neither takes any other lock or waits for anything,
+/// Each takes the store's own lock, as `list` and `ack` do, and holds it for one pass over the ring
+/// (at most `CAPACITY` alerts) and one copy. None takes any other lock or waits for anything,
 /// so the panel never holds up the resolver's answer path, which raises into this store.
 impl PendingAlerts for AlertStore {
     /// The newest alert of the highest severity among those not acknowledged: the one raised
@@ -188,7 +188,20 @@ impl PendingAlerts for AlertStore {
             severity: top.severity.into(),
             client: top.client,
             subject: top.subject.clone(),
+            count: top.count,
+            first_unix: top.first_unix,
+            last_unix: top.last_unix,
         })
+    }
+
+    fn waiting_count(&self) -> u32 {
+        let waiting = self
+            .lock()
+            .alerts
+            .iter()
+            .filter(|alert| !alert.acked)
+            .count();
+        u32::try_from(waiting).unwrap_or(u32::MAX)
     }
 
     fn ack(&self, id: u64) {
@@ -866,6 +879,38 @@ mod tests {
         // acknowledges the alert that is in the ring, as `restore_acked` says.
         assert_eq!(store.restore_acked(&[high]), 1);
         assert!(store.list(0).alerts.iter().all(|a| a.acked));
+    }
+
+    #[test]
+    fn the_panel_reads_how_many_wait_and_how_often_and_since_when_the_top_one_came() {
+        let (store, _, unix) = store();
+        let panel: &dyn PendingAlerts = &store;
+        assert_eq!(panel.waiting_count(), 0);
+        store.raise(alert("beacon", "example.org"));
+        unix.store(1_700_000_050, Ordering::SeqCst);
+        store.raise(alert("beacon", "example.org"));
+        unix.store(1_700_000_090, Ordering::SeqCst);
+        store.raise(alert("tunnel", "example.com"));
+        // Two alerts wait, not three: a repeat is one alert.
+        assert_eq!(panel.waiting_count(), 2);
+        let top = panel.top().unwrap();
+        assert_eq!(top.kind, "tunnel");
+        assert_eq!(
+            (top.count, top.first_unix, top.last_unix),
+            (1, 1_700_000_090, 1_700_000_090)
+        );
+        panel.ack(top.id);
+        assert_eq!(panel.waiting_count(), 1);
+        let top = panel.top().unwrap();
+        assert_eq!(top.kind, "beacon");
+        assert_eq!(
+            (top.count, top.first_unix, top.last_unix),
+            (2, 1_700_000_000, 1_700_000_050)
+        );
+        // An acknowledgement the desktop made is a waiting alert less, for the panel too.
+        store.ack(top.id);
+        assert_eq!(panel.waiting_count(), 0);
+        assert!(panel.top().is_none());
     }
 
     #[test]

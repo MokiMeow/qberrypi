@@ -11,8 +11,13 @@
 //! that is a client whose address is in the exempt set; in the exempt-by-default mode it is every
 //! client but one whose address is fully blocked.
 //!
+//! The one link between a name and the device that asked it is the opt-in table of
+//! [`watched`]: a query is kept there only for an address that asked to be shown its own, and
+//! for a short while ([`Dns::watched`]).
+//!
 //! Nothing here logs a name that is asked for, or an address that asks.
 
+pub mod admit;
 pub mod client;
 pub mod clients;
 pub mod dot;
@@ -20,7 +25,12 @@ pub mod exempt;
 pub mod listen;
 pub mod threat;
 pub mod upstream;
+pub mod watched;
 
+#[cfg(test)]
+mod burstbench;
+#[cfg(test)]
+mod hostbench;
 #[cfg(test)]
 pub(crate) mod testutil;
 
@@ -31,17 +41,20 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qb_dns::{
-    Action, BlockSet, Filter, Now, Pending, Resolver, ThreatHit, Transport, UpstreamOutcome,
+    Action, BlockSet, Filter, Now, Outcome, Pending, Resolver, ThreatHit, Transport,
+    UpstreamOutcome,
 };
 use tokio::sync::Semaphore;
 
 use crate::alerts::{Alert, Severity};
 use crate::lane::LaneFeed;
 use crate::watch::{Watch, rebind};
+use admit::{Admit, Verdict};
 use clients::Clients;
 use exempt::Exemption;
 use threat::{THREAT_KIND, ThreatThrottle};
 use upstream::Upstreams;
+use watched::Watched;
 
 /// The port that DNS is served on, over UDP and TCP.
 pub const DNS_PORT: u16 = 53;
@@ -114,6 +127,19 @@ impl Bucket {
     }
 }
 
+/// The name of the query that `resolver` logged last, and whether it was blocked, if it logged
+/// one since it had counted `queries_before` queries: a packet that gets no log line (one that
+/// is no query, or a drop) gives `None`. Called with the resolver that just decided the query,
+/// still locked, so that the latest line is that query's.
+fn logged_since(resolver: &Resolver, queries_before: u64) -> Option<(Box<str>, bool)> {
+    let stats = resolver.stats();
+    if stats.total().queries == queries_before {
+        return None;
+    }
+    let latest = stats.recent(1).next()?;
+    Some((latest.name.clone(), latest.outcome == Outcome::Blocked))
+}
+
 /// The DNS service's one resolver and its upstreams.
 pub struct Dns {
     resolver: Arc<Mutex<Resolver>>,
@@ -122,6 +148,14 @@ pub struct Dns {
     forwards: Arc<Semaphore>,
     /// How many permits `forwards` was made with: the most questions that may be out.
     forward_limit: usize,
+    /// Which forwarded questions go to the upstreams, and when: see [`admit`].
+    admit: Admit,
+    /// The forwards that got SERVFAIL from [`Dns::admit`], and those that waited for a token.
+    shed: AtomicU64,
+    paced: AtomicU64,
+    /// When a line about shed forwards was last logged, in seconds since the start, plus one: 0
+    /// for never.
+    shed_logged: AtomicU64,
     /// What limits the prefetches that are sent, apart from how many questions are out. Never
     /// held across an `.await`.
     prefetch_bucket: Mutex<Bucket>,
@@ -141,6 +175,10 @@ pub struct Dns {
     watch: OnceLock<Watch>,
     /// The devices that asked. Locked for one insert or one copy out, never across an `.await`.
     clients: Mutex<Clients>,
+    /// The devices that opted in to see their own queries, and those queries. Locked for one
+    /// look, one insert or one copy out, never across an `.await` and never with the resolver
+    /// locked: it is taken on its own, so that no order of the two locks can matter.
+    watched: Mutex<Watched>,
     /// Whether an answer has been sent to a device that the table would count.
     first_answer: AtomicBool,
     /// Where the names that the front panel shows are offered, once there is a panel.
@@ -182,6 +220,10 @@ impl Dns {
             upstreams,
             forwards: Arc::new(Semaphore::new(forwards)),
             forward_limit: forwards,
+            admit: Admit::new(),
+            shed: AtomicU64::new(0),
+            paced: AtomicU64::new(0),
+            shed_logged: AtomicU64::new(0),
             prefetch_bucket: Mutex::new(Bucket::new(tokio::time::Instant::now())),
             prefetched: AtomicU64::new(0),
             prefetches_skipped: AtomicU64::new(0),
@@ -191,6 +233,7 @@ impl Dns {
             utc_offset: AtomicI32::new(0),
             watch: OnceLock::new(),
             clients: Mutex::default(),
+            watched: Mutex::default(),
             first_answer: AtomicBool::new(false),
             lane: OnceLock::new(),
             exempt: Arc::default(),
@@ -218,6 +261,13 @@ impl Dns {
     /// rules apply: copy what is needed out, and never hold the guard across an `.await`.
     pub fn clients(&self) -> MutexGuard<'_, Clients> {
         self.clients.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The devices that opted in to see their own queries, locked. It is taken whether or not a
+    /// holder panicked, and the same rules apply: copy what is needed out, never hold the guard
+    /// across an `.await`, and never take the resolver's lock while holding it.
+    pub fn watched(&self) -> MutexGuard<'_, Watched> {
+        self.watched.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Notes that the device at `addr` has asked, at this moment. An address that is no device
@@ -347,8 +397,17 @@ impl Dns {
     /// change of the set waits on, and a binary search. Neither allocates.
     ///
     /// A query that is blocked as a threat may raise an alert on the watch's sink, after the
-    /// resolver is unlocked ([`Dns::threat_hit`]). Every other answer costs that check and one
-    /// test of an `Option` more than the resolver's own decision: no other lock, no allocation.
+    /// resolver is unlocked ([`Dns::threat_hit`]).
+    ///
+    /// A query of a client that [`clients::counted`] takes for a device and that opted in to see
+    /// its own queries ([`Dns::watched`]) is kept for it, name and outcome, once the resolver is
+    /// unlocked: the name is copied out under the resolver's lock, from the log line that the
+    /// resolver wrote for the query, and only for a watched client. Every other answer costs
+    /// that check and one test of an `Option` more than the resolver's own decision, and one look
+    /// in the watched table: its lock is taken alone, never with the resolver's, and held for a
+    /// scan of at most [`watched::MAX_WATCHED`] addresses, which also forgets those that have
+    /// been idle for [`watched::IDLE_SECS`], so that a device that went quiet does not keep its
+    /// queries here for want of a call of the route. It allocates nothing.
     pub(crate) fn decide_from(
         &self,
         packet: &[u8],
@@ -357,16 +416,31 @@ impl Dns {
     ) -> Action {
         let filter = self.filter_for(client);
         let now = self.now();
+        let watching = client
+            .and_then(clients::counted)
+            .filter(|&addr| self.watched().is_watching(addr, now.mono_secs));
         let mut resolver = self.resolver();
         let lane = self
             .lane
             .get()
             .map(|lane| (lane, resolver.stats().total().queries));
+        let queries_before = watching.map(|_| resolver.stats().total().queries);
         let (action, hit) = resolver.handle_query_filtered(packet, transport, now, filter);
         if let Some((lane, before)) = lane {
-            lane.offer_latest(&resolver, before, now);
+            lane.offer_latest(&resolver, before, now, client);
         }
+        let asked = queries_before.and_then(|before| logged_since(&resolver, before));
         drop(resolver);
+        if let (Some(addr), Some((name, refused))) = (watching, asked) {
+            self.watched().note(
+                addr,
+                now.mono_secs,
+                now.unix_secs,
+                &name,
+                refused,
+                hit.is_some(),
+            );
+        }
         if let Some(hit) = hit {
             self.threat_hit(hit, client, now.mono_secs);
         }
@@ -437,8 +511,32 @@ impl Dns {
             Action::Reply(bytes) => Some(bytes),
             Action::Drop => None,
             Action::Forward(pending) => {
+                // The permit first, and then the device's place and the token (the device's last),
+                // so that a question that is refused spends nothing.
                 let Ok(_permit) = self.forwards.try_acquire() else {
                     return pending.servfail();
+                };
+                let _ticket = match client {
+                    Some(client) => {
+                        let now = self.admit.now();
+                        match self
+                            .admit
+                            .admit(client, pending.name(), pending.qtype(), now)
+                        {
+                            Verdict::Go(wait, ticket) => {
+                                if !wait.is_zero() {
+                                    self.paced.fetch_add(1, Ordering::Relaxed);
+                                    tokio::time::sleep(wait).await;
+                                }
+                                Some(ticket)
+                            }
+                            Verdict::Shed => {
+                                self.note_shed();
+                                return pending.servfail();
+                            }
+                        }
+                    }
+                    None => None,
                 };
                 match self.exchange(&pending, client).await {
                     Some(UpstreamOutcome::Reply(bytes)) => Some(bytes),
@@ -493,6 +591,51 @@ impl Dns {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(tokio::time::Instant::now())
+    }
+
+    /// Lifts [`admit::UPSTREAM_RATE`]: for the host benchmark of the listener, whose upstream is
+    /// a fake on the loopback, and whose load comes from `127.0.0.1`, which no device rate holds.
+    #[cfg(test)]
+    pub(crate) fn lift_upstream_rate(&self) {
+        self.admit.lift_upstream_rate();
+    }
+
+    /// Holds `addrs` (the gateway, and the configured shared clients: a router that relays DNS, a
+    /// mesh that hides its devices behind one address) to the upstreams' rate alone, as the
+    /// board's own `127.0.0.1` is, and to no device's rate or share.
+    pub fn set_shared_clients(&self, addrs: Vec<IpAddr>) {
+        self.admit.set_shared(addrs);
+    }
+
+    /// Counts a forward that got SERVFAIL from the admission, and logs a line for the first of an
+    /// episode: at most once a minute, with no address and no name.
+    fn note_shed(&self) {
+        let shed = self.shed.fetch_add(1, Ordering::Relaxed) + 1;
+        let now = self.started.elapsed().as_secs() + 1;
+        let last = self.shed_logged.load(Ordering::Relaxed);
+        if (last == 0 || now >= last + 60)
+            && self
+                .shed_logged
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            log::info!(
+                "dns: shedding forwarded questions: a device had its share out, or the upstreams' \
+                 rate was spent ({shed} shed since the start)"
+            );
+        }
+    }
+
+    /// How many forwards got SERVFAIL at once since this was made, because their device had
+    /// [`admit::CLIENT_FORWARDS`] out, or would have waited longer than [`admit::PACE_MAX`] for a
+    /// token of its rate or the upstreams'.
+    pub fn forwards_shed(&self) -> u64 {
+        self.shed.load(Ordering::Relaxed)
+    }
+
+    /// How many forwards waited for a token before they went, since this was made.
+    pub fn forwards_paced(&self) -> u64 {
+        self.paced.load(Ordering::Relaxed)
     }
 
     /// How many prefetches were sent since this was made.
@@ -603,6 +746,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::alerts::NullSink;
+    use crate::lane::{LANE_NAME_BYTES, WatchedOutcome};
     use crate::watch::{self, Watch};
 
     use qb_panel::drain::NameKind;
@@ -780,6 +924,140 @@ mod tests {
         let raised = sink.raised_after(2).await;
         assert_eq!(raised.len(), 2);
         assert_eq!(raised[1].2, None);
+    }
+
+    /// A `Dns` that blocks [`threat_set`] over one fake upstream that answers at once.
+    async fn watched_dns() -> (Arc<Dns>, FakeUpstream) {
+        let up = FakeUpstream::start(Reply::Answer(ip("192.0.2.10"))).await;
+        let dns = Dns::new(
+            threat_set(),
+            Upstreams::with(vec![up.addr], ms(300), ms(600)),
+            Box::new(FixedOffset(0)),
+        );
+        (dns, up)
+    }
+
+    /// Makes `dns` watch the device at 192.0.2.`last`, at this moment: what is kept for it now.
+    fn watch_client(dns: &Dns, last: u8) -> watched::Mine {
+        let now = dns.now();
+        dns.watched()
+            .touch(Ipv4Addr::new(192, 0, 2, last), now.mono_secs, now.unix_secs)
+    }
+
+    #[tokio::test]
+    async fn a_watched_clients_answers_reach_its_ring() {
+        let (dns, up) = watched_dns().await;
+        watch_client(&dns, 20);
+        // One query is blocked, decided on the UDP listener's path, and one is forwarded, on the
+        // TCP listener's.
+        blocked_reply(&dns, "ads.example.com", client(20));
+        let packet = client::query(5, "example.org", TYPE_A).unwrap();
+        assert!(
+            dns.answer_for(&packet, Transport::Tcp, client(20))
+                .await
+                .is_some()
+        );
+        assert_eq!(up.udp_queries(), 1);
+        // Others ask the same names: another device, this program, and a packet that is no query.
+        blocked_reply(&dns, "ads.example.com", client(21));
+        let _ = dns.answer_for(&packet, Transport::Udp, client(21)).await;
+        let _ = dns.answer_for(&packet, Transport::Udp, None).await;
+        let _ = dns.answer_for(b"\x01", Transport::Udp, client(20)).await;
+
+        let mine = watch_client(&dns, 20);
+        assert_eq!(
+            (mine.asked_24h, mine.refused_24h, mine.threats_24h),
+            (2, 1, 0)
+        );
+        let kept: Vec<_> = mine
+            .recent
+            .iter()
+            .map(|seen| (&*seen.name, seen.refused, seen.threat))
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                ("example.org", false, false),
+                ("ads.example.com", true, false)
+            ]
+        );
+        // What the other device asked is not kept for it: it did not opt in.
+        assert_eq!(dns.watched().len(), 1);
+        assert!(!dns.watched().is_watching(Ipv4Addr::new(192, 0, 2, 21), 0));
+    }
+
+    #[tokio::test]
+    async fn a_threat_block_is_kept_as_refused_and_as_a_threat() {
+        let (dns, _up) = watched_dns().await;
+        watch_client(&dns, 20);
+        // The name is kept as the resolver records it, whatever the spelling.
+        blocked_reply(&dns, "X.Bad.EXAMPLE.net", client(20));
+        blocked_reply(&dns, "ads.example.com", client(20));
+        let mine = watch_client(&dns, 20);
+        assert_eq!(
+            (mine.asked_24h, mine.refused_24h, mine.threats_24h),
+            (2, 2, 1)
+        );
+        let kept: Vec<_> = mine
+            .recent
+            .iter()
+            .map(|seen| (&*seen.name, seen.threat))
+            .collect();
+        assert_eq!(
+            kept,
+            [("ads.example.com", false), ("x.bad.example.net", true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_the_table_does_not_count_is_never_kept() {
+        let (dns, _up) = watched_dns().await;
+        // Loopback is the Pi's own, and an IPv6 peer is no device: even if one asked to be
+        // watched, nothing that it asks is kept.
+        let loopback = Ipv4Addr::LOCALHOST;
+        let now = dns.now();
+        dns.watched().touch(loopback, now.mono_secs, now.unix_secs);
+        blocked_reply(&dns, "ads.example.com", Some(IpAddr::V4(loopback)));
+        blocked_reply(
+            &dns,
+            "ads.example.com",
+            Some(IpAddr::V6(loopback.to_ipv6_mapped())),
+        );
+        blocked_reply(
+            &dns,
+            "ads.example.com",
+            Some("2001:db8::1".parse().unwrap()),
+        );
+        let now = dns.now();
+        let mine = dns.watched().touch(loopback, now.mono_secs, now.unix_secs);
+        assert_eq!(mine.asked_24h, 0);
+        assert!(mine.recent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_query_forgets_the_watched_devices_that_went_idle() {
+        let (dns, _up) = watched_dns().await;
+        // 192.0.2.20 opts in at second 0 and is never heard from again: it is switched off.
+        watch_client(&dns, 20);
+        let mut dns = Arc::try_unwrap(dns).ok().expect("nothing else holds it");
+        dns.started -= Duration::from_secs(600);
+        let dns = Arc::new(dns);
+        // 192.0.2.21 opts in at second 600, and asks DNS after 1,000 seconds, with no call of
+        // the route in between: the first has been idle for more than 15 minutes by then.
+        watch_client(&dns, 21);
+        let mut dns = Arc::try_unwrap(dns).ok().expect("nothing else holds it");
+        dns.started -= Duration::from_secs(400);
+        let dns = Arc::new(dns);
+        assert_eq!(dns.watched().len(), 2);
+        blocked_reply(&dns, "ads.example.com", client(21));
+        assert_eq!(dns.watched().len(), 1);
+        assert!(
+            !dns.watched()
+                .is_watching(Ipv4Addr::new(192, 0, 2, 20), dns.now().mono_secs)
+        );
+        // The one that is fresh keeps what it asked.
+        let mine = watch_client(&dns, 21);
+        assert_eq!((mine.asked_24h, mine.refused_24h), (1, 1));
     }
 
     /// The addresses that a client of `dns` gets for `name` A over UDP: through the upstream, the
@@ -1256,6 +1534,34 @@ mod tests {
             "observe, full feed:       {:8.1} ns per call",
             ns_per_observe(&full, &reply, TIMED_CALLS)
         );
+
+        // The lane's hook, which every cached, blocked and forwarded answer is offered to, for a
+        // blocked name that finds room: with nobody watched, which is what the board does but for
+        // the while a device's screen is open; with another device watched; and for the device
+        // that is. The first is the cost of the hook before there was a watch, and one relaxed
+        // load.
+        let lane = LaneFeed::new();
+        let dns = offline(&["ads.example.org"], &[], Some(&lane));
+        ask_from(&dns, "ads.example.org", 1, host(7));
+        ns_per_offer(&dns, &lane, host(7), TIMED_CALLS);
+        println!(
+            "lane hook, nobody watched:           {:8.1} ns per call",
+            ns_per_offer(&dns, &lane, host(7), TIMED_CALLS)
+        );
+        lane.watch_client(Some(Ipv4Addr::new(192, 0, 2, 99)));
+        ns_per_offer(&dns, &lane, host(7), TIMED_CALLS);
+        println!(
+            "lane hook, another device watched:   {:8.1} ns per call",
+            ns_per_offer(&dns, &lane, host(7), TIMED_CALLS)
+        );
+        println!(
+            "lane hook, no client, one watched:   {:8.1} ns per call",
+            ns_per_offer(&dns, &lane, None, TIMED_CALLS)
+        );
+        println!(
+            "lane hook, the watched device asks:  {:8.1} ns per call",
+            ns_per_offer(&dns, &lane, host(99), TIMED_CALLS)
+        );
     }
 
     // Hot path: every cached, blocked and forwarded answer is offered, and none may wait on it.
@@ -1596,6 +1902,190 @@ mod tests {
         assert_eq!(taken(&first), [named("ads.example.org", NameKind::Refused)]);
     }
 
+    /// The names and outcomes that `lane` has kept of the watched device, newest first.
+    fn watched(lane: &LaneFeed) -> Vec<(String, WatchedOutcome)> {
+        let mut out = Vec::new();
+        lane.watched_names(&mut out);
+        out.into_iter().map(|n| (n.name, n.outcome)).collect()
+    }
+
+    /// What `dns` decides for `name` of record type `qtype`, as `client` asks over UDP.
+    fn ask_from(dns: &Dns, name: &str, qtype: u16, client: Option<IpAddr>) -> Action {
+        dns.decide_from(
+            &client::query(1, name, qtype).unwrap(),
+            Transport::Udp,
+            client,
+        )
+    }
+
+    /// The address 192.0.2.`host` as a client.
+    fn host(host: u8) -> Option<IpAddr> {
+        Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, host)))
+    }
+
+    #[test]
+    fn the_names_of_the_watched_device_are_kept_with_how_they_were_answered() {
+        let lane = LaneFeed::new();
+        let dns = offline(&["ads.example.org"], &[], Some(&lane));
+        // Nobody is watched: nothing is kept, whoever asks.
+        ask_from(&dns, "news.example.org", 1, host(7));
+        assert_eq!(watched(&lane), []);
+
+        lane.watch_client(Some(Ipv4Addr::new(192, 0, 2, 7)));
+        assert_eq!(watched(&lane), []);
+        ask_from(&dns, "news.example.org", 1, host(7));
+        ask_from(&dns, "ads.example.org", 1, host(7));
+        // Other devices, and this program (no client), are no part of it.
+        ask_from(&dns, "other.example.org", 1, host(8));
+        ask_from(&dns, "ads.example.org", 1, host(8));
+        ask_from(&dns, "other.example.org", 1, None);
+        ask_from(
+            &dns,
+            "other.example.org",
+            1,
+            Some(IpAddr::V6("2001:db8::7".parse().unwrap())),
+        );
+        assert_eq!(
+            watched(&lane),
+            [
+                ("ads.example.org".to_owned(), WatchedOutcome::Refused),
+                ("news.example.org".to_owned(), WatchedOutcome::Answered),
+            ]
+        );
+        // The copy takes nothing: the names stay for the next frame of the screen.
+        assert_eq!(watched(&lane).len(), 2);
+        // The lane saw all the names there were, as ever.
+        let names: Vec<_> = taken(&lane).into_iter().map(|(name, _)| name).collect();
+        assert!(names.contains(&"ads.example.org".to_owned()));
+    }
+
+    #[test]
+    fn a_watched_device_holds_the_last_two_names_and_a_second_type_of_a_name_is_the_same_name() {
+        let lane = LaneFeed::new();
+        let dns = offline(&["ads.example.org"], &[], Some(&lane));
+        lane.watch_client(Some(Ipv4Addr::new(192, 0, 2, 7)));
+        for name in ["a.example.org", "b.example.org", "c.example.org"] {
+            ask_from(&dns, name, 1, host(7));
+        }
+        let names = |lane: &LaneFeed| -> Vec<String> {
+            watched(lane).into_iter().map(|(name, _)| name).collect()
+        };
+        assert_eq!(names(&lane), ["c.example.org", "b.example.org"]);
+        // An AAAA for the name it asked last is that name again, not a second one.
+        ask_from(&dns, "c.example.org", 28, host(7));
+        assert_eq!(names(&lane), ["c.example.org", "b.example.org"]);
+        // One for the name before it brings that name up.
+        ask_from(&dns, "b.example.org", 28, host(7));
+        assert_eq!(names(&lane), ["b.example.org", "c.example.org"]);
+    }
+
+    #[test]
+    fn a_name_that_is_listed_but_let_through_is_passed_and_an_ipv4_in_ipv6_is_the_same_client() {
+        let lane = LaneFeed::new();
+        let dns = offline(&["ads.example.org"], &[], Some(&lane));
+        lane.watch_client(Some(Ipv4Addr::new(192, 0, 2, 7)));
+        // The device is exempt: the ads name is let through, and the screen says so.
+        dns.exempt()
+            .listed()
+            .replace(&[Ipv4Addr::new(192, 0, 2, 7)]);
+        let mapped = Some(IpAddr::V6(Ipv4Addr::new(192, 0, 2, 7).to_ipv6_mapped()));
+        ask_from(&dns, "ads.example.org", 1, mapped);
+        assert_eq!(
+            watched(&lane),
+            [("ads.example.org".to_owned(), WatchedOutcome::Passed)]
+        );
+        // The same name in a pause is passed for any device that is watched.
+        dns.exempt().listed().replace(&[]);
+        ask_from(&dns, "ads.example.org", 1, host(7));
+        assert_eq!(
+            watched(&lane),
+            [("ads.example.org".to_owned(), WatchedOutcome::Refused)]
+        );
+        pause(&dns);
+        ask_from(&dns, "ads.example.org", 1, host(7));
+        assert_eq!(
+            watched(&lane),
+            [("ads.example.org".to_owned(), WatchedOutcome::Passed)]
+        );
+    }
+
+    #[test]
+    fn watching_another_device_or_nobody_forgets_what_was_kept() {
+        let lane = LaneFeed::new();
+        let dns = offline(&[], &[], Some(&lane));
+        lane.watch_client(Some(Ipv4Addr::new(192, 0, 2, 7)));
+        ask_from(&dns, "a.example.org", 1, host(7));
+        assert_eq!(watched(&lane).len(), 1);
+        // Another device: the names of the first are gone, and only the second's are kept.
+        lane.watch_client(Some(Ipv4Addr::new(192, 0, 2, 8)));
+        assert_eq!(watched(&lane), []);
+        ask_from(&dns, "b.example.org", 1, host(7));
+        ask_from(&dns, "c.example.org", 1, host(8));
+        assert_eq!(
+            watched(&lane),
+            [("c.example.org".to_owned(), WatchedOutcome::Answered)]
+        );
+        // Nobody: what was kept is gone and nothing more is kept, and 0.0.0.0 is nobody.
+        lane.watch_client(None);
+        assert_eq!(watched(&lane), []);
+        ask_from(&dns, "d.example.org", 1, host(8));
+        assert_eq!(watched(&lane), []);
+        lane.watch_client(Some(Ipv4Addr::UNSPECIFIED));
+        ask_from(
+            &dns,
+            "d.example.org",
+            1,
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        );
+        assert_eq!(watched(&lane), []);
+    }
+
+    #[test]
+    fn a_name_of_the_watched_device_is_cut_as_the_lanes_are_and_a_busy_ring_drops_it() {
+        let lane = LaneFeed::new();
+        let dns = offline(&[], &[], Some(&lane));
+        lane.watch_client(Some(Ipv4Addr::new(192, 0, 2, 7)));
+        let long = format!("{}.example.org", "a".repeat(40));
+        ask_from(&dns, &long, 1, host(7));
+        assert_eq!(
+            watched(&lane),
+            [("a".repeat(LANE_NAME_BYTES), WatchedOutcome::Answered)]
+        );
+        // The panel's thread holds the ring for a copy: the name is dropped, and nothing waits.
+        {
+            let _held = lane.busy_watch();
+            ask_from(&dns, "held.example.org", 1, host(7));
+        }
+        assert_eq!(watched(&lane).len(), 1);
+    }
+
+    #[test]
+    fn with_no_lane_nothing_is_watched() {
+        // A `Dns` with no lane answers a client as ever, and there is nothing to watch.
+        let dns = offline(&[], &[], None);
+        assert!(matches!(
+            ask_from(&dns, "news.example.org", 1, host(7)),
+            Action::Forward(_)
+        ));
+    }
+
+    /// The ns per call of the lane's hook for the query that `dns` counted last, asked by `client`,
+    /// with the ring emptied every eight calls so that a name finds room in it.
+    fn ns_per_offer(dns: &Dns, lane: &LaneFeed, client: Option<IpAddr>, calls: u32) -> f64 {
+        let now = dns.now();
+        let resolver = dns.resolver();
+        let queries = resolver.stats().total().queries;
+        let started = std::time::Instant::now();
+        for call in 0..calls {
+            if call % 8 == 0 {
+                lane.clear();
+            }
+            // One query fewer than counted: a new one is there to offer.
+            lane.offer_latest(&resolver, black_box(queries - 1), now, black_box(client));
+        }
+        started.elapsed().as_secs_f64() * 1e9 / f64::from(calls)
+    }
+
     /// Calls of `decide` in one timed batch of [`decide_cost_with_and_without_the_lane`].
     const BATCH: usize = 2_000;
     /// Timed batches on each side: 200,000 calls of `decide` on a `Dns`.
@@ -1703,7 +2193,7 @@ mod tests {
                 lane.clear();
             }
             // One query fewer than counted: a new one is there to offer.
-            lane.offer_latest(&resolver, black_box(queries - 1), now);
+            lane.offer_latest(&resolver, black_box(queries - 1), now, None);
         }
         let hook = started.elapsed().as_nanos() as f64 / (BATCH * BATCHES) as f64;
         println!("the hook alone, blocked, room in the lane: {hook:.0} ns");

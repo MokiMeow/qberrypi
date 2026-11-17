@@ -1,0 +1,15 @@
+[package]
+name = "qb-bench"
+description = "A DNS load generator for qberrypi and the servers it is compared with: ramp and steady loads of cached, blocked and forwarded questions, with latency percentiles and CPU use"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rustix = { version = "1.1.6", default-features = false, features = ["std", "event", "net", "param"] }
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+
+[[bin]]
+name = "qb-bench"
+path = "src/main.rs"

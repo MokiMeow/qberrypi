@@ -21,6 +21,7 @@ use super::*;
 use crate::dns::client;
 use crate::dns::testutil::{FakeUpstream, FixedOffset, Reply, ip, ms};
 use crate::panel::{Deps, Panel, Surface};
+use crate::wiring::LiveDevices;
 
 /// The ad names of the synthetic block set.
 const ADS: usize = 300_000;
@@ -196,6 +197,12 @@ pub(crate) fn run(parts: Parts, samples: usize, every: Duration, scale: usize) -
             let (_clock_set, synced) = watch::channel(true);
             slot.fill(running(&dns, &lists, &synced, &ctx.wifi, &ctx.signal));
             slot.fill_alerts(alerts.clone());
+            slot.fill_devices(Arc::new(LiveDevices {
+                devices: devices.clone(),
+                alerts: alerts.clone(),
+                dns: dns.clone(),
+                lane: slot.lane(),
+            }));
             dns.set_lane(slot.lane());
 
             let listeners = listen::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
@@ -229,6 +236,7 @@ pub(crate) fn run(parts: Parts, samples: usize, every: Duration, scale: usize) -
                     calibrate: false,
                     lane: slot.lane(),
                     alerts: slot.clone(),
+                    devices: slot.clone(),
                 };
                 let stop = stop.clone();
                 drop(tokio::task::spawn_blocking(move || {

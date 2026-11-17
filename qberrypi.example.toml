@@ -40,6 +40,10 @@ threat_lists = [
 deny = []
 allow = []
 doh_canary = true         # NXDOMAIN for use-application-dns.net, which turns off browsers' own DoH
+# addresses that stand for many devices (a router that relays DNS, a mesh that puts its devices
+# behind one address): held only to the house's rate of fresh names to the upstreams (50 a second),
+# not to one device's (25), as the gateway is. At most 32.
+shared_clients = []
 
 [upstream]
 tls = false                 # DNS-over-TLS on port 853. Once on, nothing is forwarded unencrypted: until the

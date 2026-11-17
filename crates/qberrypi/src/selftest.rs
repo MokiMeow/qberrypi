@@ -8,13 +8,28 @@
 //! server answers. The marker that every snapshot holds is asked for too: it is blocked only if
 //! the snapshot in the initramfs was loaded before the service listened.
 //!
+//! The API's step is the panel OS's (spec 9): it logs in over loopback, as qnet does, and asks
+//! `GET /api/qbp/devices`, which must answer with a `rev`. The self-test's last line says this
+//! process's resident memory.
+//!
 //! The names asked for are fixed and made up for this, so the card's log holds none of the
 //! household's.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, Error as TlsError, SignatureScheme,
+    StreamOwned, version,
+};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout};
@@ -22,6 +37,7 @@ use tokio::time::{sleep, timeout};
 use crate::dns::client::{Answer, query, read_answer};
 use crate::dns::upstream::UDP_BUFFER;
 use crate::lists::snapshot::MARKER;
+use crate::services::blocking;
 
 /// The kernel argument that has init run the self-test.
 pub const DNS_ARG: &str = "qberrypi.selftest.dns";
@@ -187,6 +203,308 @@ fn status_code_of(head: &str) -> Option<u16> {
     words.next()?.parse().ok()
 }
 
+// ---------------------------------------------------------------------------------------------
+// The API step (panel OS, P1)
+
+/// The password of the API in the scenario that runs the self-test: no secret, the card of a QEMU
+/// run is a throwaway and `cargo xtask qemu-test` makes the hash of this word for it.
+pub const API_PASSWORD: &str = "qemu";
+/// How long the API step is given in all, from the first try to connect to the last byte: the API
+/// binds only after its TLS configuration is made, which in QEMU takes a moment.
+pub const API_WAIT: Duration = Duration::from_secs(20);
+
+/// The path of the login.
+const LOGIN_PATH: &str = "/api/auth";
+/// The path that the API step asks for after the login: the device inventory, which says its
+/// revision (`rev`).
+const DEVICES_PATH: &str = "/api/qbp/devices";
+/// How long a connection to the API may take to be made, once tried.
+const API_CONNECT: Duration = Duration::from_secs(2);
+/// How long the step waits before it tries to connect again.
+const API_RETRY: Duration = Duration::from_millis(200);
+/// The longest start of a reply that is taken.
+const API_MAX_HEAD: usize = 8 * 1024;
+/// The longest body of a reply that is taken.
+const API_MAX_BODY: usize = 1024 * 1024;
+/// The name asked of the certificate: the pin does not look at it.
+const API_NAME: &str = "localhost";
+
+/// Accepts the certificate whose SHA-256 is the pin, whatever the names and dates in it say, and
+/// checks the handshake's signatures with the provider's own algorithms: qnet's trust in the board's
+/// certificate, for the self-test that reads it from the same card file the API does.
+#[derive(Debug)]
+struct Pin {
+    sha256: [u8; 32],
+    algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl ServerCertVerifier for Pin {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        if Sha256::digest(end_entity).as_slice() == self.sha256 {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(TlsError::General("not the pinned certificate".into()))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
+}
+
+/// A TLS client, on the board's provider, that trusts the certificate with this pin and nothing else.
+fn pinned_client(pin: [u8; 32]) -> Option<Arc<ClientConfig>> {
+    let provider = Arc::new(crate::https::provider());
+    let verifier = Pin {
+        sha256: pin,
+        algorithms: provider.signature_verification_algorithms,
+    };
+    let config = ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&version::TLS13, &version::TLS12])
+        .ok()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    Some(Arc::new(config))
+}
+
+/// Logs in to the API at `server` with `password` and asks it for the devices, as qnet does, and
+/// says what came back, as the one line
+///
+/// ```text
+/// selftest: api: /api/qbp/devices: 200 rev
+/// ```
+///
+/// The certificate is the first of `pem` (the card's `tls.pem`, which the API serves), taken by its
+/// pin. Where the line ends `200 rev` the devices came with a revision; `200 no rev` is a reply
+/// without one, `login <code>` a login that was refused, any other number the code of the devices'
+/// reply, `no certificate` a card with no `tls.pem` and `no answer` a step that could not be done
+/// within `wait`. The API may not have bound yet, so the connection is tried again until `wait` is
+/// over. The line names no session, password or byte of the reply.
+///
+/// The whole exchange is blocking work of the pool, the handshake included.
+pub async fn api(server: SocketAddr, pem: Option<&[u8]>, password: &str, wait: Duration) -> String {
+    let outcome = match pem.and_then(crate::api::tls::leaf_sha256) {
+        None => "no certificate".to_owned(),
+        Some(pin) => {
+            let password = password.to_owned();
+            let deadline = Instant::now() + wait;
+            blocking("selftest api", move || {
+                api_exchange(server, pin, &password, deadline)
+            })
+            .await
+            .unwrap_or_else(|_| NO_ANSWER.to_owned())
+        }
+    };
+    format!("selftest: api: {DEVICES_PATH}: {outcome}")
+}
+
+/// [`api`]'s outcome, the words after the path.
+fn api_exchange(server: SocketAddr, pin: [u8; 32], password: &str, deadline: Instant) -> String {
+    api_outcome(server, pin, password, deadline).unwrap_or_else(str::to_owned)
+}
+
+/// The steps of the exchange: connect, handshake, login, devices. An `Err` is the words that say
+/// where it ended.
+fn api_outcome(
+    server: SocketAddr,
+    pin: [u8; 32],
+    password: &str,
+    deadline: Instant,
+) -> Result<String, &'static str> {
+    let config = pinned_client(pin).ok_or(NO_ANSWER)?;
+    let tcp = connect(server, deadline)?;
+    limit(&tcp, deadline)?;
+    let name = ServerName::try_from(API_NAME).map_err(|_| NO_ANSWER)?;
+    let conn = ClientConnection::new(config, name).map_err(|_| NO_ANSWER)?;
+    let mut stream = StreamOwned::new(conn, tcp);
+    while stream.conn.is_handshaking() {
+        limit(&stream.sock, deadline)?;
+        stream
+            .conn
+            .complete_io(&mut stream.sock)
+            .map_err(|_| NO_ANSWER)?;
+    }
+
+    let login = json!({ "password": password }).to_string();
+    let (code, body) = exchange(
+        &mut stream,
+        deadline,
+        &request_text("POST", LOGIN_PATH, None, Some(&login), false),
+    )?;
+    if code != 200 {
+        return Ok(format!("login {code}"));
+    }
+    let sid = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|reply| reply["session"]["sid"].as_str().map(str::to_owned))
+        .ok_or("login without a session")?;
+
+    let (code, body) = exchange(
+        &mut stream,
+        deadline,
+        &request_text("GET", DEVICES_PATH, Some(&sid), None, true),
+    )?;
+    let has_rev = serde_json::from_slice::<Value>(&body).is_ok_and(|reply| reply["rev"].is_u64());
+    // Say goodbye as a client does; whether the server has it by now is of no matter.
+    stream.conn.send_close_notify();
+    let _ = stream.flush();
+    Ok(match (code, has_rev) {
+        (200, true) => "200 rev".to_owned(),
+        (200, false) => "200 no rev".to_owned(),
+        (code, _) => code.to_string(),
+    })
+}
+
+/// A connection to `server`, tried again every [`API_RETRY`] until `deadline`.
+fn connect(server: SocketAddr, deadline: Instant) -> Result<StdTcpStream, &'static str> {
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(NO_ANSWER);
+        }
+        if let Ok(tcp) = StdTcpStream::connect_timeout(&server, left.min(API_CONNECT)) {
+            return Ok(tcp);
+        }
+        std::thread::sleep(API_RETRY.min(left));
+    }
+}
+
+/// Gives every read and write on `tcp` what is left to `deadline`, and no more.
+fn limit(tcp: &StdTcpStream, deadline: Instant) -> Result<(), &'static str> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(NO_ANSWER);
+    }
+    tcp.set_read_timeout(Some(left))
+        .and_then(|()| tcp.set_write_timeout(Some(left)))
+        .map_err(|_| NO_ANSWER)
+}
+
+/// The text of a request: HTTP/1.1, JSON, the session in `X-FTL-SID` when there is one, and the
+/// connection kept unless this is the last request.
+fn request_text(
+    method: &str,
+    path: &str,
+    sid: Option<&str>,
+    body: Option<&str>,
+    last: bool,
+) -> String {
+    let mut text = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {API_NAME}\r\nUser-Agent: selftest\r\nAccept: application/json\r\n"
+    );
+    if let Some(sid) = sid {
+        text.push_str(&format!("X-FTL-SID: {sid}\r\n"));
+    }
+    if let Some(body) = body {
+        text.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    text.push_str(if last {
+        "Connection: close\r\n\r\n"
+    } else {
+        "Connection: keep-alive\r\n\r\n"
+    });
+    text.push_str(body.unwrap_or(""));
+    text
+}
+
+/// What one request on `stream` is answered with: the status code and the body, as long as the
+/// reply's `Content-Length` says, which every reply of the API has.
+fn exchange(
+    stream: &mut StreamOwned<ClientConnection, StdTcpStream>,
+    deadline: Instant,
+    request: &str,
+) -> Result<(u16, Vec<u8>), &'static str> {
+    limit(&stream.sock, deadline)?;
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|_| NO_ANSWER)?;
+    let mut buf = Vec::new();
+    let (code, head, length) = loop {
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut reply = httparse::Response::new(&mut headers);
+        match reply.parse(&buf) {
+            Ok(httparse::Status::Complete(head)) => {
+                let length = reply
+                    .headers
+                    .iter()
+                    .find(|header| header.name.eq_ignore_ascii_case("content-length"))
+                    .and_then(|header| std::str::from_utf8(header.value).ok()?.trim().parse().ok())
+                    .unwrap_or(0_usize);
+                break (reply.code.ok_or(NO_ANSWER)?, head, length);
+            }
+            Ok(httparse::Status::Partial) if buf.len() < API_MAX_HEAD => {}
+            _ => return Err(NO_ANSWER),
+        }
+        read_more(stream, deadline, &mut buf)?;
+    };
+    if length > API_MAX_BODY {
+        return Err(NO_ANSWER);
+    }
+    while buf.len() < head + length {
+        read_more(stream, deadline, &mut buf)?;
+    }
+    Ok((code, buf[head..head + length].to_vec()))
+}
+
+/// Reads what the stream has next onto the end of `buf`; the end of the stream is an error, as the
+/// reply is not whole.
+fn read_more(
+    stream: &mut StreamOwned<ClientConnection, StdTcpStream>,
+    deadline: Instant,
+    buf: &mut Vec<u8>,
+) -> Result<(), &'static str> {
+    limit(&stream.sock, deadline)?;
+    let mut chunk = [0u8; 2048];
+    match stream.read(&mut chunk) {
+        Ok(0) | Err(_) => Err(NO_ANSWER),
+        Ok(read) => {
+            buf.extend_from_slice(&chunk[..read]);
+            Ok(())
+        }
+    }
+}
+
+/// The line that ends the self-test: this process's resident memory in kB, as `/proc/self/status`
+/// says, for the memory check of the panel's milestones (the QEMU guest has no panel, so the
+/// painters' sizes are measured by a unit test, and this is the rest). `unknown` where it cannot
+/// be read.
+pub fn vmrss_line() -> String {
+    match crate::usage::read_rss_kib() {
+        Some(kib) => format!("selftest: vmrss: {kib} kB"),
+        None => "selftest: vmrss: unknown".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +550,7 @@ mod tests {
             started: Instant::now(),
             link: Arc::new(crate::live::WifiStatus::default),
             board_c: Arc::new(|| None),
+            unknown_devices: Arc::new(|| 0),
             update: crate::update::UpdateCtl::off(),
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -288,6 +607,65 @@ mod tests {
         // Six questions, 200 ms each.
         let took = started.elapsed();
         assert!(took >= ms(1000) && took < ms(4000), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn an_api_that_is_not_there_is_given_the_wait_and_no_more() {
+        let pem = crate::api::testutil::pem();
+        let started = Instant::now();
+        let line = api(closed_port(), Some(pem.as_bytes()), "right", ms(700)).await;
+
+        assert_eq!(line, "selftest: api: /api/qbp/devices: no answer");
+        let took = started.elapsed();
+        assert!(took >= ms(600) && took < ms(4000), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn an_api_that_says_nothing_after_the_connection_is_given_the_wait_and_no_more() {
+        // Takes the connection and never answers the handshake.
+        let quiet = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let pem = crate::api::testutil::pem();
+
+        let started = Instant::now();
+        let line = api(
+            quiet.local_addr().unwrap(),
+            Some(pem.as_bytes()),
+            "right",
+            ms(600),
+        )
+        .await;
+
+        assert_eq!(line, "selftest: api: /api/qbp/devices: no answer");
+        let took = started.elapsed();
+        assert!(took >= ms(500) && took < ms(4000), "{took:?}");
+    }
+
+    #[test]
+    fn the_requests_name_the_session_and_the_body_and_keep_the_connection_but_the_last() {
+        let login = request_text(
+            "POST",
+            "/api/auth",
+            None,
+            Some("{\"password\":\"x\"}"),
+            false,
+        );
+        assert!(login.starts_with("POST /api/auth HTTP/1.1\r\n"), "{login}");
+        assert!(login.contains("Content-Length: 16\r\n") && !login.contains("X-FTL-SID"));
+        assert!(login.ends_with("Connection: keep-alive\r\n\r\n{\"password\":\"x\"}"));
+
+        let devices = request_text("GET", "/api/qbp/devices", Some("abc"), None, true);
+        assert!(devices.contains("X-FTL-SID: abc\r\n") && !devices.contains("Content-"));
+        assert!(devices.ends_with("Connection: close\r\n\r\n"), "{devices}");
+    }
+
+    #[test]
+    fn the_last_line_is_this_processs_resident_memory_in_kb_and_nothing_else() {
+        let line = vmrss_line();
+        let kb = line
+            .strip_prefix("selftest: vmrss: ")
+            .and_then(|rest| rest.strip_suffix(" kB"))
+            .unwrap_or_else(|| panic!("{line}"));
+        assert!(kb.parse::<u64>().is_ok_and(|kb| kb > 0), "{line}");
     }
 
     #[test]

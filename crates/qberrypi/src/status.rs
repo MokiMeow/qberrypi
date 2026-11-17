@@ -1,17 +1,22 @@
 //! The status server: read-only HTTP on port 80, for the status page and for whoever wants the
 //! numbers or the log.
 //!
-//! Two paths answer, `/api/v1/stats` and `/log`; `/api/v1/queries` is a 403, as the list of what
-//! was asked is behind the API's login; every other is a 404. Only the first line of a request is
-//! read. The statistics hold counts, the state of the block lists, the Wi-Fi link, the board's
-//! temperature, the slot that runs and how an update stands, never a name that was asked for or
-//! the address of a device that asked, and the one line logged here says where the server
-//! listens.
+//! Three paths answer, `/api/v1/stats`, `/api/v1/me` and `/log`; `/api/v1/queries` is a 403, as
+//! the list of what was asked is behind the API's login; every other is a 404. Only the first line
+//! of a request is read. The statistics hold counts, the state of the block lists, the Wi-Fi
+//! link, the board's temperature, the busy share of its cores and the memory held
+//! ([`crate::usage`]), the slot that runs and how an update stands, never a name that was asked
+//! for or the address of a device that asked. `/api/v1/me` is the one answer that holds names,
+//! and only those that the device which asks has asked itself, its reverse lookups (names under
+//! `in-addr.arpa` and `ip6.arpa`, which are addresses) left out: it needs no login, because the
+//! peer's address is the device, and a device that never calls it is never watched (see
+//! [`crate::dns::watched`]). No address of a device is in any answer, and the one line logged here
+//! says where the server listens.
 //!
 //! Nothing here holds a lock across an `.await`: the answer is made first, and then written.
 
 use std::io::{self, ErrorKind};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -20,8 +25,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, watch};
 
-use crate::dns::Dns;
 use crate::dns::upstream::TlsState;
+use crate::dns::{Dns, clients};
 use crate::lists::Lists;
 use crate::live;
 use crate::logbuf::LogBuf;
@@ -43,6 +48,8 @@ const STATS_PATH: &str = "/api/v1/stats";
 const LOG_PATH: &str = "/log";
 /// The path of the list of queries, which is served on the API's port only.
 const QUERIES_PATH: &str = "/api/v1/queries";
+/// The path where a device asks about itself.
+const ME_PATH: &str = "/api/v1/me";
 /// The seconds in an hour and in a day: the windows that the devices that asked are counted in.
 const HOUR_SECS: u64 = 3_600;
 const DAY_SECS: u64 = 86_400;
@@ -110,6 +117,9 @@ pub struct Status {
     /// The board's temperature in whole degrees, read for each request of the statistics;
     /// `None` if it cannot be read.
     pub board_c: Arc<dyn Fn() -> Option<i8> + Send + Sync>,
+    /// How many devices on the network are not on the known list, read for each request of
+    /// `/api/v1/me`: a count, never a device. While no known list has come it is 0.
+    pub unknown_devices: Arc<dyn Fn() -> usize + Send + Sync>,
     /// The slot this boot runs and how an update stands, copied out for each request of the
     /// statistics under the short lock of [`UpdateCtl`] and no longer than that takes.
     pub update: Arc<UpdateCtl>,
@@ -120,15 +130,19 @@ impl Status {
     pub fn stats(&self) -> Value {
         let now = self.dns.now();
         // The resolver is locked only to copy a few numbers out.
-        let (today, total, cache_entries, paused_until) = {
+        let (today, total, cache_entries, paused_until, block_set_bytes, cache_bytes) = {
             let resolver = self.dns.resolver();
             (
                 resolver.stats().today(now),
                 resolver.stats().total(),
                 resolver.cache_len(),
                 resolver.paused_until(now),
+                resolver.block_set_bytes(),
+                resolver.cache_bytes(),
             )
         };
+        // What the supervisor's tick last read of the cores and the process.
+        let (cpu, memory) = crate::usage::json(block_set_bytes, cache_bytes);
         // The table of clients is locked to count it: no address is copied out.
         let (clients_hour, clients_24h) = {
             let clients = self.dns.clients();
@@ -151,7 +165,15 @@ impl Status {
         // below, is one read of the SoC's own sensor: microseconds.
         let link = (self.link)();
         let update = self.update.view();
-        json!({
+        // The admission of forwards (`dns::admit`): those shed, those paced, and the most
+        // questions out on one upstream session now (`null` before TLS). Set apart: the macro
+        // takes no more keys.
+        let admission = [
+            ("forwards_shed", json!(self.dns.forwards_shed())),
+            ("forwards_paced", json!(self.dns.forwards_paced())),
+            ("upstream_cap", json!(upstreams.session_cap())),
+        ];
+        let mut stats = json!({
             "version": crate::VERSION,
             "build": crate::BUILD_EPOCH,
             "uptime_secs": self.started.elapsed().as_secs(),
@@ -179,7 +201,7 @@ impl Status {
             "watch_events_dropped": self.dns.watch_events_dropped(),
             "exempt_default": self.dns.exempt().by_default(),
             "exempt_clients": self.dns.exempt().exempt_clients(),
-            "blocking": if paused_until.is_some() { "paused" } else { "on" },
+            "blocking": blocking_word(paused_until),
             "pause_left_secs": paused_until.map(|until| until.saturating_sub(now.mono_secs)),
             "list_source": lists.source.as_str(),
             "list_names": lists.names,
@@ -193,19 +215,76 @@ impl Status {
             },
             "board_c": (self.board_c)(),
             "stalls": crate::stall::json(),
+            "cpu": cpu,
+            "memory": memory,
             "slot": update.slot.map(|slot| slot.letter()),
             "boot_files": update.boot_files.as_deref(),
             "update": update_json(&update),
-        })
+        });
+        for (key, value) in admission {
+            stats[key] = value;
+        }
+        stats
     }
 
-    /// The answer to a request whose first line, without its line end, is `request_line`.
+    /// The answer of `/api/v1/me` to the device at `peer`: what the watch table keeps of that
+    /// device alone, with the state of blocking and the count of unknown devices. The route is
+    /// the opt-in: the device is watched from its first call, and refreshed by every later one.
+    /// Its reverse lookups are not in the answer, nor in its counts: they name addresses.
     ///
-    /// `GET /api/v1/stats` and `GET /log`, with HTTP/1.0 or HTTP/1.1, are answered; any other path
-    /// is 404, and so is either of these with a query string. `GET /api/v1/queries`, with a query
-    /// string or without, is 403: the list is behind the API's login. Another method of the same
-    /// shape is 405, and what is not of that shape is 400.
-    pub fn respond(&self, request_line: &str) -> Response {
+    /// A `peer` that the table of clients does not count (loopback, or not IPv4) is 404 and is not
+    /// watched. No address is in the answer, and nothing about the request or the device is logged.
+    fn me(&self, peer: IpAddr) -> Response {
+        let Some(device) = clients::counted(peer) else {
+            return Response::line(404, "not found");
+        };
+        let now = self.dns.now();
+        // Each lock is let go of at the end of its statement: the table of watched devices is never
+        // held with the resolver, and no address is copied out of either.
+        let mine = self
+            .dns
+            .watched()
+            .touch(device, now.mono_secs, now.unix_secs);
+        let paused_until = self.dns.resolver().paused_until(now);
+        let recent: Vec<Value> = mine
+            .recent
+            .iter()
+            .map(|seen| {
+                json!({
+                    "unix_secs": seen.unix_secs,
+                    "name": &*seen.name,
+                    "refused": seen.refused,
+                    "threat": seen.threat,
+                })
+            })
+            .collect();
+        let body = json!({
+            "unix_secs": now.unix_secs,
+            "watching_since_unix": mine.watching_since_unix,
+            "blocking": blocking_word(paused_until),
+            "exempt": self.dns.exempt().is_exempt(peer),
+            "asked_24h": mine.asked_24h,
+            "refused_24h": mine.refused_24h,
+            "threats_24h": mine.threats_24h,
+            "unknown_devices": (self.unknown_devices)(),
+            "recent": recent,
+        });
+        Response {
+            status: 200,
+            content_type: JSON,
+            body: body.to_string().into_bytes(),
+        }
+    }
+
+    /// The answer to a request whose first line, without its line end, is `request_line`, from the
+    /// device at `peer`.
+    ///
+    /// `GET /api/v1/stats`, `GET /api/v1/me` and `GET /log`, with HTTP/1.0 or HTTP/1.1, are
+    /// answered; any other path is 404, and so is any of these with a query string. `/api/v1/me`
+    /// is also 404 for a `peer` that is no device, and is the one path that uses `peer`.
+    /// `GET /api/v1/queries`, with a query string or without, is 403: the list is behind the
+    /// API's login. Another method of the same shape is 405, and what is not of that shape is 400.
+    pub fn respond(&self, request_line: &str, peer: IpAddr) -> Response {
         let mut parts = request_line.split(' ');
         let (Some(method), Some(path), Some(version), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
@@ -220,6 +299,7 @@ impl Status {
             return Response::line(405, "method not allowed");
         }
         match path {
+            ME_PATH => self.me(peer),
             STATS_PATH => Response {
                 status: 200,
                 content_type: JSON,
@@ -274,8 +354,8 @@ impl Status {
                 .acquire_owned()
                 .await
                 .map_err(io::Error::other)?;
-            let stream = match listener.accept().await {
-                Ok((stream, _)) => stream,
+            let (stream, peer) = match listener.accept().await {
+                Ok((stream, peer)) => (stream, peer.ip()),
                 // The client that was to be taken has gone: that ends its connection and no more.
                 Err(err)
                     if matches!(
@@ -292,15 +372,15 @@ impl Status {
                 let _place = place;
                 // However it ended, the connection is closed with it, and an error or a time out
                 // is its own: there is no one to tell, and no other connection to harm.
-                let _ = tokio::time::timeout(timeout, status.talk(stream)).await;
+                let _ = tokio::time::timeout(timeout, status.talk(stream, peer)).await;
             });
         }
     }
 
-    /// One client's connection: its request line, the answer, and the end.
-    async fn talk(&self, mut stream: TcpStream) -> io::Result<()> {
+    /// One client's connection, from `peer`: its request line, the answer, and the end.
+    async fn talk(&self, mut stream: TcpStream, peer: IpAddr) -> io::Result<()> {
         let response = match read_request_line(&mut stream).await? {
-            Some(line) => self.respond(&String::from_utf8_lossy(&line)),
+            Some(line) => self.respond(&String::from_utf8_lossy(&line), peer),
             None => Response::line(400, "bad request"),
         };
         stream.write_all(&response.to_bytes()).await
@@ -328,6 +408,16 @@ async fn read_request_line(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>
         if filled == buf.len() {
             return Ok(None);
         }
+    }
+}
+
+/// The `blocking` entry of the statistics and of `/api/v1/me`: `"paused"` while a pause is in
+/// force, which `paused_until` says, and `"on"` otherwise.
+fn blocking_word(paused_until: Option<u64>) -> &'static str {
+    if paused_until.is_some() {
+        "paused"
+    } else {
+        "on"
     }
 }
 
@@ -399,7 +489,7 @@ mod tests {
     use super::*;
     use crate::dns::dot::ConnCounts;
 
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use qb_dns::ListClass;
     use tokio::time::timeout;
@@ -442,6 +532,7 @@ mod tests {
             started: Instant::now(),
             link: Arc::new(live::WifiStatus::default),
             board_c: Arc::new(|| None),
+            unknown_devices: Arc::new(|| 0),
             update: UpdateCtl::off(),
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -478,7 +569,7 @@ mod tests {
     #[tokio::test]
     async fn requests_are_answered_by_method_and_path() {
         let (status, _http, _dns) = served(Reply::Silent).await;
-        let code = |line: &str| status.respond(line).status;
+        let code = |line: &str| status.respond(line, peer(4)).status;
         assert_eq!(
             (
                 code("GET /api/v1/stats HTTP/1.1"),
@@ -519,7 +610,7 @@ mod tests {
             (400, 400, 400, 400)
         );
         assert_eq!(
-            status.respond("GET /log HTTP/1.1"),
+            status.respond("GET /log HTTP/1.1", peer(4)),
             Response {
                 status: 200,
                 content_type: "text/plain; charset=utf-8",
@@ -611,6 +702,11 @@ mod tests {
         assert_eq!(v["upstream_tls"], "off");
         // No watch is set on this service: nothing was dropped, and no device is exempt.
         assert_eq!(v["watch_events_dropped"].as_u64(), Some(0));
+        assert_eq!(
+            (v["forwards_shed"].as_u64(), v["forwards_paced"].as_u64()),
+            (Some(0), Some(0))
+        );
+        assert!(v["upstream_cap"].is_null());
         assert_eq!(v["exempt_clients"].as_u64(), Some(0));
         assert_eq!(v["exempt_default"], false);
         // The stall marks, as `stall` keeps them.
@@ -618,7 +714,17 @@ mod tests {
         assert!(v["stalls"]["resolver_lock_hold_max_us"].is_u64());
         // The old layout has no slot, no digest and no update to tell of.
         assert!(v["slot"].is_null() && v["boot_files"].is_null() && v["update"].is_null());
-        assert_eq!(v.as_object().unwrap().len(), 39);
+        // The cores and the process, as the tick last read them (perhaps not yet: `null`), and the
+        // memory, the block set's and the cache's own.
+        assert!(v["cpu"].get("cores").is_some() && v["cpu"].get("process").is_some());
+        assert!(
+            v["memory"]["block_set_kib"]
+                .as_u64()
+                .is_some_and(|kib| kib > 0)
+        );
+        assert!(v["memory"]["cache_kib"].as_u64().is_some_and(|kib| kib > 0));
+        assert!(v["memory"].get("rss_kib").is_some());
+        assert_eq!(v.as_object().unwrap().len(), 44);
     }
 
     /// A status on slot `slot` whose update state is `ctl`.
@@ -656,7 +762,7 @@ mod tests {
             v["update"],
             json!({"state": "idle", "trial": null, "last": null})
         );
-        assert_eq!(v.as_object().unwrap().len(), 39);
+        assert_eq!(v.as_object().unwrap().len(), 44);
     }
 
     #[tokio::test]
@@ -820,7 +926,7 @@ mod tests {
             "GET /api/v1/queries HTTP/1.1",
             "GET /api/v1/queries?n=5 HTTP/1.1",
         ] {
-            let r = status.respond(line);
+            let r = status.respond(line, peer(4));
             assert_eq!(
                 (r.status, r.content_type, r.body.as_slice()),
                 (
@@ -835,7 +941,12 @@ mod tests {
         let (head, body) = get(http, "GET /api/v1/queries?n=5 HTTP/1.1\r\n\r\n").await;
         assert!(head.starts_with("HTTP/1.1 403 Forbidden\r\n"), "{head}");
         assert_eq!(body, b"this needs the API login\n");
-        assert_eq!(status.respond("GET /api/v1/clients HTTP/1.1").status, 404);
+        assert_eq!(
+            status
+                .respond("GET /api/v1/clients HTTP/1.1", peer(4))
+                .status,
+            404
+        );
         for line in [
             "GET / HTTP/1.1",
             "GET /api/v1/stats HTTP/1.1",
@@ -843,7 +954,7 @@ mod tests {
             "GET /api/v1/queries HTTP/1.1",
             "GET /api/v1/clients HTTP/1.1",
         ] {
-            let body = String::from_utf8_lossy(&status.respond(line).body).into_owned();
+            let body = String::from_utf8_lossy(&status.respond(line, peer(4)).body).into_owned();
             assert!(!body.contains("198.51.100.4"), "{line}");
         }
     }
@@ -1068,5 +1179,270 @@ mod tests {
         }
         let (head, _body) = get(http, "GET /log HTTP/1.1\n").await;
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    /// The device 198.51.100.`n`, a documentation range: a peer that counts.
+    fn peer(n: u8) -> IpAddr {
+        Ipv4Addr::new(198, 51, 100, n).into()
+    }
+
+    /// The path of the one route that opts a device in.
+    const ME: &str = "GET /api/v1/me HTTP/1.1";
+
+    /// What `from` is answered when it asks [`ME`]: it must be a 200 of JSON, and is read as such.
+    fn me(status: &Status, from: IpAddr) -> Value {
+        let response = status.respond(ME, from);
+        assert_eq!((response.status, response.content_type), (200, JSON));
+        serde_json::from_slice(&response.body).unwrap()
+    }
+
+    /// The keys of the JSON object `v`, sorted.
+    fn keys(v: &Value) -> Vec<&str> {
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Notes that `from` asked for `name`, as the resolver does for a device that is watched.
+    fn asked(status: &Status, from: IpAddr, name: &str, refused: bool, threat: bool) {
+        let IpAddr::V4(from) = from else {
+            panic!("a device of these tests has an IPv4 address");
+        };
+        let now = status.dns.now();
+        let mut watched = status.dns.watched();
+        watched.note(from, now.mono_secs, now.unix_secs, name, refused, threat);
+    }
+
+    #[tokio::test]
+    async fn me_answers_the_asking_device_with_the_specs_keys() {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        let device = peer(4);
+        // The first call opts the device in: it is told so, and has nothing yet.
+        let v = me(&status, device);
+        assert_eq!(
+            keys(&v),
+            [
+                "asked_24h",
+                "blocking",
+                "exempt",
+                "recent",
+                "refused_24h",
+                "threats_24h",
+                "unix_secs",
+                "unknown_devices",
+                "watching_since_unix"
+            ]
+        );
+        assert!(v["unix_secs"].as_u64().unwrap() > 1_700_000_000);
+        assert_eq!(v["watching_since_unix"], v["unix_secs"]);
+        assert_eq!(
+            (v["blocking"].as_str(), v["exempt"].as_bool()),
+            (Some("on"), Some(false))
+        );
+        assert_eq!(
+            (
+                v["asked_24h"].as_u64(),
+                v["refused_24h"].as_u64(),
+                v["threats_24h"].as_u64(),
+                v["unknown_devices"].as_u64()
+            ),
+            (Some(0), Some(0), Some(0), Some(0))
+        );
+        assert_eq!(v["recent"], json!([]));
+
+        // From then on its queries are kept, and the answer lists them, newest first.
+        let (t0, t1, t2) = {
+            let now = status.dns.now().unix_secs;
+            (now - 30, now - 20, now - 10)
+        };
+        let now = status.dns.now();
+        {
+            let mut watched = status.dns.watched();
+            let addr = Ipv4Addr::new(198, 51, 100, 4);
+            watched.note(addr, now.mono_secs, t0, "ads.example.com", true, false);
+            watched.note(addr, now.mono_secs, t1, "x.bad.example.net", true, true);
+            watched.note(addr, now.mono_secs, t2, "example.com", false, false);
+        }
+        let response = status.respond(ME, device);
+        let text = String::from_utf8(response.body.clone()).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            (
+                v["asked_24h"].as_u64(),
+                v["refused_24h"].as_u64(),
+                v["threats_24h"].as_u64()
+            ),
+            (Some(3), Some(2), Some(1))
+        );
+        assert_eq!(
+            v["recent"],
+            json!([
+                {"unix_secs": t2, "name": "example.com", "refused": false, "threat": false},
+                {"unix_secs": t1, "name": "x.bad.example.net", "refused": true, "threat": true},
+                {"unix_secs": t0, "name": "ads.example.com", "refused": true, "threat": false},
+            ])
+        );
+        // A refresh does not move where the watch began, and no address is in the answer.
+        assert!(v["watching_since_unix"].as_u64().unwrap() <= now.unix_secs);
+        assert!(!text.contains("198.51.100"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn me_shows_one_device_nothing_of_another() {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        let (one, other) = (peer(4), peer(5));
+        me(&status, one);
+        me(&status, other);
+        asked(&status, one, "private.example.com", false, false);
+        asked(&status, other, "theirs.example.org", true, false);
+        let mine = me(&status, one);
+        let theirs = me(&status, other);
+        assert_eq!(
+            mine["recent"].as_array().unwrap().len() + theirs["recent"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(mine["recent"][0]["name"], "private.example.com");
+        assert_eq!(theirs["recent"][0]["name"], "theirs.example.org");
+        assert_eq!(
+            (mine["refused_24h"].as_u64(), theirs["refused_24h"].as_u64()),
+            (Some(0), Some(1))
+        );
+        // A third device that calls for the first time is shown nothing of what the two asked.
+        let third = status.respond(ME, peer(6));
+        let text = String::from_utf8(third.body).unwrap();
+        assert!(!text.contains("example"), "{text}");
+        assert_eq!(status.dns.watched().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn me_leaves_out_reverse_lookups_so_that_no_address_is_in_it() {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        let device = peer(4);
+        me(&status, device);
+        asked(&status, device, "5.2.0.192.in-addr.arpa", false, false);
+        asked(&status, device, "example.com", false, false);
+        let response = status.respond(ME, device);
+        let text = String::from_utf8(response.body).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["asked_24h"].as_u64(), Some(1));
+        assert_eq!(
+            v["recent"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|seen| seen["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["example.com"]
+        );
+        assert!(!text.contains("arpa"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn me_is_404_for_loopback_and_for_a_query_string() {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        let not_counted: [IpAddr; 5] = [
+            Ipv4Addr::LOCALHOST.into(),
+            Ipv4Addr::new(127, 0, 0, 2).into(),
+            Ipv6Addr::LOCALHOST.into(),
+            "2001:db8::4".parse().unwrap(),
+            Ipv4Addr::new(198, 51, 100, 4).to_ipv6_mapped().into(),
+        ];
+        for from in not_counted {
+            let response = status.respond(ME, from);
+            assert_eq!(
+                (response.status, response.body.as_slice()),
+                (404, &b"not found\n"[..]),
+                "{from}"
+            );
+        }
+        // A query string is no more the route than it is for the other open paths.
+        for line in [
+            "GET /api/v1/me?x=1 HTTP/1.1",
+            "GET /api/v1/me? HTTP/1.1",
+            "GET /api/v1/me/ HTTP/1.1",
+            "GET /api/v1/mine HTTP/1.1",
+        ] {
+            assert_eq!(status.respond(line, peer(4)).status, 404, "{line}");
+        }
+        // None of them watched anyone.
+        assert!(status.dns.watched().is_empty());
+    }
+
+    #[tokio::test]
+    async fn me_over_a_socket_from_loopback_is_404_and_watches_nobody() {
+        let (status, http, _dns) = served(Reply::Silent).await;
+        let (head, body) = get(http, "GET /api/v1/me HTTP/1.1\r\n\r\n").await;
+        assert!(head.starts_with("HTTP/1.1 404 Not Found\r\n"), "{head}");
+        assert_eq!(body, b"not found\n");
+        assert!(status.dns.watched().is_empty());
+    }
+
+    #[tokio::test]
+    async fn me_reports_exempt_and_unknown_devices() {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        let (exempt, other) = (peer(4), peer(5));
+        status
+            .dns
+            .exempt()
+            .listed()
+            .replace(&[Ipv4Addr::new(198, 51, 100, 4)]);
+        let status = Status {
+            unknown_devices: Arc::new(|| 3),
+            ..status
+        };
+        let (a, b) = (me(&status, exempt), me(&status, other));
+        assert_eq!(
+            (a["exempt"].as_bool(), b["exempt"].as_bool()),
+            (Some(true), Some(false))
+        );
+        assert_eq!(
+            (a["unknown_devices"].as_u64(), b["unknown_devices"].as_u64()),
+            (Some(3), Some(3))
+        );
+        // In the exempt-by-default mode every device but a blocked one is exempt.
+        status.dns.exempt().set_by_default(true);
+        assert_eq!(me(&status, other)["exempt"], true);
+    }
+
+    #[tokio::test]
+    async fn me_says_blocking_as_the_stats_do() {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        assert_eq!(me(&status, peer(4))["blocking"], "on");
+        let until = status.dns.now().mono_secs + 300;
+        status.dns.resolver().pause_until(until);
+        assert_eq!(me(&status, peer(4))["blocking"], "paused");
+        assert_eq!(status.stats()["blocking"], "paused");
+    }
+
+    #[tokio::test]
+    async fn me_is_405_for_post_and_the_other_methods() {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        for line in [
+            "POST /api/v1/me HTTP/1.1",
+            "DELETE /api/v1/me HTTP/1.1",
+            "HEAD /api/v1/me HTTP/1.1",
+        ] {
+            let response = status.respond(line, peer(4));
+            assert_eq!(
+                (response.status, response.body.as_slice()),
+                (405, &b"method not allowed\n"[..]),
+                "{line}"
+            );
+        }
+        assert!(status.dns.watched().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_but_me_opts_a_device_in() {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        for line in [
+            "GET /api/v1/stats HTTP/1.1",
+            "GET /log HTTP/1.1",
+            "GET /api/v1/queries HTTP/1.1",
+            "GET / HTTP/1.1",
+        ] {
+            status.respond(line, peer(4));
+        }
+        assert!(status.dns.watched().is_empty());
     }
 }

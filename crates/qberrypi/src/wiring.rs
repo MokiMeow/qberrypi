@@ -9,19 +9,26 @@
 //! `.await`.
 //!
 //! The slot holds the watchdog's alert store the same way: the same service fills it, and until
-//! then the panel has no alert to show. The store is read through its own lock and no other.
+//! then the panel has no alert to show. The store is read through its own lock and no other. The
+//! device inventory is held the same way ([`LiveDevices`]): its own lock, never the resolver's.
 
+use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicI16, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use qb_dns::{LogEntry, Now, Resolver};
 use tokio::sync::watch;
 
+use crate::alerts::AlertSink;
 use crate::dns::Dns;
+use crate::dns::clients::MAX_CLIENTS;
 use crate::lane::LaneFeed;
 use crate::lists::Lists;
 use crate::live::{self, BlockingControl, Snapshot, Source};
 use crate::panel::alerts::{PanelAlert, PendingAlerts};
+use crate::panel::devices::{DeviceControl, Mac as PanelMac};
+use crate::watch::devices::{Devices, EditError, WallCopy, with_devices};
+use crate::watch::frames::Mac;
 use crate::wifi;
 
 /// The file in which the kernel lists the wireless interfaces' signal.
@@ -144,6 +151,65 @@ impl Source for Live {
     }
 }
 
+/// The device inventory as the panel uses it: its own lock, the resolver's table of who asked lately,
+/// and the lane feed's watch of one client.
+///
+/// Nothing here takes the resolver's lock. Reads copy out and let go; an edit takes the inventory's
+/// lock for the call, as the API's do, and raises the alerts it made after the lock is released.
+pub struct LiveDevices {
+    /// The inventory.
+    pub devices: Arc<Mutex<Devices>>,
+    /// Where the alerts an edit makes go.
+    pub alerts: Arc<dyn AlertSink>,
+    /// Who asked lately: `Dns::clients`, whose lock the query path already takes for one insert.
+    pub dns: Arc<Dns>,
+    /// The lane feed, which keeps the names of the one device that is watched.
+    pub lane: Arc<LaneFeed>,
+}
+
+impl DeviceControl for LiveDevices {
+    fn wall(&self, recent: &dyn Fn(u64) -> bool, out: &mut WallCopy) -> bool {
+        // The inventory's lock is the one `devwatch` takes for each packet, on the thread that
+        // answers DNS: it is held for the copy and no longer.
+        self.devices
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .wall_copy(recent, out);
+        true
+    }
+
+    fn asking(&self, window_secs: u64, out: &mut Vec<Ipv4Addr>) {
+        let mono = self.dns.now().mono_secs;
+        // The room for every client the table can hold is made before the lock is taken (it is made
+        // once: `out` keeps it), so that the lock the question path takes for each query is held for
+        // a walk over the few that asked within the window and a copy of their addresses: no
+        // allocation, and no list of all 256.
+        out.clear();
+        out.reserve(MAX_CLIENTS);
+        self.dns.clients().asking_within(mono, window_secs, out);
+    }
+
+    fn set_ads_pass(&self, mac: PanelMac, pass: bool) -> Result<(), EditError> {
+        with_devices(&self.devices, &*self.alerts, |devices| {
+            devices.set_ads_pass(Mac(mac), pass)
+        })
+    }
+
+    fn device_gate(&self, mac: PanelMac, secs: u16) -> Result<(), EditError> {
+        with_devices(&self.devices, &*self.alerts, |devices| {
+            devices.open_gate(Mac(mac), secs)
+        })
+    }
+
+    fn watch_client(&self, client: Option<Ipv4Addr>) {
+        self.lane.watch_client(client);
+    }
+
+    fn watched_names(&self, out: &mut Vec<crate::lane::WatchedName>) {
+        self.lane.watched_names(out);
+    }
+}
+
 /// What the panel is given, in the place of the [`Live`] that is made beside it.
 ///
 /// Until it is filled it answers as [`live::Nothing`] does, and the switch does nothing, with a
@@ -151,11 +217,15 @@ impl Source for Live {
 ///
 /// It is the panel's source of alerts too ([`PendingAlerts`]): there is none until
 /// [`Slot::fill_alerts`] puts the watchdog's store in, and an acknowledgement before that is
-/// dropped without a line, since it names an alert that cannot have been shown.
+/// dropped without a line, since it names an alert that cannot have been shown. And it is the
+/// panel's control of the devices ([`DeviceControl`]): no inventory until [`Slot::fill_devices`], but
+/// the watch of one device's names is the lane feed's, which the slot holds from the start.
 pub struct Slot {
     live: OnceLock<Live>,
     /// The watchdog's alerts, as the panel reads them; filled by the same service as `live`.
     alerts: OnceLock<Arc<dyn PendingAlerts>>,
+    /// The device inventory, as the panel reads and edits it; filled by the same service.
+    devices: OnceLock<Arc<dyn DeviceControl>>,
     /// The names that the DNS service offers the panel. It is the slot's, not the live source's:
     /// the panel holds it from the start, before the resolver that fills it exists.
     lane: Arc<LaneFeed>,
@@ -167,6 +237,7 @@ impl Slot {
         Arc::new(Self {
             live: OnceLock::new(),
             alerts: OnceLock::new(),
+            devices: OnceLock::new(),
             lane: LaneFeed::new(),
         })
     }
@@ -188,11 +259,62 @@ impl Slot {
         // As in `fill`: the first stays.
         let _ = self.alerts.set(alerts);
     }
+
+    /// Puts the panel's control of the devices in the slot; a slot that has one keeps it.
+    pub fn fill_devices(&self, devices: Arc<dyn DeviceControl>) {
+        // As in `fill`: the first stays.
+        let _ = self.devices.set(devices);
+    }
+}
+
+impl DeviceControl for Slot {
+    fn wall(&self, recent: &dyn Fn(u64) -> bool, out: &mut WallCopy) -> bool {
+        self.devices
+            .get()
+            .is_some_and(|devices| devices.wall(recent, out))
+    }
+
+    fn asking(&self, window_secs: u64, out: &mut Vec<Ipv4Addr>) {
+        match self.devices.get() {
+            Some(devices) => devices.asking(window_secs, out),
+            None => out.clear(),
+        }
+    }
+
+    fn set_ads_pass(&self, mac: PanelMac, pass: bool) -> Result<(), EditError> {
+        self.devices
+            .get()
+            .map_or(Err(EditError::Unknown), |devices| {
+                devices.set_ads_pass(mac, pass)
+            })
+    }
+
+    fn device_gate(&self, mac: PanelMac, secs: u16) -> Result<(), EditError> {
+        self.devices
+            .get()
+            .map_or(Err(EditError::Unknown), |devices| {
+                devices.device_gate(mac, secs)
+            })
+    }
+
+    // The watch is the lane feed's own, which the slot holds from the start: a device whose screen
+    // opens before the inventory exists is watched all the same.
+    fn watch_client(&self, client: Option<Ipv4Addr>) {
+        self.lane.watch_client(client);
+    }
+
+    fn watched_names(&self, out: &mut Vec<crate::lane::WatchedName>) {
+        self.lane.watched_names(out);
+    }
 }
 
 impl PendingAlerts for Slot {
     fn top(&self) -> Option<PanelAlert> {
         self.alerts.get()?.top()
+    }
+
+    fn waiting_count(&self) -> u32 {
+        self.alerts.get().map_or(0, |alerts| alerts.waiting_count())
     }
 
     fn ack(&self, id: u64) {
@@ -315,7 +437,7 @@ fn held(dbm: i32) -> i8 {
 mod tests {
     use super::*;
 
-    use std::net::Ipv4Addr;
+    use std::net::IpAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use qb_dns::{Action, BlockSetBuilder, Counts, Resolver, Transport};
@@ -548,11 +670,137 @@ mod tests {
         assert_eq!(slot.top().unwrap().subject, "after.example");
 
         // An ack through the slot is the store's: the desktop's list shows it acknowledged.
+        assert_eq!(slot.waiting_count(), 2);
         slot.ack(2);
         assert_eq!(slot.top().unwrap().subject, "before.example");
+        assert_eq!(slot.waiting_count(), 1);
         assert!(store.list(0).alerts[1].acked);
         slot.ack(1);
         assert!(slot.top().is_none());
+        assert_eq!(slot.waiting_count(), 0);
+    }
+
+    /// A device inventory with one device, `192.0.2.5` at `02:00:00:00:00:05`, behind a router at
+    /// `192.0.2.1`, on a clock that stands still at monotonic second 1,000; the resolver's own clients
+    /// table and the lane's feed beside it.
+    fn live_devices() -> (LiveDevices, Arc<Dns>) {
+        use crate::watch::frames::{ARP_REQUEST, Arp};
+        let dns = Dns::new(
+            BlockSetBuilder::new().build(),
+            Upstreams::new(&[Ipv4Addr::LOCALHOST]),
+            Box::new(FixedOffset(0)),
+        );
+        let clock: Arc<dyn Fn() -> (u64, u64) + Send + Sync> = Arc::new(|| (1_000, 1_800_000_000));
+        let mut devices = Devices::new(None, Ipv4Addr::new(192, 0, 2, 1), clock);
+        devices.on_arp(&Arp {
+            op: ARP_REQUEST,
+            sender_mac: Mac([2, 0, 0, 0, 0, 5]),
+            sender_ip: Ipv4Addr::new(192, 0, 2, 5),
+            target_ip: Ipv4Addr::new(192, 0, 2, 5),
+        });
+        (
+            LiveDevices {
+                devices: Arc::new(Mutex::new(devices)),
+                alerts: alert_store(),
+                dns: dns.clone(),
+                lane: LaneFeed::new(),
+            },
+            dns,
+        )
+    }
+
+    /// What the panel copies of the inventory behind `devices`: its one device, as `(exempt, gate)`.
+    fn wall_row(devices: &dyn DeviceControl) -> (bool, Option<u16>) {
+        let mut copy = WallCopy::new();
+        assert!(devices.wall(&|_| true, &mut copy), "the inventory");
+        assert_eq!(copy.rows.len(), 1);
+        (copy.rows[0].exempt, copy.rows[0].gate_left_secs)
+    }
+
+    #[test]
+    fn the_panels_devices_are_the_inventory_read_and_edited_under_its_own_lock() {
+        let (devices, _) = live_devices();
+        let mac = [2, 0, 0, 0, 0, 5];
+        let rev = || devices.devices.lock().unwrap().rev();
+        assert_eq!(wall_row(&devices), (false, None));
+        let first = rev();
+
+        // Ads pass for the device, for good; and the revision moves, as it does for the API's edit.
+        devices.set_ads_pass(mac, true).unwrap();
+        assert_eq!(wall_row(&devices), (true, None));
+        assert!(rev() > first);
+        devices.set_ads_pass(mac, false).unwrap();
+        assert_eq!(wall_row(&devices), (false, None));
+
+        // Its own gate: open for five minutes, then shut.
+        devices.device_gate(mac, 300).unwrap();
+        assert_eq!(wall_row(&devices), (true, Some(300)));
+        devices.device_gate(mac, 0).unwrap();
+        assert_eq!(wall_row(&devices), (false, None));
+
+        // A gate for a device the inventory does not hold, and one longer than an hour, are refused.
+        assert_eq!(
+            devices.device_gate([2, 0, 0, 0, 0, 9], 300),
+            Err(EditError::Unknown)
+        );
+        assert_eq!(devices.device_gate(mac, 3_601), Err(EditError::Invalid));
+        // An address that is no device's is refused.
+        assert_eq!(devices.set_ads_pass([0; 6], true), Err(EditError::Invalid));
+    }
+
+    #[test]
+    fn the_panel_asks_who_asked_lately_of_the_resolvers_clients_table() {
+        let (devices, dns) = live_devices();
+        let mut asking = vec![Ipv4Addr::LOCALHOST];
+        devices.asking(2, &mut asking);
+        assert!(asking.is_empty(), "nobody asked yet: {asking:?}");
+        dns.note_client(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 5)));
+        // The Pi's own queries are no device's.
+        dns.note_client(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        devices.asking(2, &mut asking);
+        assert_eq!(asking, [Ipv4Addr::new(192, 0, 2, 5)]);
+        // A window of nothing holds nobody.
+        devices.asking(0, &mut asking);
+        assert!(asking.is_empty());
+        // The room for the whole table was made once, outside the table's lock, and is kept: the
+        // next ask allocates nothing.
+        let room = asking.capacity();
+        assert!(room >= MAX_CLIENTS);
+        devices.asking(2, &mut asking);
+        assert_eq!((asking.len(), asking.capacity()), (1, room));
+    }
+
+    #[test]
+    fn the_slot_has_no_devices_until_the_inventory_is_in_it_but_watches_a_device_all_the_same() {
+        let slot = Slot::new();
+        let mac = [2, 0, 0, 0, 0, 5];
+        let mut copy = WallCopy::new();
+        assert!(!slot.wall(&|_| true, &mut copy));
+        assert_eq!(slot.set_ads_pass(mac, true), Err(EditError::Unknown));
+        assert_eq!(slot.device_gate(mac, 300), Err(EditError::Unknown));
+        let mut asking = vec![Ipv4Addr::LOCALHOST];
+        slot.asking(2, &mut asking);
+        assert!(asking.is_empty());
+        // The watch is the lane feed's own, which the slot holds from the start.
+        slot.watch_client(Some(Ipv4Addr::new(192, 0, 2, 5)));
+        let mut names = Vec::new();
+        slot.watched_names(&mut names);
+        assert!(names.is_empty());
+        slot.watch_client(None);
+
+        let (devices, _) = live_devices();
+        let devices: Arc<dyn DeviceControl> = Arc::new(devices);
+        slot.fill_devices(devices.clone());
+        assert!(slot.wall(&|_| true, &mut copy));
+        assert_eq!(copy.rows.len(), 1);
+        slot.set_ads_pass(mac, true).unwrap();
+        assert!(wall_row(&*devices).0);
+        slot.device_gate(mac, 60).unwrap();
+        assert_eq!(wall_row(&*devices).1, Some(60));
+        // A second inventory does not replace the first.
+        let (other, _) = live_devices();
+        slot.fill_devices(Arc::new(other));
+        assert!(wall_row(&*slot).0);
     }
 
     #[test]

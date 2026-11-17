@@ -1,6 +1,7 @@
 //! The Pi-hole API subset that qberrypi serves over TLS on port 443: the login, the statistics
 //! and the blocking switch that qnet and other Pi-hole clients use, and, under `/api/qbp/`, the
-//! watchdog's alerts and devices ([`qbp`]).
+//! watchdog's alerts and devices ([`qbp`]) and the load generator against the board's own DNS
+//! service ([`bench`]), whose run holds its connection's thread of the pool while it lasts.
 //!
 //! [`serve`] is the listener. It accepts on the runtime and does nothing else there: each
 //! connection, from its TLS handshake to its close, is one job of the blocking pool
@@ -49,6 +50,7 @@ use self::routes::Api;
 use crate::services::blocking;
 use crate::update::receive::{self, Receiver};
 
+pub mod bench;
 mod hex;
 pub mod http;
 pub mod live;

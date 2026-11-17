@@ -11,10 +11,18 @@
 //! the bytes of a name are copied into a slot of a fixed size. When the panel is behind, names are
 //! dropped, and the drops are counted.
 //!
+//! A device's own names: while the panel shows one device's screen it asks for that device's
+//! addresses to be watched ([`LaneFeed::watch_client`]), and `offer_latest` then keeps the last two
+//! names that address asked in a ring of two fixed slots, for [`LaneFeed::watched_names`]. When no
+//! device is watched, which is always but while that screen is open, the cost on the answer path
+//! is one relaxed load and nothing is kept per client. A matching name is put in by `try_lock`
+//! as the lane's are, in a slot of fixed size, so nothing waits and nothing allocates.
+//!
 //! A name reaches the physical screen and nothing else. These types implement no `Debug` and no
 //! `Serialize`, nothing here logs, and no `Source`, API or status page hands the feed out.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 
 use qb_dns::{Now, Outcome, Resolver};
@@ -25,6 +33,9 @@ pub const LANE_SLOTS: usize = 8;
 
 /// The bytes of a name that the ring keeps; the panel shows 20 characters of them.
 pub const LANE_NAME_BYTES: usize = 32;
+
+/// The names of the watched device that the feed keeps: the last two it asked.
+pub const WATCH_SLOTS: usize = 2;
 
 /// What `last_plain` holds before any plain name was sampled: no second a clock gives.
 const NO_SECOND: u64 = u64::MAX;
@@ -132,6 +143,122 @@ impl Ring {
     }
 }
 
+/// How a watched device's name was answered, as its screen says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchedOutcome {
+    /// The name is on the lists and was refused.
+    Refused,
+    /// The name is on the lists and was let through: the device is exempt, or blocking is paused.
+    Passed,
+    /// The name is not on the lists, and was answered.
+    Answered,
+}
+
+/// A name that the watched device asked, taken from the feed for the panel's thread to show. Made
+/// only on the panel's side. It has no `Debug`: the name is the device's own business.
+pub struct WatchedName {
+    /// The name as the resolver recorded it, cut as a [`LaneName`] is.
+    pub name: String,
+    /// How it was answered.
+    pub outcome: WatchedOutcome,
+}
+
+/// One name of the watched device in the ring: its bytes, in a slot of a fixed size.
+#[derive(Clone, Copy)]
+struct WatchSlot {
+    bytes: [u8; LANE_NAME_BYTES],
+    /// How many of `bytes` are the name's.
+    len: u8,
+    /// Whether the name was longer than the slot.
+    cut: bool,
+    outcome: WatchedOutcome,
+}
+
+impl WatchSlot {
+    const EMPTY: Self = Self {
+        bytes: [0; LANE_NAME_BYTES],
+        len: 0,
+        cut: false,
+        outcome: WatchedOutcome::Answered,
+    };
+
+    /// The first [`LANE_NAME_BYTES`] bytes of `name`, less any part of a character at the end.
+    fn of(name: &str, outcome: WatchedOutcome) -> Self {
+        let mut end = name.len().min(LANE_NAME_BYTES);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut slot = Self::EMPTY;
+        if let (Some(room), Some(kept)) = (slot.bytes.get_mut(..end), name.as_bytes().get(..end)) {
+            room.copy_from_slice(kept);
+        }
+        // At most `LANE_NAME_BYTES`, which is 32.
+        slot.len = u8::try_from(end).unwrap_or(u8::MAX);
+        slot.cut = end < name.len();
+        slot.outcome = outcome;
+        slot
+    }
+
+    /// The bytes of the name.
+    fn kept(&self) -> &[u8] {
+        self.bytes.get(..usize::from(self.len)).unwrap_or_default()
+    }
+
+    /// The name for the panel's thread, which may allocate.
+    fn into_name(self) -> WatchedName {
+        let mut name = String::from_utf8_lossy(self.kept()).into_owned();
+        if self.cut && name.chars().count() < LANE_NAME_BYTES {
+            name.push('~');
+        }
+        WatchedName {
+            name,
+            outcome: self.outcome,
+        }
+    }
+}
+
+/// The last names of the watched device, newest first, and whose they are.
+struct WatchRing {
+    /// The IPv4 address (as a number) the names belong to; 0 for none. Set under the lock together
+    /// with `watched`, so a name that was offered for the device before this one never lands in
+    /// the ring of this one.
+    client: u32,
+    slots: [WatchSlot; WATCH_SLOTS],
+    /// How many of `slots`, from the first, are in use.
+    len: usize,
+}
+
+impl WatchRing {
+    /// Puts `slot` first. The name that is first already, or second, is that name again (a device
+    /// asks A and AAAA of one name): it moves to the front with the new outcome and nothing else
+    /// is pushed out, so the two places hold two different names.
+    fn push(&mut self, slot: WatchSlot) {
+        let held = self.slots.get(..self.len).unwrap_or_default();
+        let at = held
+            .iter()
+            .position(|old| old.kept() == slot.kept() && old.cut == slot.cut);
+        let from = at.unwrap_or_else(|| self.len.min(WATCH_SLOTS - 1));
+        // The names before `from` move back one place; the one at `from` is overwritten.
+        self.slots.copy_within(..from, 1);
+        if let Some(first) = self.slots.first_mut() {
+            *first = slot;
+        }
+        if at.is_none() {
+            self.len = (self.len + 1).min(WATCH_SLOTS);
+        }
+    }
+}
+
+/// The IPv4 address of `client` as a number: an IPv4 address, or an IPv4 address mapped into
+/// IPv6. 0 for any other, and for none, which no watched address is.
+fn client_key(client: Option<IpAddr>) -> u32 {
+    match client {
+        Some(IpAddr::V4(v4)) => u32::from(v4),
+        Some(IpAddr::V6(v6)) => v6.to_ipv4_mapped().map_or(0, u32::from),
+        None => 0,
+    }
+}
+
 /// The feed from the DNS service to the front panel: a ring of the names to show.
 pub struct LaneFeed {
     /// Taken with `try_lock` by the resolver's side, and with `lock` by the panel's, which holds
@@ -141,10 +268,16 @@ pub struct LaneFeed {
     last_plain: AtomicU64,
     /// The names that were lost: dropped by `observe`, or displaced from the ring.
     dropped: AtomicU64,
+    /// The IPv4 address whose names are kept, as a number; 0 while none is. The one thing the
+    /// answer path reads when no device is watched.
+    watched: AtomicU32,
+    /// The names of the watched device. Taken with `try_lock` by the resolver's side, and with
+    /// `lock` by the panel's, which holds it for a copy.
+    watch: Mutex<WatchRing>,
 }
 
 impl LaneFeed {
-    /// An empty feed.
+    /// An empty feed, watching nobody.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             ring: Mutex::new(Ring {
@@ -153,6 +286,12 @@ impl LaneFeed {
             }),
             last_plain: AtomicU64::new(NO_SECOND),
             dropped: AtomicU64::new(0),
+            watched: AtomicU32::new(0),
+            watch: Mutex::new(WatchRing {
+                client: 0,
+                slots: [WatchSlot::EMPTY; WATCH_SLOTS],
+                len: 0,
+            }),
         })
     }
 
@@ -208,8 +347,18 @@ impl LaneFeed {
 
     /// Offers `resolver`'s latest logged query, if it logged one since it had counted
     /// `queries_before` queries: a refused one if it was blocked. Called with the resolver that
-    /// just decided a query, as [`LaneFeed::observe`] allows: it does not wait.
-    pub(crate) fn offer_latest(&self, resolver: &Resolver, queries_before: u64, now: Now) {
+    /// just decided a query, as [`LaneFeed::observe`] allows: it does not wait. `client` is who
+    /// asked; it matters only while that address is watched ([`LaneFeed::watch_client`]), and
+    /// then the name is kept for that device's screen too.
+    ///
+    /// With nobody watched the watch costs one relaxed load, after the lane's own work.
+    pub(crate) fn offer_latest(
+        &self,
+        resolver: &Resolver,
+        queries_before: u64,
+        now: Now,
+        client: Option<IpAddr>,
+    ) {
         let stats = resolver.stats();
         if stats.total().queries == queries_before {
             return;
@@ -224,6 +373,76 @@ impl LaneFeed {
             // A name is on the lists but let through only while blocking is paused.
             |name| resolver.paused_until(now).is_some() && resolver.lists(name),
         );
+        let watched = self.watched.load(Ordering::Relaxed);
+        if watched != 0 {
+            self.offer_watched(watched, client, resolver, &latest.name, latest.outcome);
+        }
+    }
+
+    /// Keeps `name`, which `client` asked and the resolver answered with `outcome`, if `client` is
+    /// the `watched` address. It does not wait and does not allocate: whether the name is on the
+    /// lists is looked up in a buffer on the stack, and the ring is taken with `try_lock`.
+    #[inline(never)]
+    fn offer_watched(
+        &self,
+        watched: u32,
+        client: Option<IpAddr>,
+        resolver: &Resolver,
+        name: &str,
+        outcome: Outcome,
+    ) {
+        if name.is_empty() || client_key(client) != watched {
+            return;
+        }
+        let outcome = if outcome == Outcome::Blocked {
+            WatchedOutcome::Refused
+        } else if resolver.lists(name) {
+            WatchedOutcome::Passed
+        } else {
+            WatchedOutcome::Answered
+        };
+        let slot = WatchSlot::of(name, outcome);
+        // The panel's thread holds the ring for a copy: a name that finds it busy is dropped.
+        if let Ok(mut ring) = self.watch.try_lock()
+            && ring.client == watched
+        {
+            ring.push(slot);
+        }
+    }
+
+    /// Keeps the names that the device at `client` asks from now on, for
+    /// [`LaneFeed::watched_names`], and forgets the names of the one that was watched before. With
+    /// `None` nothing is kept, and what was kept is gone: nothing is remembered of a device that
+    /// nobody is looking at. An unspecified address (0.0.0.0) is no device and watches nobody.
+    ///
+    /// For the panel's thread, when a device's screen opens or closes. It takes the ring's lock,
+    /// which the resolver's side never waits for.
+    pub fn watch_client(&self, client: Option<Ipv4Addr>) {
+        let key = client.map_or(0, u32::from);
+        let mut ring = self.watch.lock().unwrap_or_else(PoisonError::into_inner);
+        // A holder that panicked left it poisoned, and the resolver's side drops names for ever
+        // after; the ring is a whole one whatever the holder did, so it is made good again.
+        self.watch.clear_poison();
+        ring.client = key;
+        ring.len = 0;
+        // What was kept is gone, not just out of reach.
+        ring.slots = [WatchSlot::EMPTY; WATCH_SLOTS];
+        self.watched.store(key, Ordering::Relaxed);
+    }
+
+    /// The names of the watched device, the newest first, at most [`WATCH_SLOTS`]: into `out`,
+    /// whose contents they replace. Nothing is taken: the names stay for the next copy, as a screen
+    /// that is on shows them all the while. Empty while nobody is watched, and until the device
+    /// asks. For the panel's thread: the ring's lock is held only for the copy, and the names are
+    /// made once it is let go.
+    pub fn watched_names(&self, out: &mut Vec<WatchedName>) {
+        let (slots, len) = {
+            let ring = self.watch.lock().unwrap_or_else(PoisonError::into_inner);
+            (ring.slots, ring.len)
+        };
+        out.clear();
+        let held = slots.get(..len).unwrap_or_default();
+        out.extend(held.iter().map(|slot| slot.into_name()));
     }
 
     /// Moves the names that wait into `out`, oldest first, and empties the ring. For the panel's
@@ -251,6 +470,13 @@ impl LaneFeed {
     pub(crate) fn clear(&self) {
         self.ring.lock().unwrap_or_else(PoisonError::into_inner).len = 0;
     }
+
+    /// Holds the ring of the watched device's names, as the panel's thread does for a copy, until
+    /// what it returns is dropped.
+    #[cfg(test)]
+    pub(crate) fn busy_watch(&self) -> impl Drop + '_ {
+        self.watch.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +484,8 @@ mod tests {
     use super::*;
 
     use std::cell::Cell;
+
+    use qb_dns::BlockSet;
 
     /// The names and kinds that `take` gives, which empties the feed.
     fn taken(feed: &LaneFeed) -> Vec<(String, NameKind)> {
@@ -481,6 +709,138 @@ mod tests {
         assert_eq!(feed.dropped(), 1);
         assert_eq!(taken(&feed), [refused("ads.example.org")]);
         assert!(taken(&feed).is_empty());
+    }
+
+    /// The names and outcomes of the watched device that the feed holds, newest first.
+    fn watched(feed: &LaneFeed) -> Vec<(String, WatchedOutcome)> {
+        let mut out = Vec::new();
+        feed.watched_names(&mut out);
+        out.into_iter().map(|n| (n.name, n.outcome)).collect()
+    }
+
+    /// Puts `name` in the ring of the watched device's names as an answered one, and says what the
+    /// ring holds.
+    fn pushed(feed: &LaneFeed, name: &str) -> Vec<String> {
+        feed.watch
+            .lock()
+            .unwrap()
+            .push(WatchSlot::of(name, WatchedOutcome::Answered));
+        watched(feed).into_iter().map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn the_ring_of_the_watched_device_holds_two_names_newest_first_and_a_repeat_moves_up() {
+        let feed = LaneFeed::new();
+        assert_eq!(watched(&feed), []);
+        assert_eq!(pushed(&feed, "a.example.org"), ["a.example.org"]);
+        assert_eq!(
+            pushed(&feed, "b.example.org"),
+            ["b.example.org", "a.example.org"]
+        );
+        assert_eq!(
+            pushed(&feed, "c.example.org"),
+            ["c.example.org", "b.example.org"]
+        );
+        // The name that is first again is one name; the one before it comes up.
+        assert_eq!(
+            pushed(&feed, "c.example.org"),
+            ["c.example.org", "b.example.org"]
+        );
+        assert_eq!(
+            pushed(&feed, "b.example.org"),
+            ["b.example.org", "c.example.org"]
+        );
+        // A repeat takes the outcome it has now.
+        feed.watch
+            .lock()
+            .unwrap()
+            .push(WatchSlot::of("b.example.org", WatchedOutcome::Passed));
+        assert_eq!(
+            watched(&feed),
+            [
+                ("b.example.org".to_owned(), WatchedOutcome::Passed),
+                ("c.example.org".to_owned(), WatchedOutcome::Answered),
+            ]
+        );
+        let mut out = Vec::new();
+        feed.watched_names(&mut out);
+        feed.watched_names(&mut out);
+        assert_eq!(out.len(), WATCH_SLOTS, "the copy replaces what `out` held");
+    }
+
+    #[test]
+    fn watching_a_client_clears_the_ring_and_says_whose_names_it_holds() {
+        let feed = LaneFeed::new();
+        // Names that nobody asked for are not kept by the ring of nobody.
+        assert_eq!(feed.watched.load(Ordering::Relaxed), 0);
+        feed.watch_client(Some(Ipv4Addr::new(192, 0, 2, 7)));
+        assert_eq!(feed.watched.load(Ordering::Relaxed), 0xC000_0207);
+        assert_eq!(pushed(&feed, "a.example.org").len(), 1);
+        feed.watch_client(Some(Ipv4Addr::new(192, 0, 2, 8)));
+        assert_eq!(watched(&feed), []);
+        assert_eq!(feed.watch.lock().unwrap().client, 0xC000_0208);
+        feed.watch_client(None);
+        assert_eq!(feed.watched.load(Ordering::Relaxed), 0);
+        assert_eq!(feed.watch.lock().unwrap().client, 0);
+        feed.watch_client(Some(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(feed.watched.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_name_that_was_on_its_way_when_the_watch_moved_is_not_taken_in_by_the_new_ring() {
+        let feed = LaneFeed::new();
+        let resolver = Resolver::new(BlockSet::default());
+        let (old, new) = (Ipv4Addr::new(192, 0, 2, 7), Ipv4Addr::new(192, 0, 2, 8));
+        feed.watch_client(Some(new));
+        // The resolver's side read the address 7 as watched, and the panel moved the watch to 8
+        // before the ring was taken: the name of 7 is dropped, and the one of 8 is kept.
+        let offer = |watched: Ipv4Addr, client: Ipv4Addr, name: &str| {
+            feed.offer_watched(
+                u32::from(watched),
+                Some(IpAddr::V4(client)),
+                &resolver,
+                name,
+                Outcome::Forwarded,
+            );
+        };
+        offer(old, old, "late.example.org");
+        assert_eq!(watched(&feed), []);
+        offer(new, new, "now.example.org");
+        assert_eq!(
+            watched(&feed),
+            [("now.example.org".to_owned(), WatchedOutcome::Answered)]
+        );
+        // A name of another client than the watched one is not kept either.
+        offer(new, old, "other.example.org");
+        assert_eq!(watched(&feed).len(), 1);
+    }
+
+    #[test]
+    fn a_client_is_an_ipv4_address_or_an_ipv4_address_mapped_into_ipv6_and_nothing_else() {
+        let v4 = Ipv4Addr::new(192, 0, 2, 7);
+        assert_eq!(client_key(Some(IpAddr::V4(v4))), u32::from(v4));
+        assert_eq!(
+            client_key(Some(IpAddr::V6(v4.to_ipv6_mapped()))),
+            u32::from(v4)
+        );
+        assert_eq!(client_key(Some("2001:db8::7".parse().unwrap())), 0);
+        assert_eq!(client_key(Some(IpAddr::V6(v4.to_ipv6_compatible()))), 0);
+        assert_eq!(client_key(None), 0);
+    }
+
+    #[test]
+    fn a_watched_name_is_cut_at_32_bytes_at_a_char_boundary() {
+        let feed = LaneFeed::new();
+        let out = |feed: &LaneFeed, name: &str| {
+            feed.watch_client(Some(Ipv4Addr::new(192, 0, 2, 7)));
+            pushed(feed, name).remove(0)
+        };
+        assert_eq!(out(&feed, &"b".repeat(33)), "b".repeat(LANE_NAME_BYTES));
+        assert_eq!(
+            out(&feed, &"\u{20ac}".repeat(12)),
+            format!("{}~", "\u{20ac}".repeat(10))
+        );
+        assert_eq!(out(&feed, &"\u{e9}".repeat(16)), "\u{e9}".repeat(16));
     }
 
     #[test]

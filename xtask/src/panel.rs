@@ -2,11 +2,16 @@
 //! and with `--push` onto the 3.5-inch screen of a Pi running Raspberry Pi OS.
 //!
 //! The frame is one of the Drain's stills, as `qb-panel` paints it:
-//! `--state normal` (the default), `paused`, `alert`, `alert-low`,
-//! `alert-long`, `boot`, `listening`, `quiet`, `long`, `five`, `six`, `pct0`
-//! or `pct100`. They are the fixtures the goldens compare, so the PNG of a
+//! `--state normal` (the default), `paused`, `boot`, `listening`, `quiet`,
+//! `long`, `five`, `six`, `pct0` or `pct100`. They are the fixtures the goldens compare, so the PNG of a
 //! bare `cargo xtask panel-preview` is the first of the references in
 //! `crates/qb-panel/tests/reference`.
+//!
+//! Or it is one screen of the panel's OS: `--screen home`, `home-alert`, `home-open`, `gate`, `live`,
+//! `live-gate`, `devices`, `device`, `confirm`, `pause`, `alert` or `about` (every still of
+//! `qb_panel::os::fixture::Still`). The frame is drawn as the goldens draw it, from the same world and
+//! navigation and through the same `screens::{view_of, draw}` (or, for LIVE, the Drain's painter), so the
+//! PNG is the pixels of `os-<screen>.png` in the references. `--screen` and `--state` are alternatives.
 //!
 //! `--push` sends the same frame as RGB565 to the Pi, in two commands over SSH
 //! and without `sudo`: on Raspberry Pi OS the user is in the `video` group,
@@ -27,6 +32,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
+use qb_panel::os::fixture::{Still, live_scene, world};
+use qb_panel::os::screens;
+use qb_panel::ui::ScreenPainter;
 use qb_panel::{Fixture, HEIGHT, Painter, WIDTH, drain_fixture, rgba_to_rgb565};
 
 use crate::deploy::{Invocation, Runner, SystemRunner, resolve_host, run_fed_to_success, ssh};
@@ -58,12 +66,6 @@ pub enum State {
     Normal,
     /// Blocking is paused, with a listed name crossing the gate outlined.
     Paused,
-    /// The normal scene, with a high severity alert over its lower right.
-    Alert,
-    /// The normal scene, with a blue alert for a new device.
-    AlertLow,
-    /// The normal scene, with an alert whose subject takes two lines.
-    AlertLong,
     /// Wi-Fi not joined: the lane says so and the figures are dashes.
     Boot,
     /// Joined, and no query yet.
@@ -88,9 +90,6 @@ impl State {
         match self {
             State::Normal => Fixture::Normal,
             State::Paused => Fixture::Paused,
-            State::Alert => Fixture::Alert,
-            State::AlertLow => Fixture::AlertLow,
-            State::AlertLong => Fixture::AlertLong,
             State::Boot => Fixture::Boot,
             State::Listening => Fixture::Listening,
             State::Quiet => Fixture::Quiet,
@@ -112,9 +111,24 @@ pub struct PreviewArgs {
     /// Also show the frame on the 3.5-inch screen of the Pi with this SSH alias, running Raspberry Pi OS
     #[arg(long, value_name = "ssh-alias")]
     pub push: Option<String>,
-    /// Which still to draw
+    /// Which still of the Drain to draw
     #[arg(long, value_enum, default_value_t = State::Normal)]
     pub state: State,
+    /// Draw this screen of the panel's OS instead of a Drain still: home, home-alert, home-open, gate,
+    /// live, live-gate, devices, device, confirm, pause, alert or about
+    #[arg(long, value_name = "screen", value_parser = screen_still, conflicts_with = "state")]
+    pub screen: Option<Still>,
+}
+
+/// The still that `--screen` names: one of [`Still::ALL`] by its name, and nothing else.
+fn screen_still(word: &str) -> Result<Still, String> {
+    Still::from_name(word).ok_or_else(|| {
+        let names: Vec<&str> = Still::ALL.iter().map(|still| still.name()).collect();
+        format!(
+            "not a screen of the panel; the screens are {}",
+            names.join(", ")
+        )
+    })
 }
 
 /// Paints a still of the Drain from scratch, as the RGBA frame `qb-panel` draws it.
@@ -122,6 +136,23 @@ pub fn render(state: State) -> Vec<u8> {
     let (drain, stills) = drain_fixture(state.fixture());
     let mut painter = Painter::new();
     painter.paint(&drain, &stills);
+    painter.rgba().to_vec()
+}
+
+/// Paints a screen of the OS from scratch, as the RGBA frame `qb-panel`'s goldens paint it: LIVE with the
+/// Drain's painter from `live_scene`, every other still through `screens::view_of` and `screens::draw`
+/// on the screen painter, from the still's world and navigation.
+pub fn render_screen(still: Still) -> Vec<u8> {
+    if let Some((drain, stills)) = live_scene(still) {
+        let mut painter = Painter::new();
+        painter.paint(&drain, &stills);
+        return painter.rgba().to_vec();
+    }
+    let world = world(still);
+    let view = screens::view_of(&still.nav(&world), &world)
+        .expect("every still that is not LIVE has a view the screen painter draws");
+    let mut painter = ScreenPainter::new();
+    painter.paint(view, screens::draw);
     painter.rgba().to_vec()
 }
 
@@ -308,7 +339,10 @@ fn push(runner: &mut dyn Runner, alias: &str, frame: &[u8]) -> Result<String> {
 /// Draws the still the flags name, writes it as a PNG and prints where;
 /// with `--push`, then puts the same frame on the Pi's screen.
 pub fn run(args: &PreviewArgs, root: &Path) -> Result<()> {
-    let rgba = render(args.state);
+    let rgba = match args.screen {
+        Some(still) => render_screen(still),
+        None => render(args.state),
+    };
     let path = match &args.out {
         Some(path) => path.clone(),
         None => root.join(DEFAULT_PNG),
@@ -369,9 +403,6 @@ mod tests {
         for (word, state) in [
             ("normal", State::Normal),
             ("paused", State::Paused),
-            ("alert", State::Alert),
-            ("alert-low", State::AlertLow),
-            ("alert-long", State::AlertLong),
             ("boot", State::Boot),
             ("listening", State::Listening),
             ("quiet", State::Quiet),
@@ -384,7 +415,15 @@ mod tests {
             assert_eq!(parse(&["--state", word]).unwrap().state, state, "{word}");
             assert_eq!(state.fixture().name(), word, "{word} is its fixture's name");
         }
-        for bad in ["", "Normal", "dial", "unknown", "alert,paused", "alert_low"] {
+        for bad in [
+            "",
+            "Normal",
+            "dial",
+            "unknown",
+            "paused,boot",
+            "pct_0",
+            "alert",
+        ] {
             assert!(parse(&["--state", bad]).is_err(), "{bad:?}");
         }
         assert!(parse(&["--state"]).is_err());
@@ -435,11 +474,21 @@ mod tests {
         )
     }
 
-    /// The reference of a still in `qb-panel`, as an RGBA frame: its 8-bit RGB PNG with the alpha added.
+    /// The reference of a Drain still in `qb-panel`, as an RGBA frame: its 8-bit RGB PNG with the alpha added.
     fn reference(name: &str) -> Vec<u8> {
+        reference_file(&format!("drain-{name}.png"))
+    }
+
+    /// The reference of a screen of the OS (`os-<name>.png`), as `reference` gives one.
+    fn os_reference(name: &str) -> Vec<u8> {
+        reference_file(&format!("os-{name}.png"))
+    }
+
+    /// A file of `qb-panel`'s references, as an RGBA frame.
+    fn reference_file(file: &str) -> Vec<u8> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../crates/qb-panel/tests/reference")
-            .join(format!("drain-{name}.png"));
+            .join(file);
         let (width, height, colour, depth, rgb) = decode(&fs::read(&path).unwrap());
         assert_eq!(
             (width, height, colour, depth),
@@ -476,7 +525,6 @@ mod tests {
         for (state, name) in [
             (State::Normal, "normal"),
             (State::Paused, "paused"),
-            (State::Alert, "alert"),
             (State::Boot, "boot"),
             (State::Listening, "listening"),
             (State::Quiet, "quiet"),
@@ -505,13 +553,80 @@ mod tests {
     }
 
     #[test]
+    fn screen_takes_the_stills_of_the_os_by_name_and_nothing_else() {
+        for still in Still::ALL {
+            let args = parse(&["--screen", still.name()]).unwrap();
+            assert_eq!(args.screen, Some(still), "{}", still.name());
+        }
+        assert_eq!(parse(&[]).unwrap().screen, None);
+        for bad in [
+            "",
+            "Home",
+            "nope",
+            "home,gate",
+            "devices-adspass",
+            "drain-normal",
+        ] {
+            assert!(parse(&["--screen", bad]).is_err(), "{bad:?}");
+        }
+        assert!(parse(&["--screen"]).is_err());
+        // The Drain's states and the OS's screens are alternatives.
+        assert!(parse(&["--screen", "home", "--state", "paused"]).is_err());
+        // The refusal names the screens.
+        let message = parse(&["--screen", "nope"]).err().unwrap().to_string();
+        assert!(
+            message.contains("home-alert") && message.contains("about"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn screen_home_writes_the_pixels_of_the_os_home_reference() {
+        let root = tempfile::tempdir().unwrap();
+        let out = root.path().join("home.png");
+        let args = PreviewArgs {
+            out: Some(out.clone()),
+            screen: Some(Still::Home),
+            ..PreviewArgs::default()
+        };
+        run(&args, root.path()).unwrap();
+        let (width, height, colour, depth, pixels) = decode(&fs::read(&out).unwrap());
+        assert_eq!(
+            (width, height, colour, depth),
+            (480, 320, png::ColorType::Rgba, png::BitDepth::Eight)
+        );
+        assert!(
+            pixels == os_reference("home"),
+            "--screen home is not the pixels of os-home.png"
+        );
+    }
+
+    #[test]
+    fn every_screen_renders_the_pixels_of_its_reference() {
+        let mut frames = Vec::new();
+        for still in Still::ALL {
+            let frame = render_screen(still);
+            assert!(
+                frame == os_reference(still.name()),
+                "--screen {} is not the pixels of os-{}.png",
+                still.name(),
+                still.name()
+            );
+            frames.push(frame);
+        }
+        // No two screens are the same picture.
+        for (i, a) in frames.iter().enumerate() {
+            for b in &frames[i + 1..] {
+                assert!(a != b);
+            }
+        }
+    }
+
+    #[test]
     fn every_state_looks_different() {
         let all = [
             State::Normal,
             State::Paused,
-            State::Alert,
-            State::AlertLow,
-            State::AlertLong,
             State::Boot,
             State::Listening,
             State::Quiet,

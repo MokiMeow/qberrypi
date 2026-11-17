@@ -1,51 +1,12 @@
-//! Touch: which control a screen point belongs to, which presses count as
-//! taps, the pause switch, and the mapping from raw touch readings to pixels.
+//! Touch: which presses count as taps, the pause switch, and the mapping from raw touch readings to
+//! pixels.
 //!
 //! Times are milliseconds on any clock that does not jump; the caller owns
-//! it. Nothing here panics or overflows, whatever the input.
+//! it. Nothing here panics or overflows, whatever the input. What is under a point of the screen is the
+//! caller's to say (`os::nav::decide` for the panel OS): the tracker only decides which presses are taps.
 
-use crate::geometry::{HEIGHT, Rect, WIDTH};
+use crate::geometry::{HEIGHT, WIDTH};
 use crate::state::Blocking;
-
-/// Something on the panel that a tap works.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Control {
-    /// The key that pauses blocking and turns it on again.
-    BlockingSwitch,
-    /// The alert that covers part of the screen: a tap acknowledges it.
-    DismissAlert,
-}
-
-/// Where a tap works the key: the key and a margin around it, a little more than the finger needs.
-pub const KEY_TARGET: Rect = Rect {
-    x: 0,
-    y: 212,
-    w: 96,
-    h: 108,
-};
-
-/// Where a tap dismisses the alert: the whole of its card, 344 by 224, standing on the floor. It is live only while the card is shown.
-pub const ALERT_TARGET: Rect = Rect {
-    x: 128,
-    y: 80,
-    w: 344,
-    h: 224,
-};
-
-/// The control at a point of the screen, in pixels from the top left; `None` where a tap does nothing.
-///
-/// `alert_shown` is whether the alert's card is on the screen: only then does its region count.
-/// The two regions do not meet, so no point belongs to both.
-#[must_use]
-pub fn hit(x: u16, y: u16, alert_shown: bool) -> Option<Control> {
-    if KEY_TARGET.contains(x, y) {
-        Some(Control::BlockingSwitch)
-    } else if alert_shown && ALERT_TARGET.contains(x, y) {
-        Some(Control::DismissAlert)
-    } else {
-        None
-    }
-}
 
 /// One report of the touch screen, in screen coordinates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,53 +32,75 @@ pub enum TouchEvent {
 /// The shortest press that counts as a tap, in milliseconds; anything shorter is noise.
 pub const MIN_PRESS_MS: u64 = 50;
 
-/// A press that would work a control if it were released now or later.
-#[derive(Debug, Clone, Copy)]
-struct Press {
-    /// The control the press began on and has not left.
-    control: Control,
+/// A press that would work a target if it were released now or later.
+#[derive(Debug, Clone)]
+struct Press<T> {
+    /// What the press began on and has not left.
+    target: T,
+    /// Where the finger came down.
+    at: (u16, u16),
     /// When the finger came down.
     began_ms: u64,
 }
 
-/// Turns touch events into taps: a press that begins on a control, stays on it and lasts `MIN_PRESS_MS`.
-#[derive(Debug, Clone, Default)]
-pub struct TapTracker {
+/// Turns touch events into taps: a press that begins on a target, stays on it and lasts `MIN_PRESS_MS`.
+///
+/// A target is whatever the caller says is under a point: any value that can be compared (the OS's `Tap`
+/// of `nav::decide`). Two points are on the same target when the caller's function gives equal targets for
+/// them.
+#[derive(Debug, Clone)]
+pub struct TapTracker<T> {
     /// The press a release would turn into a tap. `None` while no finger is
     /// down, and also during a press that began on nothing or was spoilt:
     /// none of the three can fire before the next `Down`.
-    press: Option<Press>,
+    press: Option<Press<T>>,
 }
 
-impl TapTracker {
-    /// Takes the event that happened at `at_ms`; returns the control that was tapped, on the `Up` that completes a tap.
+impl<T> Default for TapTracker<T> {
+    fn default() -> Self {
+        Self { press: None }
+    }
+}
+
+impl<T: Clone + PartialEq> TapTracker<T> {
+    /// Takes the event that happened at `at_ms`; `target` says what is under a point, `None` for nothing.
+    /// On the `Up` that completes a tap it gives the target the press began on and the point it came
+    /// down at, which the caller hands to `nav::tap`.
     ///
-    /// `alert_shown` is whether the alert's card is on the screen as the event is taken. A press on
-    /// the card that is still down when the card goes is spoilt by its next move, as a press that
-    /// leaves its control is; the caller drops a tap on a card that is gone.
+    /// A press that began on nothing is not tracked. One that moves off its target is spoilt for good:
+    /// coming back does not restore it. A press shorter than `MIN_PRESS_MS` is noise. The target is
+    /// decided at the press; `target` is asked again at every move, so a target that goes away while
+    /// the finger is down (the gate ask, once it has closed) spoils the press at its next move.
     #[must_use]
-    pub fn feed(&mut self, at_ms: u64, event: TouchEvent, alert_shown: bool) -> Option<Control> {
+    pub fn feed_with(
+        &mut self,
+        at_ms: u64,
+        event: TouchEvent,
+        target: impl Fn(u16, u16) -> Option<T>,
+    ) -> Option<(T, (u16, u16))> {
         match event {
             TouchEvent::Down { x, y } => {
                 // Whatever press was under way is dropped: its release was lost.
-                self.press = hit(x, y, alert_shown).map(|control| Press {
-                    control,
+                self.press = target(x, y).map(|target| Press {
+                    target,
+                    at: (x, y),
                     began_ms: at_ms,
                 });
                 None
             }
             TouchEvent::Move { x, y } => {
-                // Off its control the press is spoilt for good: coming back does not restore it.
+                // Off its target the press is spoilt for good: coming back does not restore it.
                 self.press = self
                     .press
-                    .filter(|press| hit(x, y, alert_shown) == Some(press.control));
+                    .take()
+                    .filter(|press| target(x, y).as_ref() == Some(&press.target));
                 None
             }
             TouchEvent::Up => {
                 let press = self.press.take()?;
                 // A clock that went backwards counts as no time at all.
                 let held_ms = at_ms.saturating_sub(press.began_ms);
-                (held_ms >= MIN_PRESS_MS).then_some(press.control)
+                (held_ms >= MIN_PRESS_MS).then_some((press.target, press.at))
             }
         }
     }
@@ -256,81 +239,48 @@ mod tests {
     use super::*;
     use TouchEvent::{Down, Move, Up};
 
+    use crate::geometry::Rect;
+
     const IN: (u16, u16) = (40, 290);
 
-    fn run(events: &[(u64, TouchEvent)]) -> Vec<Option<Control>> {
-        run_with(false, events)
+    /// A target for these tests: one key in the screen's lower left corner, the place of the Drain's key
+    /// and its margin, `(0, 212, 96, 108)`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Control {
+        BlockingSwitch,
     }
 
-    fn run_with(alert_shown: bool, events: &[(u64, TouchEvent)]) -> Vec<Option<Control>> {
+    /// The key's place.
+    const KEY_TARGET: Rect = Rect {
+        x: 0,
+        y: 212,
+        w: 96,
+        h: 108,
+    };
+
+    /// The target at a point; `None` where a tap does nothing.
+    fn hit(x: u16, y: u16) -> Option<Control> {
+        KEY_TARGET.contains(x, y).then_some(Control::BlockingSwitch)
+    }
+
+    /// The press point of a tap is not what these tests look at: only whether, and on what, a tap landed.
+    fn run(events: &[(u64, TouchEvent)]) -> Vec<Option<Control>> {
         let mut t = TapTracker::default();
         events
             .iter()
-            .map(|&(at, e)| t.feed(at, e, alert_shown))
+            .map(|&(at, e)| t.feed_with(at, e, hit).map(|(control, _)| control))
             .collect()
     }
 
     #[test]
-    fn the_key_is_tapped_at_its_region_and_the_alert_only_when_shown() {
-        // The key and its margin, shown or not: its region is (0, 212, 96, 108).
-        for alert_shown in [false, true] {
-            for (x, y) in [(0, 212), (8, 220), (50, 260), (95, 319), (0, 319)] {
-                assert_eq!(hit(x, y, alert_shown), Some(Control::BlockingSwitch));
-            }
-            for (x, y) in [(96, 290), (50, 211), (127, 250), (240, 40)] {
-                assert_eq!(hit(x, y, alert_shown), None, "{x},{y}");
-            }
+    fn the_key_is_tapped_at_its_region() {
+        // The key and its margin: its region is (0, 212, 96, 108).
+        for (x, y) in [(0, 212), (8, 220), (50, 260), (95, 319), (0, 319)] {
+            assert_eq!(hit(x, y), Some(Control::BlockingSwitch));
         }
-        // The alert's card, (128, 80, 344, 224), counts only while it is on the screen.
-        for (x, y) in [(128, 80), (300, 200), (471, 303), (128, 303), (471, 80)] {
-            assert_eq!(hit(x, y, true), Some(Control::DismissAlert), "{x},{y}");
-            assert_eq!(hit(x, y, false), None, "{x},{y}");
+        for (x, y) in [(96, 290), (50, 211), (127, 250), (240, 40), (300, 200)] {
+            assert_eq!(hit(x, y), None, "{x},{y}");
         }
-        // Not the cleared field round the card, nor the floor under it.
-        for (x, y) in [(127, 80), (128, 79), (472, 200), (300, 304), (124, 200)] {
-            assert_eq!(hit(x, y, true), None, "{x},{y}");
-        }
-        // The two regions share no pixel.
-        for x in 0..=u16::try_from(WIDTH).unwrap() {
-            for y in 0..=u16::try_from(HEIGHT).unwrap() {
-                assert!(!(KEY_TARGET.contains(x, y) && ALERT_TARGET.contains(x, y)));
-            }
-        }
-    }
-
-    #[test]
-    fn the_alert_region_is_the_takeovers_area() {
-        use crate::drain::look::ALERT;
-        let area = (ALERT.x, ALERT.y, ALERT.w, ALERT.h);
-        let region = (
-            f32::from(ALERT_TARGET.x),
-            f32::from(ALERT_TARGET.y),
-            f32::from(ALERT_TARGET.w),
-            f32::from(ALERT_TARGET.h),
-        );
-        assert_eq!(area, region);
-    }
-
-    #[test]
-    fn a_tap_on_the_alert_fires_once_and_only_while_it_is_shown() {
-        let down = Down { x: 300, y: 200 };
-        assert_eq!(
-            run_with(true, &[(1000, down), (1050, Up)]),
-            [None, Some(Control::DismissAlert)]
-        );
-        assert_eq!(run_with(false, &[(1000, down), (1050, Up)]), [None; 2]);
-        // Too short to count, as on the key.
-        assert_eq!(run_with(true, &[(1000, down), (1049, Up)]), [None; 2]);
-        // A press that slides off the card is spoilt.
-        assert_eq!(
-            run_with(true, &[(0, down), (10, Move { x: 50, y: 200 }), (200, Up)]),
-            [None; 3]
-        );
-        // The card goes while the finger is down: the next move spoils the press.
-        let mut tracker = TapTracker::default();
-        assert_eq!(tracker.feed(0, down, true), None);
-        assert_eq!(tracker.feed(20, Move { x: 301, y: 200 }, false), None);
-        assert_eq!(tracker.feed(200, Up, false), None);
     }
 
     #[test]
@@ -614,8 +564,7 @@ mod tests {
             x: u16::MAX,
             y: u16::MAX,
         };
-        assert_eq!(hit(u16::MAX, u16::MAX, false), None);
-        assert_eq!(hit(u16::MAX, u16::MAX, true), None);
+        assert_eq!(hit(u16::MAX, u16::MAX), None);
         assert_eq!(
             run(&[
                 (0, corner),
@@ -741,5 +690,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    // The tracker is generic: any target a caller can compare, and the press point comes back with it.
+    #[test]
+    fn a_tracker_of_any_target_yields_the_target_and_where_the_finger_came_down() {
+        // Two halves of the screen are the targets 1 and 2; a strip at the top is nothing.
+        let target = |x: u16, y: u16| (y >= 20).then_some(if x < 240 { 1_u8 } else { 2 });
+        let mut tracker: TapTracker<u8> = TapTracker::default();
+        let mut feed = |at, event| tracker.feed_with(at, event, target);
+        assert_eq!(feed(0, Down { x: 10, y: 100 }), None);
+        assert_eq!(feed(60, Move { x: 200, y: 300 }), None);
+        assert_eq!(
+            feed(80, Up),
+            Some((1, (10, 100))),
+            "the point of the press, not of the release"
+        );
+        // Sliding onto the other target spoils it; so does a press that begins on nothing.
+        assert_eq!(feed(100, Down { x: 10, y: 100 }), None);
+        assert_eq!(feed(110, Move { x: 300, y: 100 }), None);
+        assert_eq!(feed(200, Up), None);
+        assert_eq!(feed(300, Down { x: 10, y: 5 }), None);
+        assert_eq!(feed(400, Up), None);
+        // Fifty milliseconds, as for the Drain's key.
+        assert_eq!(feed(500, Down { x: 300, y: 100 }), None);
+        assert_eq!(feed(549, Up), None);
+        assert_eq!(feed(600, Down { x: 300, y: 100 }), None);
+        assert_eq!(feed(650, Up), Some((2, (300, 100))));
+        // A lost release: the next press begins again, from its own time.
+        assert_eq!(feed(700, Down { x: 300, y: 100 }), None);
+        assert_eq!(feed(1_000, Down { x: 10, y: 100 }), None);
+        assert_eq!(feed(1_020, Up), None);
     }
 }

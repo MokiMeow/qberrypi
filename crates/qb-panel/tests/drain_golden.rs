@@ -1,4 +1,4 @@
-//! The Drain's golden tests: eight of the stills as this crate paints them, compared with the committed
+//! The Drain's golden tests: seven of the stills as this crate paints them, compared with the committed
 //! references, and the painter's frame built up compared with a fresh one.
 //!
 //! The comparison has three parts: the mean over the frame, the share of outlier pixels and the
@@ -11,83 +11,24 @@
 
 use std::env;
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::{BufWriter, Cursor};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use qb_panel::drain::look::{TILE_DX, TILE_W, cell_x};
-use qb_panel::drain::{AlertCard, Drain, Melt, NameKind, Stills, Tile, TileStyle};
+use qb_panel::drain::{Drain, Melt, NameKind, Stills, Tile, TileStyle};
 use qb_panel::rows::changed_rows;
 use qb_panel::{
     Blocking, Fixture, HEIGHT, LaneWords, Painter, Share, TimeOfDay, WIDTH, drain_fixture,
 };
 
-/// The side of a tile of the third part of the metric, in pixels.
-const TILE: usize = 16;
-/// A pixel is an outlier if a channel of it differs by more than this.
-const OUTLIER_STEP: u8 = 48;
-/// The tiles in a row of the frame.
-const TILES_ACROSS: usize = WIDTH / TILE;
-/// The pixels of a frame, as the divisor of a share or a mean.
-const FRAME_PIXELS: f64 = (WIDTH * HEIGHT) as f64;
-/// The pixels of a tile, as the divisor of a mean.
-const TILE_PIXELS: f64 = (TILE * TILE) as f64;
-/// The colour channels of a pixel that are compared: R, G and B.
-const CHANNELS: f64 = 3.0;
-
-// The tiles cover the frame exactly: 600 of them.
-const _: () = assert!(WIDTH.is_multiple_of(TILE) && HEIGHT.is_multiple_of(TILE));
+mod os_common;
+use os_common::{
+    Rect, blessing, close, diff, mockup_dir, mockup_frame, read_png, read_png_any, region_diff,
+    write_png,
+};
 
 /// A colour as the frame stores it, without the alpha.
 type Rgb = [u8; 3];
-/// A rectangle of the frame: left, top, width, height.
-type Rect = (usize, usize, usize, usize);
-
-/// How far two frames are apart.
-struct Diff {
-    /// The mean of |a − b| over the R, G and B bytes of all pixels.
-    mean_abs: f64,
-    /// The share of pixels with any channel differing by more than 48.
-    outliers: f64,
-    /// The largest `mean_abs` of one of the 600 tiles of 16 × 16.
-    worst_tile: f64,
-}
-
-/// Compares two 480 × 320 RGBA frames; the alpha is ignored.
-fn diff(a: &[u8], b: &[u8]) -> Diff {
-    let (a, b) = (a.as_chunks::<4>().0, b.as_chunks::<4>().0);
-    assert_eq!(
-        (a.len(), b.len()),
-        (WIDTH * HEIGHT, WIDTH * HEIGHT),
-        "two frames of 480 × 320"
-    );
-    // The sum of |a − b| in each tile; a whole frame of the largest steps stays within `u32`.
-    let mut tiles = vec![0_u32; TILES_ACROSS * (HEIGHT / TILE)];
-    let mut outliers = 0_u32;
-    for (at, (p, q)) in a.iter().zip(b).enumerate() {
-        let steps = [
-            p[0].abs_diff(q[0]),
-            p[1].abs_diff(q[1]),
-            p[2].abs_diff(q[2]),
-        ];
-        let (x, y) = (at % WIDTH, at / WIDTH);
-        tiles[y / TILE * TILES_ACROSS + x / TILE] +=
-            steps.iter().copied().map(u32::from).sum::<u32>();
-        outliers += u32::from(steps.iter().any(|&step| step > OUTLIER_STEP));
-    }
-    let worst = tiles.iter().copied().max().unwrap_or(0);
-    Diff {
-        mean_abs: f64::from(tiles.iter().sum::<u32>()) / (FRAME_PIXELS * CHANNELS),
-        outliers: f64::from(outliers) / FRAME_PIXELS,
-        worst_tile: f64::from(worst) / (TILE_PIXELS * CHANNELS),
-    }
-}
-
-/// Whether a difference is within the three limits of the golden test.
-fn close(d: &Diff) -> bool {
-    d.mean_abs <= 0.40 && d.outliers <= 0.0003 && d.worst_tile <= 8.0
-}
 
 /// The reference PNG of a still.
 fn reference_path(which: Fixture) -> String {
@@ -96,52 +37,6 @@ fn reference_path(which: Fixture) -> String {
         env!("CARGO_MANIFEST_DIR"),
         which.name()
     )
-}
-
-/// An 8-bit RGB or RGBA PNG of any size, as RGBA, with its width and height.
-fn read_png_any(path: impl AsRef<Path>) -> (usize, usize, Vec<u8>) {
-    let path = path.as_ref();
-    let png = fs::read(path).unwrap_or_else(|e| panic!("{} is read: {e}", path.display()));
-    let mut reader = png::Decoder::new(Cursor::new(png))
-        .read_info()
-        .expect("the file is a PNG");
-    let mut raw = vec![0; reader.output_buffer_size().expect("the PNG fits in memory")];
-    let frame = reader.next_frame(&mut raw).expect("the PNG decodes");
-    let (width, height) = (
-        usize::try_from(frame.width).expect("the width fits"),
-        usize::try_from(frame.height).expect("the height fits"),
-    );
-    assert_eq!(
-        frame.bit_depth,
-        png::BitDepth::Eight,
-        "{} is 8-bit",
-        path.display()
-    );
-    let raw = &raw[..frame.buffer_size()];
-    let rgba = match frame.color_type {
-        png::ColorType::Rgb => raw
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .flat_map(|&[r, g, b]| [r, g, b, u8::MAX])
-            .collect(),
-        png::ColorType::Rgba => raw.to_vec(),
-        other => panic!("{} is {other:?}, not RGB or RGBA", path.display()),
-    };
-    (width, height, rgba)
-}
-
-/// An 8-bit RGB PNG as an RGBA frame of 480 × 320.
-fn read_png(path: impl AsRef<Path>) -> Vec<u8> {
-    let path = path.as_ref();
-    let (width, height, rgba) = read_png_any(path);
-    assert_eq!(
-        (width, height),
-        (WIDTH, HEIGHT),
-        "{} has the frame's size",
-        path.display()
-    );
-    rgba
 }
 
 /// The committed reference of a still as an RGBA frame.
@@ -157,37 +52,11 @@ fn render(which: Fixture) -> Vec<u8> {
     painter.rgba().to_vec()
 }
 
-/// Writes an RGBA frame as an 8-bit RGB PNG.
-fn write_png(path: &Path, rgba: &[u8]) -> Result<(), Box<dyn Error>> {
-    let rgb: Vec<u8> = rgba
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .flat_map(|&[r, g, b, _]| [r, g, b])
-        .collect();
-    let mut encoder = png::Encoder::new(
-        BufWriter::new(File::create(path)?),
-        u32::try_from(WIDTH)?,
-        u32::try_from(HEIGHT)?,
-    );
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header()?;
-    writer.write_image_data(&rgb)?;
-    writer.finish()?;
-    Ok(())
-}
-
 /// Saves a rendering that missed its reference among the build's temporary files and says where.
 fn save_actual(name: &str, rgba: &[u8]) -> Result<PathBuf, Box<dyn Error>> {
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("qb-panel-drain-{name}.png"));
     write_png(&path, rgba)?;
     Ok(path)
-}
-
-/// Whether this run is to write the references: `QBP_BLESS` is set to anything.
-fn blessing() -> bool {
-    env::var_os("QBP_BLESS").is_some()
 }
 
 /// Checks a still against its reference, saving the rendering if it is not close. With `QBP_BLESS`
@@ -285,11 +154,6 @@ fn drain_paused_renders_as_the_reference() {
 }
 
 #[test]
-fn drain_alert_renders_as_the_reference() {
-    check(Fixture::Alert);
-}
-
-#[test]
 fn drain_boot_renders_as_the_reference() {
     check(Fixture::Boot);
 }
@@ -376,7 +240,7 @@ fn the_painter_draws_the_same_frame_whether_built_up_or_fresh() {
     };
     let mut blocked = 4000_u32;
     let mut paused_left = 0_u16;
-    let mut alert_left = 0_u32;
+    let mut ask_left = 0_u32;
     let mut drops = 0_u32;
     let mut refills = 0_u32;
     let mut words_shown = 0_u32;
@@ -432,22 +296,14 @@ fn the_painter_draws_the_same_frame_whether_built_up_or_fresh() {
                 Blocking::On
             },
             gate_fill: if paused {
-                qb_panel::format::gate_fill(paused_left)
+                qb_panel::format::gate_fill(paused_left, 300)
             } else {
                 0
             },
             count: drain.count(),
-            // An alert over ticks 60 to 90, a blue one with a subject on two lines over 300 to 330,
-            // and one that is high and has no subject over 440 to 460.
-            alert: match tick {
-                60..90 => Some(card(true, "doubleclick.net")),
-                300..330 => Some(card(
-                    false,
-                    "secure-login-verify.accounts-billing.example.org",
-                )),
-                440..460 => Some(card(true, "")),
-                _ => None,
-            },
+            // The gate ask unfolded over ticks 60 to 90 (the lane busy, names landing under it), 300 to 330
+            // (the lane idle) and 440 to 460.
+            gate_ask: matches!(tick, 60..90 | 300..330 | 440..460),
             words: match tick {
                 0..12 => Some(LaneWords::Joining),
                 12..30 => Some(LaneWords::Listening),
@@ -457,12 +313,12 @@ fn the_painter_draws_the_same_frame_whether_built_up_or_fresh() {
                 _ => None,
             },
         };
-        alert_left += u32::from(wanted.alert.is_some());
+        ask_left += u32::from(wanted.gate_ask);
         refills += u32::from(wanted.gate_fill > 0);
         words_shown += u32::from(wanted.words.is_some() && drain.idle());
         // The panel's schedule: a motion write, then still writes one field at a time. The frame
         // built up is checked against a fresh one every few ticks, and around every change of
-        // the pause, the alert, the words and the spout's drop.
+        // the pause, the gate ask, the words and the spout's drop.
         let edge = [12, 30, 60, 90, 150, 200, 250, 300, 330, 340, 440, 460]
             .iter()
             .any(|&at| (at..at + 3).contains(&tick))
@@ -494,52 +350,10 @@ fn the_painter_draws_the_same_frame_whether_built_up_or_fresh() {
         }
     }
     // The run took in every state the comparison is for.
-    assert!(alert_left > 0, "an alert was shown");
+    assert!(ask_left > 0, "the gate ask was shown");
     assert!(drops > 0, "a drop left the spout");
     assert!(refills > 10, "the gate refilled");
     assert!(words_shown > 0, "the lane said its words");
-}
-
-/// An alert card with a title and a name.
-fn card(high: bool, subject: &str) -> AlertCard {
-    qb_panel::format::alert_card("beacon", high, subject, None)
-}
-
-/// How far two frames are apart inside some rectangles of the frame: the three parts of the metric,
-/// over the pixels of the rectangles only. A tile is of the frame's grid, and counts only the pixels of
-/// the rectangles that fall in it.
-fn region_diff(a: &[u8], b: &[u8], rects: &[Rect]) -> Diff {
-    let inside = |x: usize, y: usize| {
-        rects
-            .iter()
-            .any(|&(l, t, w, h)| (l..l + w).contains(&x) && (t..t + h).contains(&y))
-    };
-    let mut tiles = vec![0_u32; TILES_ACROSS * (HEIGHT / TILE)];
-    let (mut total, mut outliers, mut pixels) = (0_u64, 0_u64, 0_u64);
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            if !inside(x, y) {
-                continue;
-            }
-            let (p, q) = (px(a, x, y), px(b, x, y));
-            let steps = [
-                p[0].abs_diff(q[0]),
-                p[1].abs_diff(q[1]),
-                p[2].abs_diff(q[2]),
-            ];
-            let sum = steps.iter().copied().map(u32::from).sum::<u32>();
-            tiles[y / TILE * TILES_ACROSS + x / TILE] += sum;
-            total += u64::from(sum);
-            outliers += u64::from(steps.iter().any(|&step| step > OUTLIER_STEP));
-            pixels += 1;
-        }
-    }
-    let pixels = pixels.max(1) as f64;
-    Diff {
-        mean_abs: total as f64 / (pixels * CHANNELS),
-        outliers: outliers as f64 / pixels,
-        worst_tile: f64::from(tiles.iter().copied().max().unwrap_or(0)) / (TILE_PIXELS * CHANNELS),
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -656,8 +470,6 @@ fn letter_boxes(tiles: &[Tile], skipped: bool) -> Vec<TextBox> {
 struct Replaced {
     /// The letters of the plain names on the lane.
     plain_letters: bool,
-    /// The subject and who lines of the alert card.
-    card_lines: bool,
 }
 
 impl Plan {
@@ -684,18 +496,7 @@ impl Plan {
         text.push(boxed("REFUSED", (0, 124, 96, 18), false));
         text.push(boxed("clock", (0, 168, 96, 28), false));
         text.push(boxed("key text", (16, 236, 64, 56), false));
-        let alert = stills.alert.is_some();
-        if alert {
-            text.push(boxed("card title", (136, 92, 336, 80), false));
-            text.push(boxed(
-                "card subject and who",
-                (136, 176, 336, 76),
-                replaced.card_lines,
-            ));
-            text.push(boxed("card stub text", (136, 268, 336, 28), false));
-        } else {
-            text.push(boxed("count", (120, 250, 360, 70), false));
-        }
+        text.push(boxed("count", (120, 250, 360, 70), false));
         if stills.words.is_some() && idle {
             text.push(boxed("lane words", (120, 22, 360, 32), false));
         }
@@ -712,14 +513,17 @@ impl Plan {
         };
         let mut areas = vec![
             area("gate column", &[(96, 0, 24, 320)], Kind::Flat),
+            // The lane's first four cells, x 0 to 96 and y 8 to 64, say `HOME` since round 8: they are left out
+            // of every comparison with the round 6 stills, which have the names running on there. The rails
+            // above and below them are the stills' own.
             area(
                 "lane tiles and rails",
-                &[(0, 0, 96, 56), (120, 0, 360, 56)],
+                &[(0, 0, 96, 8), (120, 0, 360, 56)],
                 Kind::Flat,
             ),
             area(
                 "drips, tips and lower rail",
-                &[(0, 56, 96, 24), (120, 56, 360, 24)],
+                &[(0, 64, 96, 16), (120, 56, 360, 24)],
                 if melting { Kind::Round } else { Kind::Flat },
             ),
             area("key", &[(8, 224, 80, 80)], Kind::Flat),
@@ -734,17 +538,9 @@ impl Plan {
                 Kind::Flat,
             ),
         ];
-        if alert {
-            areas.push(area(
-                "alert card and its field",
-                &[(120, 80, 360, 240)],
-                Kind::Flat,
-            ));
-        } else {
-            areas.push(area("funnel", &[(120, 80, 360, 144)], Kind::Round));
-            areas.push(area("count band", &[(120, 224, 360, 96)], Kind::Flat));
-        }
-        let mut regions = vec![
+        areas.push(area("funnel", &[(120, 80, 360, 144)], Kind::Round));
+        areas.push(area("count band", &[(120, 224, 360, 96)], Kind::Flat));
+        let regions = vec![
             TextRegion {
                 name: "left column text",
                 rects: vec![(0, 64, 96, 256)],
@@ -752,28 +548,15 @@ impl Plan {
             },
             TextRegion {
                 name: "lane letters and words",
-                rects: vec![(0, 0, 96, 64), (120, 0, 360, 64)],
+                rects: vec![(120, 0, 360, 64)],
                 skipped: replaced.plain_letters,
             },
-        ];
-        if alert {
-            for (name, rect) in [
-                ("card title", (128, 80, 344, 96)),
-                ("card stub text", (128, 252, 344, 68)),
-            ] {
-                regions.push(TextRegion {
-                    name,
-                    rects: vec![rect],
-                    skipped: false,
-                });
-            }
-        } else {
-            regions.push(TextRegion {
+            TextRegion {
                 name: "count text",
                 rects: vec![(128, 240, 352, 80)],
                 skipped: false,
-            });
-        }
+            },
+        ];
         Self {
             text,
             regions,
@@ -893,33 +676,9 @@ fn compare(label: &str, ours: &[u8], theirs: &[u8], plan: &Plan) -> Vec<String> 
     bad
 }
 
-/// The mockup's directory, if `QBP_MOCKUP_DIR` names it.
-fn mockup_dir() -> Option<PathBuf> {
-    let dir = env::var_os("QBP_MOCKUP_DIR").map(PathBuf::from);
-    if dir.is_none() {
-        eprintln!("QBP_MOCKUP_DIR is not set: nothing to compare with");
-    }
-    dir
-}
-
 /// The mockup's still of this name as the 480 × 320 frame it is a 2× copy of: every second pixel.
 fn mockup_still(dir: &Path, name: &str) -> Vec<u8> {
-    let path = dir.join(format!("r6-after-{name}@2x.png"));
-    let (width, height, big) = read_png_any(&path);
-    assert_eq!(
-        (width, height),
-        (2 * WIDTH, 2 * HEIGHT),
-        "{} is a 2x still",
-        path.display()
-    );
-    let mut frame = vec![0; WIDTH * HEIGHT * 4];
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let from = (2 * y * width + 2 * x) * 4;
-            frame[offset(x, y)..offset(x, y) + 4].copy_from_slice(&big[from..from + 4]);
-        }
-    }
-    frame
+    mockup_frame(&dir.join(format!("r6-after-{name}@2x.png")))
 }
 
 /// Writes the frame beside the mockup's, if `QBP_DUMP_DIR` names a directory, so a difference can be looked at.
@@ -936,11 +695,6 @@ fn replaced(which: Fixture) -> Replaced {
         // The mockup's plain names are other names; only a name's last letters show in these.
         Fixture::Pct0 => Replaced {
             plain_letters: true,
-            card_lines: false,
-        },
-        Fixture::Alert | Fixture::AlertLow | Fixture::AlertLong => Replaced {
-            plain_letters: false,
-            card_lines: true,
         },
         _ => Replaced::default(),
     }

@@ -951,8 +951,8 @@ fn load_wifi_modules(
 }
 
 /// What the panel is given to work with: the configured touch calibration, and the slot that
-/// stands for the resolver, for its numbers, for its switch, for the names its lane shows and for
-/// the watchdog's alerts; the first service component to start fills it.
+/// stands for the resolver, for its numbers, for its switch, for the names its lane shows, for
+/// the watchdog's alerts and for the device inventory; the first service component to start fills it.
 fn panel_deps(cfg: &Config, slot: &Arc<Slot>) -> Deps {
     Deps {
         source: slot.clone(),
@@ -961,6 +961,7 @@ fn panel_deps(cfg: &Config, slot: &Arc<Slot>) -> Deps {
         calibrate: cfg.debug.calibrate_touch,
         lane: slot.lane(),
         alerts: slot.clone(),
+        devices: slot.clone(),
     }
 }
 
@@ -1460,7 +1461,8 @@ fn return_after(return_after_secs: u64, elapsed: Duration) -> Option<Duration> {
 }
 
 /// What the supervisor's tick does: pets the watchdog, collects the children that have exited,
-/// copies the kernel's new log lines, and starts a save of the log if one is due.
+/// copies the kernel's new log lines, reads how busy the cores are ([`crate::usage::sample`]), and
+/// starts a save of the log if one is due.
 ///
 /// Nothing here waits: the save runs on the pool. The one exception is the provoked stall
 /// (`fault` is [`Fault::Stall`], which `debug.fault = "stall"` gives, and `"trial_stall"` on a boot
@@ -1484,6 +1486,8 @@ fn tick(
         pet_watchdog();
         sys::reap_children();
         log_kernel_news(&mut kernel_log);
+        // Three small files of the kernel's, for the statistics' `cpu` and `memory`.
+        crate::usage::sample();
         // The status is copied out, so that no hold on the channel lasts through the rest.
         let now = status.borrow().clone();
         start_save_if_due(cfg, log, &saves, &now, Instant::now(), SdCard);

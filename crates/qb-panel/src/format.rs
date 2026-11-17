@@ -1,11 +1,9 @@
 //! The strings the panel shows, made from its values. An unknown value is a
 //! dash, never a zero, and no string can outgrow its place.
 
-use std::net::IpAddr;
-
-use crate::drain::AlertCard;
-use crate::drain::look::{ALERT_SUBJECT_CELLS, ALERT_TITLE_CELLS, ALERT_WHO_CELLS};
-use crate::touch::PAUSE_MS;
+use crate::geometry::Weight;
+use crate::state::TimeOfDay;
+use crate::text::has_glyph;
 
 /// An unknown value: an em dash alone, with no unit.
 pub const DASH: &str = "\u{2014}";
@@ -20,10 +18,33 @@ pub fn count(n: u32) -> String {
     }
 }
 
-/// What is left of a pause as `m:ss`, never more than `9:59`.
-pub fn countdown(left_secs: u16) -> String {
-    let secs = left_secs.min(599);
+/// A size in a few characters, for a tile's figure: `912`, `1.2K`, `212K`, `1.2M` (cut, not
+/// rounded), the way the mockup writes the lists' `212K` names.
+pub fn short_count(n: u32) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..10_000 => format!("{}.{}K", n / 1_000, n / 100 % 10),
+        10_000..1_000_000 => format!("{}K", n / 1_000),
+        1_000_000..1_000_000_000 => format!("{}.{}M", n / 1_000_000, n / 100_000 % 10),
+        _ => format!("{}.{}B", n / 1_000_000_000, n / 100_000_000 % 10),
+    }
+}
+
+/// Seconds as `m:ss`, from `0:00` to `99:59`: an hour's gate says `60:00`. `countdown` is the Drain's key and
+/// stops at an hour; this one is for the gate's own lengths, 5, 30 and 60 minutes, and runs to `99:59`.
+pub fn mss(secs: u16) -> String {
+    let secs = secs.min(99 * 60 + 59);
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// The longest gate there is, in seconds: an hour. Nothing the panel opens is longer, and `countdown`
+/// stops there.
+pub const GATE_LONGEST_SECS: u16 = 3_600;
+
+/// What is left of a pause as `m:ss` for the Drain's key, never more than `60:00`: the gate opens for 5, 30
+/// or 60 minutes (the key is 80 px wide, and `60:00` in 24 px bold is 72).
+pub fn countdown(left_secs: u16) -> String {
+    mss(left_secs.min(GATE_LONGEST_SECS))
 }
 
 /// How many steps the paused gate refills in.
@@ -32,19 +53,22 @@ const GATE_FILL_STEPS: u32 = 19;
 /// The most steps the refill shows: the last one is the gate full, and a pause that is still running is never that.
 const GATE_FILL_MAX: u32 = GATE_FILL_STEPS - 1;
 
-/// How full the paused gate is, as steps of 12 pixels from the floor, 0 to 18, when `left_secs` of the pause are left.
+/// How full the paused gate is, as steps of 12 pixels from the floor, 0 to 18, when `left_secs` of a pause of
+/// `total_secs` are left.
 ///
 /// The gate is hollow when the pause starts and refills from the floor as it runs out:
-/// `floor((300 - left) * 19 / 300)`. It is 0 for a full pause or more and stops at 18 for none left.
-pub fn gate_fill(left_secs: u16) -> u8 {
-    let pause = u32::try_from(PAUSE_MS / 1_000).unwrap_or(u32::MAX).max(1);
-    let gone = pause.saturating_sub(u32::from(left_secs));
-    let steps = (u64::from(gone) * u64::from(GATE_FILL_STEPS) / u64::from(pause))
+/// `floor((total - left) * 19 / total)`, against the pause's own length, so that 5, 30 and 60 minutes all
+/// refill from empty. It is 0 for a full pause or more (a pause longer than its total counts as full) and
+/// stops at 18 for none left. A total of 0 is taken as 1 s.
+pub fn gate_fill(left_secs: u16, total_secs: u16) -> u8 {
+    let total = u32::from(total_secs).max(1);
+    let gone = total.saturating_sub(u32::from(left_secs));
+    let steps = (u64::from(gone) * u64::from(GATE_FILL_STEPS) / u64::from(total))
         .min(u64::from(GATE_FILL_MAX));
     u8::try_from(steps).unwrap_or(u8::MAX)
 }
 
-/// A DNS name in `cells` cells, as the lane and the alert card show it.
+/// A DNS name in `cells` cells, as the lane shows it.
 ///
 /// It is lower-case, with one trailing dot off, and every character that is
 /// not printable ASCII is a `?`. A name longer than `cells` is cut so that a
@@ -61,6 +85,32 @@ pub fn fit_name(name: &str, cells: usize) -> String {
 /// The character itself if it is printable ASCII and not a space, else `?`.
 fn printable(c: char) -> char {
     if ('!'..='~').contains(&c) { c } else { '?' }
+}
+
+/// A label or a line of words in at most `cells` cells: its case and its spaces are kept, every control
+/// character and every character the font lacks is a `?`, and a text that is longer is cut so that a
+/// `~` is the last cell. Leading and trailing spaces go. For what the owner typed (a device's label)
+/// and what the panel's own code says; a DNS name is `fit_name` or `fit_site`.
+pub fn fit_text(text: &str, cells: usize) -> String {
+    let shown = |c: char| {
+        c == ' '
+            || c.is_ascii_graphic()
+            || (!c.is_ascii() && !c.is_control() && has_glyph(Weight::Bold, c))
+    };
+    cut(
+        text.trim().chars().map(|c| if shown(c) { c } else { '?' }),
+        cells,
+    )
+}
+
+/// The time as the clock says it: `10:21`, or `--:--` while the clock is not set.
+pub fn clock(time: Option<TimeOfDay>) -> String {
+    match time {
+        Some(TimeOfDay { hour, minute }) if hour < 24 && minute < 60 => {
+            format!("{hour:02}:{minute:02}")
+        }
+        _ => "--:--".to_string(),
+    }
 }
 
 /// The first `cells` characters, or fewer with a `~` last if there are more.
@@ -144,7 +194,7 @@ pub fn wrap_name(name: &str, cells: usize) -> [String; 2] {
         return [chars.into_iter().collect(), String::new()];
     }
     if chars.len() > whole {
-        // One character too many was read: the name is longer than the card's two lines.
+        // One character too many was read: the name is longer than the two lines.
         let from = chars.len() - (whole - 1);
         chars = std::iter::once('~')
             .chain(chars.into_iter().skip(from))
@@ -158,49 +208,6 @@ pub fn wrap_name(name: &str, cells: usize) -> [String; 2] {
         .unwrap_or(cells);
     let (head, tail) = chars.split_at(at.min(chars.len()));
     [head.iter().collect(), tail.iter().collect()]
-}
-
-/// The card of an alert: two title lines, the subject on one or two, and who it concerns.
-///
-/// The title comes from the kind: `threat` is `THREAT` over `BLOCKED`, and a
-/// kind that has no title of its own is upper-cased and split at its first
-/// `_`. `who` says `at <ip>` for a device that appeared (`new_device`,
-/// `arp_spoof`) and `asked by <ip>` for anything else, and is empty without a
-/// client. Every line is cut to the room it has on the card, and the subject is wrapped by `wrap_name`.
-pub fn alert_card(kind: &str, high: bool, subject: &str, client: Option<IpAddr>) -> AlertCard {
-    let line = |text: &str| {
-        cut(
-            text.chars().map(|c| printable(c.to_ascii_uppercase())),
-            ALERT_TITLE_CELLS,
-        )
-    };
-    let title = match kind {
-        "threat" => ["THREAT", "BLOCKED"].map(line),
-        "rebind" => ["REBIND", "BLOCKED"].map(line),
-        "dga" => ["RANDOM", "NAMES"].map(line),
-        "tunnel" => ["DNS", "TUNNEL"].map(line),
-        "beacon" => ["BEACON", "SEEN"].map(line),
-        "burst" => ["QUERY", "BURST"].map(line),
-        "new_device" => ["NEW", "DEVICE"].map(line),
-        "arp_spoof" => ["ARP", "SPOOF"].map(line),
-        other => {
-            let (first, rest) = other.split_once('_').unwrap_or((other, ""));
-            [first, rest].map(line)
-        }
-    };
-    let who = client.map_or_else(String::new, |ip| {
-        let who = match kind {
-            "new_device" | "arp_spoof" => format!("at {ip}"),
-            _ => format!("asked by {ip}"),
-        };
-        cut(who.chars(), ALERT_WHO_CELLS)
-    });
-    AlertCard {
-        high,
-        title,
-        subject: wrap_name(subject, ALERT_SUBJECT_CELLS),
-        who,
-    }
 }
 
 #[cfg(test)]
@@ -239,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn a_countdown_is_minutes_and_seconds_and_stops_at_nine_fifty_nine() {
+    fn a_countdown_is_minutes_and_seconds_and_stops_at_sixty() {
         for (s, t) in [
             (299, "4:59"),
             (300, "5:00"),
@@ -247,41 +254,106 @@ mod tests {
             (60, "1:00"),
             (1, "0:01"),
             (0, "0:00"),
-            (u16::MAX, "9:59"),
+            (599, "9:59"),
+            (600, "10:00"),
+            (1_800, "30:00"),
+            (3_599, "59:59"),
+            (3_600, "60:00"),
+            (3_601, "60:00"),
+            (u16::MAX, "60:00"),
         ] {
             assert_eq!(countdown(s), t);
         }
     }
 
+    /// The fill steps of a pause of `total` seconds, for every second left from `total` down to 0.
+    fn fills(total: u16) -> Vec<u8> {
+        (0..=total)
+            .rev()
+            .map(|left| gate_fill(left, total))
+            .collect()
+    }
+
     #[test]
-    fn gate_fill_steps() {
+    fn gate_fill_steps_for_a_five_minute_pause() {
         // A full pause is an empty gate, and each step is a nineteenth of it.
-        assert_eq!(gate_fill(300), 0);
+        assert_eq!(gate_fill(300, 300), 0);
         assert_eq!(
-            gate_fill(u16::MAX),
+            gate_fill(u16::MAX, 300),
             0,
             "more than a pause is none of it gone"
         );
-        assert_eq!(gate_fill(299), 0);
-        assert_eq!(gate_fill(285), 0, "15 s gone is 0.95 of a step");
-        assert_eq!(gate_fill(284), 1);
-        assert_eq!(gate_fill(277), 1, "the mockup's 4:37");
-        assert_eq!(gate_fill(150), 9);
-        assert_eq!(gate_fill(1), 18);
-        assert_eq!(gate_fill(0), 18, "the last step is as full as it shows");
+        assert_eq!(gate_fill(299, 300), 0);
+        assert_eq!(gate_fill(285, 300), 0, "15 s gone is 0.95 of a step");
+        assert_eq!(gate_fill(284, 300), 1);
+        assert_eq!(gate_fill(277, 300), 1, "the mockup's 4:37");
+        assert_eq!(gate_fill(150, 300), 9);
+        assert_eq!(gate_fill(1, 300), 18);
+        assert_eq!(
+            gate_fill(0, 300),
+            18,
+            "the last step is as full as it shows"
+        );
         // Never more than 18, never backwards: the steps only go up as the time runs out.
         let mut last = 0;
-        for left in (0..=300).rev() {
-            let fill = gate_fill(left);
-            assert!(fill >= last && fill <= 18, "{left}: {fill}");
+        for fill in fills(300) {
+            assert!(fill >= last && fill <= 18, "{fill}");
             last = fill;
         }
         assert_eq!(last, 18);
         assert_eq!(
-            (0..=300).map(gate_fill).filter(|&f| f == 0).count(),
+            fills(300).iter().filter(|&&f| f == 0).count(),
             16,
             "left 285..=300 is the first step"
         );
+    }
+
+    #[test]
+    fn gate_fill_counts_against_the_pauses_own_total_so_every_length_refills_from_empty() {
+        for total in [300_u16, 1_800, 3_600] {
+            let fills = fills(total);
+            assert_eq!(fills[0], 0, "{total} s: it starts empty");
+            assert_eq!(*fills.last().expect("a run"), 18, "{total} s: it ends full");
+            assert!(
+                fills.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{total} s: only up"
+            );
+            // Every step from 0 to 18 is seen, and a step is a nineteenth of the pause.
+            for step in 0..=18_u8 {
+                assert!(fills.contains(&step), "{total} s: step {step} is seen");
+            }
+            assert_eq!(gate_fill(total, total), 0);
+            assert_eq!(gate_fill(total / 2, total), 9, "{total} s: halfway");
+            assert_eq!(gate_fill(1, total), 18);
+            // The first step comes after a nineteenth of the pause has gone, rounded up.
+            let first_step = u32::from(total).div_ceil(19);
+            assert_eq!(
+                gate_fill(
+                    u16::try_from(u32::from(total) - first_step + 1).unwrap_or(0),
+                    total
+                ),
+                0
+            );
+            assert_eq!(
+                gate_fill(
+                    u16::try_from(u32::from(total) - first_step).unwrap_or(0),
+                    total
+                ),
+                1,
+                "{total} s"
+            );
+        }
+        // The same time left is a different fill under a different total: an hour with 5 minutes
+        // left is nearly full, five minutes with 5 minutes left is empty.
+        assert_eq!(gate_fill(300, 300), 0);
+        assert_eq!(gate_fill(300, 1_800), 15);
+        assert_eq!(gate_fill(300, 3_600), 17);
+        // A pause that runs longer than its total (set by the API) counts as full, a total of 0 as 1 s.
+        assert_eq!(gate_fill(3_600, 300), 0);
+        assert_eq!(gate_fill(5, 0), 0);
+        assert_eq!(gate_fill(0, 0), 18);
+        assert_eq!(gate_fill(u16::MAX, u16::MAX), 0);
+        assert_eq!(gate_fill(0, u16::MAX), 18);
     }
 
     #[test]
@@ -437,5 +509,67 @@ mod tests {
         assert_eq!(wrap("W\u{fc}.EXAMPLE.org"), ["w?.example.org", ""]);
         assert_eq!(wrap_name("abc", 0), [String::new(), String::new()]);
         assert_eq!(wrap_name("abc", 1), ["~", "c"]);
+    }
+
+    #[test]
+    fn fit_text_keeps_case_and_spaces_and_cuts_with_a_tilde() {
+        assert_eq!(fit_text("Living room TV", 24), "Living room TV");
+        assert_eq!(
+            fit_text("  Sam's phone  ", 24),
+            "Sam's phone",
+            "the ends are trimmed"
+        );
+        assert_eq!(fit_text("Sam's phone", 8), "Sam's p~");
+        assert_eq!(fit_text("abc", 3), "abc");
+        assert_eq!(fit_text("abcd", 3), "ab~");
+        assert_eq!(fit_text("abc", 0), "");
+        assert_eq!(fit_text("", 5), "");
+        // A control character is a `?`; a letter the font has stays, one it lacks is a `?`.
+        assert_eq!(fit_text("a\tb\nc", 24), "a?b?c");
+        assert_eq!(fit_text("Caf\u{e9}", 24), "Caf\u{e9}");
+        assert_eq!(fit_text("a\u{1f600}b", 24), "a?b");
+        // Any length costs the same cells.
+        assert_eq!(fit_text(&"x".repeat(1 << 16), 24).chars().count(), 24);
+    }
+
+    #[test]
+    fn the_clock_says_the_time_or_dashes() {
+        let at = |hour, minute| clock(Some(TimeOfDay { hour, minute }));
+        assert_eq!(at(10, 21), "10:21");
+        assert_eq!(at(0, 5), "00:05");
+        assert_eq!(at(23, 59), "23:59");
+        assert_eq!(clock(None), "--:--");
+        assert_eq!(at(24, 0), "--:--");
+        assert_eq!(at(1, 60), "--:--");
+    }
+
+    #[test]
+    fn a_tiles_figure_is_short_and_a_gates_time_goes_to_an_hour() {
+        for (n, s) in [
+            (0, "0"),
+            (912, "912"),
+            (1_000, "1.0K"),
+            (1_234, "1.2K"),
+            (9_999, "9.9K"),
+            (10_000, "10K"),
+            (212_000, "212K"),
+            (999_999, "999K"),
+            (1_000_000, "1.0M"),
+            (1_250_000, "1.2M"),
+            (u32::MAX, "4.2B"),
+        ] {
+            assert_eq!(short_count(n), s);
+        }
+        for (secs, s) in [
+            (0, "0:00"),
+            (59, "0:59"),
+            (277, "4:37"),
+            (300, "5:00"),
+            (1_800, "30:00"),
+            (3_600, "60:00"),
+            (u16::MAX, "99:59"),
+        ] {
+            assert_eq!(mss(secs), s);
+        }
     }
 }

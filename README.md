@@ -8,11 +8,12 @@ network setup, DNS server and status page. No shell, no other programs.
 **Status: all milestones done; it runs permanently on the Pi it was built for.** It joins the
 Wi-Fi network by itself, forwards over DNS-over-TLS and caches, blocks ads and threat lists from the
 snapshot in its image and refreshes them daily, survives pulled power and lost links, draws a live
-front panel on a 3.5-inch touchscreen, watches the network for new devices and suspicious lookups,
+front panel on a 3.5-inch touchscreen (a small OS of its own, see The front panel), watches the network for new devices and suspicious lookups,
 and serves a Pi-hole-compatible API over HTTPS. Notes: [milestone 0](docs/bring-up/m0.md),
 [milestone 1](docs/bring-up/m1.md), [milestones 2 and 3](docs/bring-up/m2-m3.md),
 [milestones 4 and 5](docs/bring-up/m4-m5.md), [milestone 6](docs/bring-up/m6.md),
-[latency against Pi-hole](docs/bring-up/latency-baseline.md).
+[latency against Pi-hole](docs/bring-up/latency-baseline.md),
+[throughput benchmark](docs/bring-up/benchmark.md).
 Milestone 8 puts qberrypi on the card alone, in two slots, and updates it over the network
 (`cargo xtask update`, with a trial boot and an automatic rollback). It is built and its trials run
 under QEMU; its checks on the Pi are listed in [milestone 8](docs/bring-up/m8-only-os.md) and have not
@@ -89,6 +90,14 @@ the page cache, and says whether the SHA-256 matches. It writes 256 MiB and leav
 card as it was. Put the card in the Pi and switch it on: it answers about 15 s later, and
 `curl -s http://<pi>/api/v1/stats` reports `"slot": "a"`.
 
+`/api/v1/me` on the same port needs no login and tells a device about itself alone, by the address
+its request comes from: its latest DNS queries (the name, the time, whether it was blocked), its
+counts of queries, blocks and threat blocks, whether blocking is on and the device is exempt, and
+how many devices are not on the known list (none, until a known list has come). Reverse lookups
+(names under `in-addr.arpa` and `ip6.arpa`) are left out of its queries and its counts, and no
+address is in the answer. The Pi records a device's queries only while that device keeps asking
+this route, and forgets it, with all it kept, after 15 minutes without a call.
+
 ## Update
 
 Build, then pipe the API's password into `update`. The password comes from whatever prints it for
@@ -138,6 +147,82 @@ few lines of a trial boot's bookkeeping; a boot with no update under way writes 
 - **Back to Raspberry Pi OS and Pi-hole:** `cargo xtask flash --image <the backup that backup-card
   made> --device /dev/sdX --yes` puts the old card back as it was. `return-to-pios` is not the way
   back from a slot card; it works only on the old layout described under Development.
+
+## The front panel
+
+The 3.5-inch touchscreen is a small OS of its own, built in three milestones from
+[`docs/superpowers/specs/2026-11-12-qberrypi-panel-os-design.md`](docs/superpowers/specs/2026-11-12-qberrypi-panel-os-design.md)
+and [its plan](docs/superpowers/plans/2026-11-12-panel-os.md). **Phase 1** is what this section
+describes: the status lane, HOME, LIVE, DEVICES, the gate and the top alert. NAMES (P2) is a tile on
+HOME that does nothing yet, and SYSTEM opens only the ABOUT reading until P3 brings its other
+readings and the PIN lock. It is all taps, every target is at least 48 x 48 pixels, and the panel
+boots on HOME and returns to it after 60 s without a touch.
+
+| Screen | What it shows | Taps |
+|---|---|---|
+| **Lane** (every screen but LIVE) | `HOME`, the section's name (on HOME: `ALL WELL`, `n ALERT(S)` or `GATE OPEN`), a white tile with the count of waiting alerts, the clock | `HOME` goes HOME; the middle goes to the section's root (on HOME: `ALL WELL` opens LIVE, `n ALERTS` opens ALERT, `GATE OPEN` shuts the gate); the clock opens ABOUT |
+| **HOME** | Six tiles: LIVE (refused today, its share), DEVICES (how many, how many blocked, a miniature wall), ALERTS (how many wait, the newest's time), the gate (`SHUT` or the time left), NAMES, SYSTEM (version, days up) | A tile opens its screen. The gate tile opens GATE when shut and shuts the gate at once when open. NAMES does nothing in P1 |
+| **LIVE** | The old Drain: each name crossing the gate, the day's count and share | The key unfolds `5 MIN`, `30 MIN` and `1 HOUR` over the field when the gate is shut (a tap anywhere else, or 8 s, folds them) and shuts the gate when open; the clock column opens ABOUT |
+| **GATE** | `OPEN THE GATE`: ads pass on every device, threats stay blocked | `5 MIN`, `30 MIN`, `1 HOUR` open it and go back; `KEEP` goes back |
+| **DEVICES** | A wall of up to 12 places, each a device with its name and `BLOCKED`, `ADS PASS`, `OPEN m:ss` or `ALWAYS`, and a lamp that lights while it asks. Labelled devices come first, then the others by first sighting, then the router and the Pi; with more than 12 devices the twelfth place is `MORE` and turns the page. The first empty place says what a newcomer gets | A place opens DEVICE |
+| **DEVICE** | Its name, the last two names it asked and what became of them (`REFUSED`, `PASSED`, `ANSWERED`), the state key and the key of its own gate | The state key opens CONFIRM; the gate key opens ITS GATE, or shuts that device's gate when it is open. Both keys are inert on the router and the Pi, and on a device the configuration decides (`SET IN CONFIG`; its gate key says `NEVER OPENS` or `ALREADY OPEN`) |
+| **CONFIRM** | `LET ADS PASS?` or `BLOCK ADS?` for that device | `ALLOW ADS` / `BLOCK ADS` does it; `KEEP ...` goes back |
+| **ITS GATE** | `OPEN ITS GATE`: ads pass on that one device for a while | `5 MIN`, `30 MIN`, `1 HOUR`; `KEEP` goes back |
+| **ALERT** | The newest waiting alert, as a slab (white for high severity, blue otherwise): its title and up to three lines | `DISMISS` acknowledges it and goes HOME |
+| **ABOUT** | `QBERRYPI` and the running version. It is SYSTEM's only reading in P1 | `BACK` or the lane goes HOME |
+
+**ADS PASS** is the word, on the panel and in qnet, for a device that is let off the ads lists. The
+threat lists and every alert still apply to it. (The API's JSON keeps its field names, `exempt` and
+`exempt_macs`.) CONFIRM edits the list of the mode in force, in memory: the pushed exempt list when
+devices are blocked by default, the pushed block list when they pass by default. A device that the
+configuration's own list of that mode names says `SET IN CONFIG` and is left as the file says, and
+no gate opens on it (the Pi refuses it, so the panel does not offer it); the router and the Pi are
+`ALWAYS` and never change.
+
+**Gates** (the main one and each device's) are `5 MIN`, `30 MIN` or `1 HOUR`, and they shut by
+themselves: the main gate is a pause of blocking, a device's is an exemption that expires (at most 64
+open at once, none longer than an hour). They are not PIN-locked, now or later. Nothing is locked in P1:
+the lock (P3) will ask for a PIN before `ALLOW ADS` and the other strong actions, never before a
+gate. The gate's bar refills against the length that was chosen; a gate opened from elsewhere (qnet,
+the API) is drawn against the smallest of the three lengths that holds what is left of it.
+
+**Labels** are the owner's names for devices, pushed by qnet (`PUT /api/qbp/devices/labels`: at most
+64, each 1 to 24 printable ASCII characters, kept in memory and so pushed again after a restart). The
+wall shows a device's label, else its hostname, else its last address number. No name, label or
+address is ever written to the log.
+
+**A device's names** are kept only while its DEVICE screen is open, from the moment it opens; leaving
+it forgets them. The Pi has no record of which device asked what.
+
+**Sync with qnet.** `GET /api/qbp/devices` carries a `rev` that moves whenever the pushed exempt or
+block list, the mode, a label or a gate changes, whoever changed it: the panel, the API or a gate
+that ran out. `PUT devices/exempt` and `devices/policy` take an optional `if_rev` and answer 409 with
+`{"rev": current}` when it is stale. qnet's side of the rule (qnet is outside this repository): read
+`GET devices` on the usual poll; when `rev` moved and the pushed lists (`exempt_pushed`,
+`block_pushed`) differ from its own, adopt the Pi's, because the panel was the last writer; push with
+`if_rev` and, on 409, read again and merge. After a restart the lists are empty and qnet pushes its
+own. A panel edit made in the poll interval before a power cut is lost, and the panel says nothing of
+that. To draw the same wall as the panel, `GET devices` also gives `own_mac` (the Pi's own address,
+or `null`) and, per device, `label_rank` (the place of its label, or `null`) and `always` (the router
+and whatever claims its address or the Pi's).
+
+**Preview without the Pi:** `cargo xtask panel-preview --screen <name>` writes one screen to a PNG
+(`out/panel-preview.png`, or `--out`), drawn by the same code as the panel and pixel-for-pixel the
+reference of the same name in `crates/qb-panel/tests/reference/os-<name>.png`. The names are `home`,
+`home-alert`, `home-open`, `gate`, `live`, `live-gate`, `devices`, `device`, `confirm`, `pause`,
+`alert` and `about`. `--state` still draws the Drain's own states, and `--push <ssh-alias>` puts
+either on the screen of a Pi that runs Raspberry Pi OS.
+
+**Memory.** A unit test adds up the panel's buffers (the two painters, the glass's kept frame, the
+glyph caches and the world: about 3 MB, against a ceiling of 5 MB) and prints the total; the QEMU
+self-test logs the process's resident memory in its last line (`selftest: vmrss`), and
+`/api/v1/stats` reports it on the Pi as `memory.rss_kib`.
+
+Where P1 differs from the design mockups on purpose: `ADS PASS` where the mockup says `AD-FREE`; no
+`CHECK NOW` (the Pi cannot fetch a build, so an update is pushed from the desktop); a device's names
+only while its screen is open (above); `SEE DEVICE` on ALERT, the alert list, the arrival rule that
+opens a new alert by itself, and NAMES wait for P2; a new alert in P1 only lights the tile and the
+lane's count.
 
 ## Development on a card with Raspberry Pi OS
 
@@ -222,9 +307,10 @@ address. The board's firmware runs before the kernel and is not in that figure;
 | `cargo xtask make-cert` | Makes qberrypi's own TLS certificate for the API, once, as `qberrypi-tls.pem` (private, git-ignored), and prints the pin a client checks. `image` and `update` use it too. |
 | `cargo xtask hash-password` | Prints the `password_hash` line for the API's login from a password piped in on standard input. |
 | `cargo xtask boot-time` | Measures power-on to the Pi's first DNS answer, from this computer. |
-| `cargo xtask panel-preview` | Draws the front panel into a PNG, and with `--push` onto the Pi's 3.5-inch screen. |
+| `cargo xtask panel-preview [--state <drain state> \| --screen <screen>] [--out <file>] [--push <ssh-alias>]` | Draws the front panel into a PNG, one of the Drain's states (`--state`, the default `normal`) or one screen of the panel's OS (`--screen home`, `devices`, `alert` and so on; see The front panel), and with `--push` onto the 3.5-inch screen of a Pi running Raspberry Pi OS. |
 | `cargo xtask probe --stage {resolver,blocker} [--server <ipv4>] [--listed <name>]` | While a one-shot boot is running, asks the Pi's DNS and status servers what a client would and prints which of the milestone's checks hold. `resolver` runs eight checks: forwarding, the cache, TCP, single-label names, the clock and the upstream latency. `blocker` runs those and seven more: the snapshot blocks before any refresh, the lists are then refreshed over HTTPS (it waits up to 150 s for that), and the name given with `--listed`, which must be on the lists, stays blocked. Start `blocker` together with the deploy, before the Pi has refreshed its lists. Run either stage once per boot: a second run finds `example.org` already in the Pi's cache. |
 | `cargo xtask latency [--host <ssh-alias-or-address>] [--samples N] [--interval-ms M] [--blocked <name>] [--json <file>]`, or `cargo xtask latency --compare <a.json> <b.json> [--received-only]` | Measures from this PC the Pi's ping round trip and its DNS answer times — cached, blocked and forwarded — as p50, p95, min, mean, lost and failed, for comparison with `docs/bring-up/latency-baseline.md`; a DNS answer that does not come within 2 s counts as 2 s in p50, p95 and mean, and so does one with the response code SERVFAIL or REFUSED (`failed` counts those, a subset of `lost`; ping counts replies only); `--json <file>` keeps the figures. `--compare` measures nothing: it reads two such files and prints, per row, the p50 and p95 of the second against the first with a verdict, `ok` or `slower`, and a note where the two files' lost and failed counts differ. It fails, after printing, if any figure is slower, if either file lacks a figure the other has (a baseline with an error row or a missing row is incomplete), if the interval or the sample count differs between the files, or if a file has DNS rows from before lost answers were counted (re-run that pass). `--received-only` reads both files' received-only figures instead (lost answers left out), which accepts those older files; it is not the acceptance comparison, and a mismatch of pacing or samples still fails. |
+| `<password command> \| cargo xtask bench --on-pi [--server <ipv4>] [--class <class>]... [--seconds N] [--forwarded-max-qps N] [--json <file>]`, `cargo xtask bench --from-here [...]`, or `cargo xtask bench --compare <a.json> <b.json>` | Measures how many DNS answers a second the Pi sustains, per class (cached, blocked, forwarded): `--on-pi` runs `qb-bench`'s generator on the Pi against its own DNS over the loopback, through the API's `POST /api/qbp/bench` (logged in as `update` does), a ramp and then a steady load at 80% of the most it sustained; `--from-here` runs the same loads from this PC, the figure the Wi-Fi allows; `--compare` prints B against A and fails if B is worse. The forwarded class really asks Quad9 for every question, which throttles a source that sends too many fresh names, so it stops at 50 a second by default (100 at most). Figures go to `private/`. The same generator is the static `qb-bench` binary for Raspberry Pi OS; see `docs/bring-up/benchmark.md`. |
 | `cargo test -p qberrypi --test hwsim -- --ignored --test-threads=1` | Runs the Wi-Fi code against `hostapd` on the kernel's simulated radios (`mac80211_hwsim`), each test inside a user and network namespace of its own. Needs `sudo modprobe mac80211_hwsim radios=0` once and `hostapd` installed; it touches no real radio. |
 
 An image holds the contents of the lists, so the lists' own licences apply to

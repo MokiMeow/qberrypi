@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+mod bench;
 mod boottime;
 mod build;
 mod card;
@@ -126,6 +127,10 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Measure how many DNS answers a second the Pi sustains, cached, blocked and forwarded:
+    /// on the Pi over its loopback through the API (--on-pi, the password piped in), or from this
+    /// PC over the network (--from-here); or compare two files of figures (--compare)
+    Bench(bench::BenchArgs),
     /// Measure from this PC the Pi's ping round trip and its DNS answer times (cached, blocked
     /// and forwarded), for comparison with the stock Pi-hole baseline
     Latency {
@@ -221,6 +226,12 @@ fn main() -> Result<()> {
         ),
         Command::Image(args) => image::run(workspace_root(), &args, &mut std::io::stdout()),
         Command::Update(args) => update::run(workspace_root(), &args, &mut std::io::stdout()),
+        Command::Bench(args) => bench::run(
+            workspace_root(),
+            &args,
+            unix_time()?,
+            &mut std::io::stdout(),
+        ),
         Command::PanelPreview(args) => panel::run(&args, workspace_root()),
         Command::BootTime { server } => boottime::run(server, workspace_root()),
         Command::HashPassword => hashpw::run(),
@@ -385,6 +396,24 @@ mod tests {
         assert!(parse(&["image", "--out"]).is_err());
         assert!(parse(&["image", "--firmware"]).is_err());
         assert!(parse(&["image", "--out", "a.img", "--out", "b.img"]).is_err());
+    }
+
+    #[test]
+    fn bench_runs_on_the_pi_or_from_here_or_compares_two_files() {
+        let Command::Bench(args) = parse(&["bench", "--on-pi"]).unwrap().command else {
+            panic!("not the bench command");
+        };
+        assert!(args.on_pi && !args.from_here && args.compare.is_none());
+        assert_eq!((args.seconds, args.forwarded_max_qps), (20, 50));
+        let Command::Bench(args) = parse(&["bench", "--from-here", "--server", "192.0.2.53"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the bench command");
+        };
+        assert_eq!(args.server, Some(Ipv4Addr::new(192, 0, 2, 53)));
+        assert!(parse(&["bench"]).is_err());
+        assert!(parse(&["bench", "--on-pi", "--password", "x"]).is_err());
     }
 
     #[test]
