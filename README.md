@@ -1,334 +1,136 @@
 # qberrypi
 
-A single-purpose operating system for the Raspberry Pi 3 B+ that turns the
-board into a network-wide DNS ad blocker. The Linux kernel is stock;
-everything above it is one static Rust executable: init, Wi-Fi supplicant,
-network setup, DNS server and status page. No shell, no other programs.
+**A Raspberry Pi ad blocker and home-network watchdog, written as its own tiny operating system.**
 
-**Status: all milestones done; it runs permanently on the Pi it was built for.** It joins the
-Wi-Fi network by itself, forwards over DNS-over-TLS and caches, blocks ads and threat lists from the
-snapshot in its image and refreshes them daily, survives pulled power and lost links, draws a live
-front panel on a 3.5-inch touchscreen (a small OS of its own, see The front panel), watches the network for new devices and suspicious lookups,
-and serves a Pi-hole-compatible API over HTTPS. Notes: [milestone 0](docs/bring-up/m0.md),
-[milestone 1](docs/bring-up/m1.md), [milestones 2 and 3](docs/bring-up/m2-m3.md),
-[milestones 4 and 5](docs/bring-up/m4-m5.md), [milestone 6](docs/bring-up/m6.md),
-[latency against Pi-hole](docs/bring-up/latency-baseline.md),
-[throughput benchmark](docs/bring-up/benchmark.md).
-Milestone 8 puts qberrypi on the card alone, in two slots, and updates it over the network
-(`cargo xtask update`, with a trial boot and an automatic rollback). It is built and its trials run
-under QEMU; its checks on the Pi are listed in [milestone 8](docs/bring-up/m8-only-os.md) and have not
-been run yet.
-The design is in
-[`docs/superpowers/specs/2026-11-10-qberrypi-design.md`](docs/superpowers/specs/2026-11-10-qberrypi-design.md);
-the security watchdog's is in
-[`docs/superpowers/specs/2026-11-11-qberrypi-watchdog-design.md`](docs/superpowers/specs/2026-11-11-qberrypi-watchdog-design.md);
-the card with two slots and the network update are in
-[`docs/superpowers/specs/2026-11-11-qberrypi-only-os-design.md`](docs/superpowers/specs/2026-11-11-qberrypi-only-os-design.md).
+Put it on a Raspberry Pi 3 B+, point your router's DNS at it, and every device in the house gets
+ads, trackers, malware and phishing sites blocked. There's no Linux distribution underneath to
+maintain: the stock Raspberry Pi kernel boots straight into one Rust program that does everything
+else, from joining your Wi-Fi to drawing the touchscreen.
 
-## Install
+- **Blocks ads and threats for the whole house**: about 1.3 million domains from well-known public
+  lists, refreshed daily.
+- **Fast**: 2.7–3× the lookups of Pi-hole and 10–24× AdGuard Home on the same Pi ([numbers below](#how-fast)).
+- **Private**: questions to the internet go out encrypted (DNS-over-TLS to Quad9), and the Pi
+  keeps no record of who looked up what.
+- **Watches the network**: alerts you to new devices, devices pretending to be your router, and
+  lookups that look like malware calling home.
+- **Per-device control**: let ads through on a device that breaks with blocking, while threats stay
+  blocked, or block everything everywhere.
+- **Touchscreen**: an optional 3.5-inch screen shows what's happening and lets you pause blocking,
+  manage devices and see alerts without a computer.
+- **Hard to break**: updates install over the network into a spare slot, run on trial, and roll back
+  by themselves if anything goes wrong. Pulling the plug is always safe; it writes nothing to the
+  card while it runs.
 
-The card holds qberrypi alone: the Pi's boot firmware and two slots, `qberrypi-a/` and `qberrypi-b/`,
-each a complete copy of the kernel, the initramfs and your configuration. One card-reader trip puts
-that on the card; every later update goes over the network (see Update). Everything below runs on
-this PC, with the Pi switched off and its card in a USB reader. Bluetooth is absent by design: the
-image has no Bluetooth module and no Bluetooth firmware, the module helper refuses every request for
-one, and the device-tree node is disabled.
+## How fast
 
-Copy `qberrypi.example.toml` to `qberrypi.toml` and fill it in; the file holds the Wi-Fi passphrase
-and is ignored by git. A card that is to stay needs every `[debug]` switch off and an `[api]`
-section, because the API is how the Pi is updated: `cargo xtask image` refuses a configuration
-without it. Make the `password_hash` for that section by piping the password into
-`cargo xtask hash-password`. Then:
+Measured on one Raspberry Pi 3 B+, each server running alone at full clock with the same
+1.29-million-domain block lists and the same load generator. Figures are lookups per second
+answered with nothing lost and 99% of answers back within 10 ms.
 
-```
-cargo xtask fetch
-cargo xtask fetch-lists
-cargo xtask build
-cargo xtask make-cert
-cargo xtask image
-```
-
-Optionally, `qberrypi.toml` may say which channel the access point is on (`hint_mhz` under `[wifi]`,
-see `qberrypi.example.toml`), so that the Pi's first scan after a start covers only that channel;
-`cargo xtask image --wifi-hint 5180` puts it in the slots' copy, and `cargo xtask update` adds the
-channel the Pi is on to the copy it uploads, when your file has none and the channel is a 5 GHz one.
-The hint is meant for the 5 GHz channel, which the Pi prefers: a hinted scan whose best access point
-is on 2.4 GHz is not taken, and the scan covers every channel after all. The Pi shows its channel as
-`wifi.freq_mhz` in `/api/v1/stats`.
-
-`make-cert` is needed once: it makes the API's certificate, `qberrypi-tls.pem`, which the image carries
-and which qnet and `cargo xtask update` pin. `image` writes `private/qberrypi-card.img`, 256 MiB:
-the boot firmware and both slots holding this build, slot a selected. It prints the image's SHA-256.
-The image holds the Wi-Fi passphrase and the API's key, so `private/` is git-ignored and made with
-mode 0700, and the file with mode 0600.
-
-With the Pi's power cord pulled and its card in the reader, find the card and make sure nothing has
-it mounted:
-
-```
-lsblk -o NAME,TRAN,RM,SIZE,MOUNTPOINTS
-udisksctl unmount -b /dev/sdX1
-```
-
-Take a backup of the card first, because after the flash it is the only copy of what was on it (the
-way back to Raspberry Pi OS and Pi-hole; it holds the Wi-Fi passphrase and keys, so it is kept in
-`private/` too), then write the image:
-
-```
-cargo xtask backup-card --device /dev/sdX --yes
-cargo xtask flash --image private/qberrypi-card.img --device /dev/sdX --yes
-udisksctl power-off -b /dev/sdX
-```
-
-`sdX` is the card as a whole, never a partition. Both commands refuse anything but a removable USB
-`/dev/sd*` disk of 1 to 512 GiB with nothing mounted, say what they will do, and do nothing without
-`--yes`. If this user may not open the device they print the exact `sudo` line to run, and you run
-it yourself; they never call `sudo`. A file name ending in `.zst` is compressed (backup) or
-decompressed (flash) on the way; a backup without `--out` goes to
-`private/card-backup-<UTC time>.img.zst`. `flash` reads the image's length back from the card, past
-the page cache, and says whether the SHA-256 matches. It writes 256 MiB and leaves the rest of the
-card as it was. Put the card in the Pi and switch it on: it answers about 15 s later, and
-`curl -s http://<pi>/api/v1/stats` reports `"slot": "a"`.
-
-`/api/v1/me` on the same port needs no login and tells a device about itself alone, by the address
-its request comes from: its latest DNS queries (the name, the time, whether it was blocked), its
-counts of queries, blocks and threat blocks, whether blocking is on and the device is exempt, and
-how many devices are not on the known list (none, until a known list has come). Reverse lookups
-(names under `in-addr.arpa` and `ip6.arpa`) are left out of its queries and its counts, and no
-address is in the answer. The Pi records a device's queries only while that device keeps asking
-this route, and forgets it, with all it kept, after 15 minutes without a call.
-
-## Update
-
-Build, then pipe the API's password into `update`. The password comes from whatever prints it for
-you, never typed at a terminal, which `update` refuses, as `hash-password` does:
-
-```
-cargo xtask build
-<command that prints the API password> | cargo xtask update
-```
-
-`update` checks locally what the Pi checks, logs in over TLS to the certificate in
-`qberrypi-tls.pem` (and to no other), and uploads the build and your current `qberrypi.toml` to the
-slot the Pi is not running. The Pi hashes everything it wrote back from the card, then restarts into
-the new slot on trial, with the firmware's one-shot `tryboot` flag. About two minutes after that the
-new build confirms itself, once its Wi-Fi is up, its clock is set and an upstream has answered, and
-the command says the build is confirmed on its slot. If the trial build restarts, stalls or has not
-confirmed within ten minutes, or the power is pulled during the trial, the Pi boots the slot it came
-from, reports why in its log and in `/api/v1/stats` (`update.last`), and the command says it rolled
-back. The Pi answers no DNS for about 15 to 20 s around the restart.
-
-- `--server <ipv4>` names the Pi's address.
-- `--allow-kernel` lets the update change the kernel, device tree, overlays or command line. Without
-  it the kernel and boot files stay fixed: the build carries a digest of them, and both `update` and
-  the Pi refuse a build whose digest differs from the running one's. Nothing rolls back a kernel that
-  stops the board before init runs, except that under the firmware trial a power cycle boots the old
-  slot again.
-- `--force` uploads a build that is not newer than the running one.
-- `--software-trial` selects the new slot in `config.txt` instead of using `tryboot`, for a board
-  whose firmware ignores the flag. It rolls back only a build that reaches init; for anything
-  earlier the card must come out.
-- `--rollback-drill panic|stall` uploads the same build with a fault that acts only on a trial boot,
-  and succeeds when the Pi rolls back. It is how the rollback is tested.
-
-qberrypi still writes nothing to the card while it runs, apart from an update's own writes and the
-few lines of a trial boot's bookkeeping; a boot with no update under way writes nothing
-([milestone 6](docs/bring-up/m6.md), amended).
-
-## Recovery
-
-- **A trial that fails** needs nothing from you: the Pi is back on its old slot and says why.
-- **The Pi does not answer during an update's trial:** pull its power cord and plug it back. Under the
-  firmware trial this boots the slot it came from.
-- **A card that will not boot, or a configuration to start over from:** with the card in the reader,
-  `cargo xtask flash --image private/qberrypi-card.img --device /dev/sdX --yes` writes the image
-  again. It holds the build and configuration as of the day `image` made it; run `build` and
-  `image` again first for a current one.
-- **Back to Raspberry Pi OS and Pi-hole:** `cargo xtask flash --image <the backup that backup-card
-  made> --device /dev/sdX --yes` puts the old card back as it was. `return-to-pios` is not the way
-  back from a slot card; it works only on the old layout described under Development.
-
-## The front panel
-
-The 3.5-inch touchscreen is a small OS of its own, built in three milestones from
-[`docs/superpowers/specs/2026-11-12-qberrypi-panel-os-design.md`](docs/superpowers/specs/2026-11-12-qberrypi-panel-os-design.md)
-and [its plan](docs/superpowers/plans/2026-11-12-panel-os.md). **Phase 1** is what this section
-describes: the status lane, HOME, LIVE, DEVICES, the gate and the top alert. NAMES (P2) is a tile on
-HOME that does nothing yet, and SYSTEM opens only the ABOUT reading until P3 brings its other
-readings and the PIN lock. It is all taps, every target is at least 48 x 48 pixels, and the panel
-boots on HOME and returns to it after 60 s without a touch.
-
-| Screen | What it shows | Taps |
-|---|---|---|
-| **Lane** (every screen but LIVE) | `HOME`, the section's name (on HOME: `ALL WELL`, `n ALERT(S)` or `GATE OPEN`), a white tile with the count of waiting alerts, the clock | `HOME` goes HOME; the middle goes to the section's root (on HOME: `ALL WELL` opens LIVE, `n ALERTS` opens ALERT, `GATE OPEN` shuts the gate); the clock opens ABOUT |
-| **HOME** | Six tiles: LIVE (refused today, its share), DEVICES (how many, how many blocked, a miniature wall), ALERTS (how many wait, the newest's time), the gate (`SHUT` or the time left), NAMES, SYSTEM (version, days up) | A tile opens its screen. The gate tile opens GATE when shut and shuts the gate at once when open. NAMES does nothing in P1 |
-| **LIVE** | The old Drain: each name crossing the gate, the day's count and share | The key unfolds `5 MIN`, `30 MIN` and `1 HOUR` over the field when the gate is shut (a tap anywhere else, or 8 s, folds them) and shuts the gate when open; the clock column opens ABOUT |
-| **GATE** | `OPEN THE GATE`: ads pass on every device, threats stay blocked | `5 MIN`, `30 MIN`, `1 HOUR` open it and go back; `KEEP` goes back |
-| **DEVICES** | A wall of up to 12 places, each a device with its name and `BLOCKED`, `ADS PASS`, `OPEN m:ss` or `ALWAYS`, and a lamp that lights while it asks. Labelled devices come first, then the others by first sighting, then the router and the Pi; with more than 12 devices the twelfth place is `MORE` and turns the page. The first empty place says what a newcomer gets | A place opens DEVICE |
-| **DEVICE** | Its name, the last two names it asked and what became of them (`REFUSED`, `PASSED`, `ANSWERED`), the state key and the key of its own gate | The state key opens CONFIRM; the gate key opens ITS GATE, or shuts that device's gate when it is open. Both keys are inert on the router and the Pi, and on a device the configuration decides (`SET IN CONFIG`; its gate key says `NEVER OPENS` or `ALREADY OPEN`) |
-| **CONFIRM** | `LET ADS PASS?` or `BLOCK ADS?` for that device | `ALLOW ADS` / `BLOCK ADS` does it; `KEEP ...` goes back |
-| **ITS GATE** | `OPEN ITS GATE`: ads pass on that one device for a while | `5 MIN`, `30 MIN`, `1 HOUR`; `KEEP` goes back |
-| **ALERT** | The newest waiting alert, as a slab (white for high severity, blue otherwise): its title and up to three lines | `DISMISS` acknowledges it and goes HOME |
-| **ABOUT** | `QBERRYPI` and the running version. It is SYSTEM's only reading in P1 | `BACK` or the lane goes HOME |
-
-**ADS PASS** is the word, on the panel and in qnet, for a device that is let off the ads lists. The
-threat lists and every alert still apply to it. (The API's JSON keeps its field names, `exempt` and
-`exempt_macs`.) CONFIRM edits the list of the mode in force, in memory: the pushed exempt list when
-devices are blocked by default, the pushed block list when they pass by default. A device that the
-configuration's own list of that mode names says `SET IN CONFIG` and is left as the file says, and
-no gate opens on it (the Pi refuses it, so the panel does not offer it); the router and the Pi are
-`ALWAYS` and never change.
-
-**Gates** (the main one and each device's) are `5 MIN`, `30 MIN` or `1 HOUR`, and they shut by
-themselves: the main gate is a pause of blocking, a device's is an exemption that expires (at most 64
-open at once, none longer than an hour). They are not PIN-locked, now or later. Nothing is locked in P1:
-the lock (P3) will ask for a PIN before `ALLOW ADS` and the other strong actions, never before a
-gate. The gate's bar refills against the length that was chosen; a gate opened from elsewhere (qnet,
-the API) is drawn against the smallest of the three lengths that holds what is left of it.
-
-**Labels** are the owner's names for devices, pushed by qnet (`PUT /api/qbp/devices/labels`: at most
-64, each 1 to 24 printable ASCII characters, kept in memory and so pushed again after a restart). The
-wall shows a device's label, else its hostname, else its last address number. No name, label or
-address is ever written to the log.
-
-**A device's names** are kept only while its DEVICE screen is open, from the moment it opens; leaving
-it forgets them. The Pi has no record of which device asked what.
-
-**Sync with qnet.** `GET /api/qbp/devices` carries a `rev` that moves whenever the pushed exempt or
-block list, the mode, a label or a gate changes, whoever changed it: the panel, the API or a gate
-that ran out. `PUT devices/exempt` and `devices/policy` take an optional `if_rev` and answer 409 with
-`{"rev": current}` when it is stale. qnet's side of the rule (qnet is outside this repository): read
-`GET devices` on the usual poll; when `rev` moved and the pushed lists (`exempt_pushed`,
-`block_pushed`) differ from its own, adopt the Pi's, because the panel was the last writer; push with
-`if_rev` and, on 409, read again and merge. After a restart the lists are empty and qnet pushes its
-own. A panel edit made in the poll interval before a power cut is lost, and the panel says nothing of
-that. To draw the same wall as the panel, `GET devices` also gives `own_mac` (the Pi's own address,
-or `null`) and, per device, `label_rank` (the place of its label, or `null`) and `always` (the router
-and whatever claims its address or the Pi's).
-
-**Preview without the Pi:** `cargo xtask panel-preview --screen <name>` writes one screen to a PNG
-(`out/panel-preview.png`, or `--out`), drawn by the same code as the panel and pixel-for-pixel the
-reference of the same name in `crates/qb-panel/tests/reference/os-<name>.png`. The names are `home`,
-`home-alert`, `home-open`, `gate`, `live`, `live-gate`, `devices`, `device`, `confirm`, `pause`,
-`alert` and `about`. `--state` still draws the Drain's own states, and `--push <ssh-alias>` puts
-either on the screen of a Pi that runs Raspberry Pi OS.
-
-**Memory.** A unit test adds up the panel's buffers (the two painters, the glass's kept frame, the
-glyph caches and the world: about 3 MB, against a ceiling of 5 MB) and prints the total; the QEMU
-self-test logs the process's resident memory in its last line (`selftest: vmrss`), and
-`/api/v1/stats` reports it on the Pi as `memory.rss_kib`.
-
-Where P1 differs from the design mockups on purpose: `ADS PASS` where the mockup says `AD-FREE`; no
-`CHECK NOW` (the Pi cannot fetch a build, so an update is pushed from the desktop); a device's names
-only while its screen is open (above); `SEE DEVICE` on ALERT, the alert list, the arrival rule that
-opens a new alert by itself, and NAMES wait for P2; a new alert in P1 only lights the tile and the
-lane's count.
-
-## Development on a card with Raspberry Pi OS
-
-This is the development path, for a Pi whose card still has Raspberry Pi OS: it needs no card
-reader, and it is not how a slot card is updated. The Pi keeps its Raspberry Pi OS install. qberrypi
-lives in a folder on the same card's boot partition and is started for one boot at a time, so the
-card never leaves the Pi. Copy `qberrypi.example.toml` to `qberrypi.toml` and fill
-it in; the file holds the Wi-Fi passphrase and is ignored by git. For a
-development boot, set three things under `[debug]`:
-
-- `one_shot = true`, so qberrypi puts Raspberry Pi OS's `config.txt` back as
-  soon as it starts and any restart returns to Raspberry Pi OS;
-- `log_to_sd = true`, so it leaves a log on the card for `collect` to fetch;
-- `return_after_secs = 90` or so, so it restarts by itself after that long
-  and has time to join the network first.
-  With 0 it stays up until the Pi is switched off and on.
-
-To measure the touch screen, set `calibrate_touch = true` under `[debug]` for
-one boot. Four crosses appear one after the other on the screen: press each for
-about half a second. The log then holds the `[panel]` table for this screen as
-`panel: calibration:` lines, a heading and five values; copy them into
-`qberrypi.toml` without that prefix and set `calibrate_touch` back to `false`.
-
-## Speed against Pi-hole
-
-Measured on the same Raspberry Pi 3 B+, on the same Wi-Fi, from the same PC, with
-`cargo xtask latency`, against the stock Raspberry Pi OS + Pi-hole install that
-qberrypi replaced, booted from the same card. Each cell is median / 95th
-percentile in milliseconds over 200 questions. A lost or failed answer counts as
-the full 2-second wait. Full runs and method:
-[`docs/bring-up/latency-baseline.md`](docs/bring-up/latency-baseline.md).
-
-**As shipped** (DNS-over-TLS to the upstreams, one question every 200 ms; Pi-hole
-measured just before and just after):
-
-| Answer | Pi-hole, before | qberrypi | Pi-hole, after |
+| | qberrypi | Pi-hole v6 | AdGuard Home |
 |---|---|---|---|
-| Cached | 8.27 / 10.70 | **7.77 / 10.44** | 8.01 / 10.07 |
-| Blocked | 7.99 / 10.83 | **7.73 / 10.28** | 7.92 / 10.00 |
-| Forwarded upstream | 29.93 / 184.54 | **28.07 / 86.87** | 29.04 / 126.98 |
-| Forwarded after 20 s of silence (median / max) | 36.3 / 166 | **33.6 / 106** | — |
+| Cached lookups | **17,000/s** | 6,250/s | 1,625/s |
+| Blocked lookups | **18,000/s** | 5,750/s | 750/s |
+| CPU used | ~1 core | ~1.8 cores | up to 3 cores |
+| Memory | **34 MB** total | ~92 MB | ~540 MB |
 
-Pi-hole sends its upstream questions as plain UDP. qberrypi encrypts them and is
-still no slower, including the first question after the encrypted connection
-has gone idle.
+From your devices over Wi-Fi it answers in about 7.5 ms for cached and blocked lookups and 28 ms for
+lookups that go to the internet. It's faster than Pi-hole's medians even though it encrypts
+everything Pi-hole sends in plain text. It boots in about 9.5 seconds from power-on to the first answer.
 
-**Under load** (one question every 2 ms; three Pi-hole runs on the same day):
+How these were measured, and every run: [throughput](docs/bring-up/benchmark.md) and
+[latency](docs/bring-up/latency-baseline.md).
 
-| Answer | Pi-hole, three runs | qberrypi |
-|---|---|---|
-| Cached | 3.47 / 6.67, 2.90 / 4.38, 2.98 / 4.83 | **2.82 / 5.50** |
-| Blocked | 3.52 / 122.79, 2.78 / 4.69, 2.65 / 4.30 | **2.65 / 4.81** |
-| Forwarded upstream | 25.76 / 2000 (11 lost), 24.52 / 118.46 (6 lost), 25.08 / 2000 (11 lost) | **23.83 / 77.51 (0 lost)** |
+## What you need
 
-- **Medians:** qberrypi's median is lower than every Pi-hole run on every row.
-- **Lost answers:** it lost no forwarded answer in any run, where Pi-hole lost 6
-  to 29 of 200 under load.
-- **Cached and blocked 95th percentiles:** these sit inside the spread between
-  Pi-hole's own runs, which is mostly Wi-Fi noise.
+- A **Raspberry Pi 3 Model B+**. It is the only board it supports.
+- A **microSD card** (256 MB is used; any size from 1 GB up) and a **USB card reader**.
+- **Wi-Fi with a WPA2-Personal password**. It connects over Wi-Fi only, using IPv4.
+- **A Linux PC** with [Rust](https://rustup.rs) to build and install it.
+- Optional: a **3.5-inch SPI touchscreen** of the common ILI9486/ADS7846 kind (often sold as
+  "3.5 inch RPi display"), and [**qnet**](https://github.com/quinprobably-netizen/qnet), a desktop panel for managing it.
 
-The first DNS answer goes out 5.9 s after the kernel starts: about 2.1 s of kernel
-start-up, 2.8 s scanning for the Wi-Fi network, and 0.2 s to join it and set the
-address. The board's firmware runs before the kernel and is not in that figure;
-`cargo xtask boot-time` measures from power-on.
+## Getting started
 
-## Commands
+1. **Configure.** Copy `qberrypi.example.toml` to `qberrypi.toml` and fill in your Wi-Fi name and
+   password, the address the Pi should have, and an admin password. The comments in the file explain
+   each setting. This file holds secrets; git ignores it.
+2. **Set the admin password.** Pipe it into `cargo xtask hash-password` (for example from your
+   password manager, so it's never typed on screen), then uncomment the `[api]` section at the end
+   of `qberrypi.toml` and paste the `password_hash` line it prints there.
+3. **Build the card image:**
+   ```
+   cargo xtask fetch
+   cargo xtask fetch-lists
+   cargo xtask build
+   cargo xtask make-cert
+   cargo xtask image
+   ```
+4. **Write it to the card.** Put the card in the reader, find it with `lsblk`, and run
+   `cargo xtask flash --image private/qberrypi-card.img --device /dev/sdX --yes`.
+   It refuses anything that isn't a removable USB card, and checks what it wrote. If it needs root
+   it prints the exact `sudo` line to run.
+5. **Boot the Pi** with the card in. About 10 seconds later it answers DNS at the address you gave
+   it. Check it at `http://<pi address>/api/v1/stats`.
+6. **Point your router's DNS** at the Pi's address, with no second server. Devices pick it up as
+   they reconnect.
 
-| Command | What it does |
-|---|---|
-| `cargo xtask fetch` | Downloads the pinned Raspberry Pi kernel, Wi-Fi firmware and boot-firmware packages, checks them and extracts what the image needs. |
-| `cargo xtask fetch-lists` | Downloads the lists your configuration names into `vendor-cache/lists/`, for `build` to pack into the image as the snapshot the Pi blocks from before it has a network. |
-| `cargo xtask build` | Cross-compiles qberrypi and writes the boot folder to `out/qberrypi/`. Needs `cargo xtask fetch-lists` first: the image holds the snapshot of the lists, and `build` stops where they have not been fetched. |
-| `cargo xtask qemu-test` | Boots the built image in QEMU and checks that it behaves, including a card with two slots and three trial updates (one that confirms, two that roll back). |
-| `cargo xtask image [--out <file>] [--firmware <dir>] [--wifi-hint <MHz>]...` | Makes a complete card image from the build in `out/qberrypi/`, `qberrypi.toml`, `qberrypi-tls.pem` and the boot firmware: both slots hold this build, slot a is selected. It goes to `private/qberrypi-card.img` unless `--out` says otherwise, and holds the Wi-Fi passphrase and the API's key. Refuses a configuration with a development switch on or with no `[api]` section. `--wifi-hint` (up to four times, a 2.4 or 5 GHz channel centre in MHz, at least one of them 5 GHz) sets `wifi.hint_mhz` in the slots' copy of `qberrypi.toml` only, and is refused if your file has a `hint_mhz` already or lists 2.4 GHz channels alone. |
-| `cargo xtask backup-card --device /dev/sdX [--out <file>] --yes` | Copies the whole card in a USB reader into a file, `private/card-backup-<UTC time>.img.zst` by default (compressed when the name ends in `.zst`), and prints the SHA-256 of the bytes it read. Without `--yes` it only says what it would do; if the device needs root it prints the `sudo` line to run. |
-| `cargo xtask flash --image <file> --device /dev/sdX --yes` | Writes an image (decompressed when its name ends in `.zst`) onto the card in a USB reader, reads it back past the page cache and compares the SHA-256. Without `--yes` it only says what it would do; if the device needs root it prints the `sudo` line to run. |
-| `<password command> \| cargo xtask update [--server <ipv4>] [--allow-kernel] [--force] [--software-trial] [--rollback-drill panic\|stall]` | Uploads the build to the Pi's other slot over the API, with the password piped on standard input, and follows the trial boot until the new build confirms or the Pi rolls back, then says which. When your `qberrypi.toml` has no `hint_mhz`, the copy it uploads gets the channel the Pi reports (`wifi.freq_mhz`) when that is a 5 GHz one, and it says so (or says that it left a 2.4 GHz channel out). See Update. |
-| `cargo xtask deploy --host <ssh-alias>` | On a card that still has Raspberry Pi OS: copies the build to the Pi over SSH, starts it for one boot, waits for Raspberry Pi OS to come back, checks that the Pi went through qberrypi, and collects the log, which must be this build's. |
-| `cargo xtask collect --host <ssh-alias>` | On a card that still has Raspberry Pi OS: fetches the log qberrypi left on the card into `out/logs/`, and refuses to show it if it holds the passphrase. |
-| `cargo xtask deploy --host <ssh-alias> --permanent` | On a card that still has Raspberry Pi OS: installs the build to stay: qberrypi is selected for every boot. The configuration must have every `[debug]` switch off. |
-| `cargo xtask return-to-pios --boot <mount>` | With the Pi's card in this computer's reader, makes it start Raspberry Pi OS again: the way back from a permanent qberrypi on a card that still has Raspberry Pi OS. |
-| `cargo xtask make-cert` | Makes qberrypi's own TLS certificate for the API, once, as `qberrypi-tls.pem` (private, git-ignored), and prints the pin a client checks. `image` and `update` use it too. |
-| `cargo xtask hash-password` | Prints the `password_hash` line for the API's login from a password piped in on standard input. |
-| `cargo xtask boot-time` | Measures power-on to the Pi's first DNS answer, from this computer. |
-| `cargo xtask panel-preview [--state <drain state> \| --screen <screen>] [--out <file>] [--push <ssh-alias>]` | Draws the front panel into a PNG, one of the Drain's states (`--state`, the default `normal`) or one screen of the panel's OS (`--screen home`, `devices`, `alert` and so on; see The front panel), and with `--push` onto the 3.5-inch screen of a Pi running Raspberry Pi OS. |
-| `cargo xtask probe --stage {resolver,blocker} [--server <ipv4>] [--listed <name>]` | While a one-shot boot is running, asks the Pi's DNS and status servers what a client would and prints which of the milestone's checks hold. `resolver` runs eight checks: forwarding, the cache, TCP, single-label names, the clock and the upstream latency. `blocker` runs those and seven more: the snapshot blocks before any refresh, the lists are then refreshed over HTTPS (it waits up to 150 s for that), and the name given with `--listed`, which must be on the lists, stays blocked. Start `blocker` together with the deploy, before the Pi has refreshed its lists. Run either stage once per boot: a second run finds `example.org` already in the Pi's cache. |
-| `cargo xtask latency [--host <ssh-alias-or-address>] [--samples N] [--interval-ms M] [--blocked <name>] [--json <file>]`, or `cargo xtask latency --compare <a.json> <b.json> [--received-only]` | Measures from this PC the Pi's ping round trip and its DNS answer times — cached, blocked and forwarded — as p50, p95, min, mean, lost and failed, for comparison with `docs/bring-up/latency-baseline.md`; a DNS answer that does not come within 2 s counts as 2 s in p50, p95 and mean, and so does one with the response code SERVFAIL or REFUSED (`failed` counts those, a subset of `lost`; ping counts replies only); `--json <file>` keeps the figures. `--compare` measures nothing: it reads two such files and prints, per row, the p50 and p95 of the second against the first with a verdict, `ok` or `slower`, and a note where the two files' lost and failed counts differ. It fails, after printing, if any figure is slower, if either file lacks a figure the other has (a baseline with an error row or a missing row is incomplete), if the interval or the sample count differs between the files, or if a file has DNS rows from before lost answers were counted (re-run that pass). `--received-only` reads both files' received-only figures instead (lost answers left out), which accepts those older files; it is not the acceptance comparison, and a mismatch of pacing or samples still fails. |
-| `<password command> \| cargo xtask bench --on-pi [--server <ipv4>] [--class <class>]... [--seconds N] [--forwarded-max-qps N] [--json <file>]`, `cargo xtask bench --from-here [...]`, or `cargo xtask bench --compare <a.json> <b.json>` | Measures how many DNS answers a second the Pi sustains, per class (cached, blocked, forwarded): `--on-pi` runs `qb-bench`'s generator on the Pi against its own DNS over the loopback, through the API's `POST /api/qbp/bench` (logged in as `update` does), a ramp and then a steady load at 80% of the most it sustained; `--from-here` runs the same loads from this PC, the figure the Wi-Fi allows; `--compare` prints B against A and fails if B is worse. The forwarded class really asks Quad9 for every question, which throttles a source that sends too many fresh names, so it stops at 50 a second by default (100 at most). Figures go to `private/`. The same generator is the static `qb-bench` binary for Raspberry Pi OS; see `docs/bring-up/benchmark.md`. |
-| `cargo test -p qberrypi --test hwsim -- --ignored --test-threads=1` | Runs the Wi-Fi code against `hostapd` on the kernel's simulated radios (`mac80211_hwsim`), each test inside a user and network namespace of its own. Needs `sudo modprobe mac80211_hwsim radios=0` once and `hostapd` installed; it touches no real radio. |
+## Updating
 
-An image holds the contents of the lists, so the lists' own licences apply to
-anyone who passes an image on.
+Updates go over the network, so the card never needs to come out again:
 
-`deploy` and `collect` (the development path, for a card that still has Raspberry Pi OS) can leave
-out `--host` when the environment variable `QBERRYPI_HOST` names the Pi; `probe` and `latency`
-ignore that variable and, without `--server` or `--host`, use `net.address` of `qberrypi.toml`. The
-first deploy saves a copy of the Pi's boot partition to `vendor-cache/bootpart-backup.tar`.
+```
+cargo xtask build
+<command that prints your admin password> | cargo xtask update
+```
 
-If the Pi does not come back after a deploy, put the card in another computer
-and copy `config.pios.txt` over `config.txt` on its boot partition: that file
-is Raspberry Pi OS's configuration, saved before qberrypi was first selected.
-(That file exists only on a card that still has Raspberry Pi OS.)
+The Pi installs the new build in its spare slot and restarts into it on trial. If the new build
+proves itself healthy within about two minutes it stays; otherwise the Pi goes back to the
+previous one by itself. DNS is down for about 15 seconds during the restart.
+
+## If something goes wrong
+
+- **An update fails:** nothing to do. The Pi is already back on the previous version and says why.
+- **The Pi stops answering during an update:** unplug it and plug it back in. It boots the previous
+  version.
+- **Anything else:** flash the card again (step 4 of Getting started).
+
+## The touchscreen
+
+The home screen has six tiles:
+
+- **LIVE**: lookups flowing past, with blocked ones draining away.
+- **DEVICES**: every device on the network. Tap one to see what it's been looking up, let ads pass
+  on it, or block it.
+- **ALERTS**: anything suspicious the watchdog spotted.
+- **GATE**: pause blocking for everyone for 5, 30 or 60 minutes.
+- **NAMES**: what's being blocked most.
+- **SYSTEM**: version, Wi-Fi and uptime.
+
+Everything works by tap, and it returns to the home screen after a minute idle. Alerts, Names and
+System are still being finished.
+
+## Privacy
+
+- Lookups to the internet are encrypted. Until the Pi's clock is set (needed to check certificates),
+  only the time servers' names go out unencrypted.
+- The Pi keeps counts, not a history. A device's recent lookups are shown only while you have that
+  device open on the screen, and are forgotten when you close it.
+- A device can ask the Pi about its own activity at `http://<pi address>/api/v1/me`; the Pi starts
+  tracking it only when it asks, and forgets it 15 minutes after it stops.
+- Logs never contain the names your devices look up, or their addresses.
+- There's no shell, no SSH and no way to log in. Management is through the password-protected API
+  only.
+
+## Learn more
+
+- [The full manual](docs/reference.md): every setting, screen and command, the development path,
+  and recovery details.
+- [Design documents](docs/superpowers/specs/) and [bring-up notes](docs/bring-up/) from building it
+  on a real Pi.
 
 ## Licence
 
-MIT. See `LICENSE`.
-
-The image also carries the JetBrains Mono typefaces, which are under the SIL Open
-Font License 1.1; its text is packed into the image as `licenses/JetBrainsMono-OFL.txt`.
+MIT. See `LICENSE`. The image also carries the JetBrains Mono typefaces (SIL Open Font License 1.1),
+and the block lists keep their own licences: anyone passing an image on passes those lists on too.
