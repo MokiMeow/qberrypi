@@ -1530,6 +1530,12 @@ fn dns_selftest_conditions(evidence: &Evidence) -> Vec<Condition> {
         // The panel OS's P1: the API logged in over loopback (the password is the scenario's, the
         // certificate the card's, taken by its pin) and its device inventory answered with a `rev`.
         evidence.serial_has("INFO  selftest: api: /api/qbp/devices: 200 rev"),
+        // P2: the owner's names. The API refused a made-up `.invalid` name, which the resolver then
+        // blocked over loopback, and when the names were cleared it no longer did.
+        evidence.serial_has("INFO  selftest: api: /api/qbp/names: 200 refused cleared"),
+        // P3: the panel's night hours and lock. The API answered `GET /api/qbp/panel` with both and with
+        // no hash in the answer.
+        evidence.serial_has("INFO  selftest: api: /api/qbp/panel: 200 night lock"),
         evidence.serial_has("INFO  selftest: dns: done"),
         // The last line: the process's resident memory in kB, for the memory check of the
         // milestones. A number that could not be read is `unknown`, and is no line.
@@ -4726,8 +4732,10 @@ mod tests {
              [  22.731] INFO  selftest: dns: udp example.com A: SERVFAIL\n\
              [  22.740] INFO  selftest: status: /api/v1/stats: 200\n\
              [  22.900] INFO  selftest: api: /api/qbp/devices: 200 rev\n\
-             [  22.901] INFO  selftest: dns: done\n\
-             [  22.902] INFO  selftest: vmrss: 14400 kB\n\
+             [  22.901] INFO  selftest: api: /api/qbp/names: 200 refused cleared\n\
+             [  22.902] INFO  selftest: api: /api/qbp/panel: 200 night lock\n\
+             [  22.903] INFO  selftest: dns: done\n\
+             [  22.904] INFO  selftest: vmrss: 14400 kB\n\
              [  60.000] INFO  returning\n",
         );
         evidence
@@ -4743,7 +4751,7 @@ mod tests {
         let conditions = dns_selftest_conditions(&good_dns_selftest_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 30);
+        assert_eq!(conditions.len(), 32);
     }
 
     #[test]
@@ -4761,7 +4769,7 @@ mod tests {
     fn each_thing_wrong_with_the_dns_selftest_boot_fails_its_condition() {
         /// What the failed condition is about, and what makes the evidence wrong.
         type Wrong = (&'static str, fn(&mut Evidence));
-        let wrong: [Wrong; 27] = [
+        let wrong: [Wrong; 33] = [
             ("has `INFO  services: started`", |e| {
                 e.serial = e.serial.replace("services: started", "services: startup")
             }),
@@ -4848,6 +4856,58 @@ mod tests {
             (
                 "has `INFO  selftest: api: /api/qbp/devices: 200 rev`",
                 |e| e.serial = e.serial.replace("devices: 200 rev", "devices: 200 no rev"),
+            ),
+            // The owner's names: the refusal was not taken, the name was not blocked after it, or it
+            // was blocked still after the names were cleared.
+            (
+                "has `INFO  selftest: api: /api/qbp/names: 200 refused cleared`",
+                |e| {
+                    e.serial = e
+                        .serial
+                        .replace("names: 200 refused cleared", "names: put 400")
+                },
+            ),
+            (
+                "has `INFO  selftest: api: /api/qbp/names: 200 refused cleared`",
+                |e| {
+                    e.serial = e
+                        .serial
+                        .replace("names: 200 refused cleared", "names: not refused SERVFAIL")
+                },
+            ),
+            (
+                "has `INFO  selftest: api: /api/qbp/names: 200 refused cleared`",
+                |e| {
+                    e.serial = e
+                        .serial
+                        .replace("names: 200 refused cleared", "names: still refused")
+                },
+            ),
+            // The panel's state: the login was refused, the answer lacked the hours or the lock, or the API
+            // did not answer.
+            (
+                "has `INFO  selftest: api: /api/qbp/panel: 200 night lock`",
+                |e| {
+                    e.serial = e
+                        .serial
+                        .replace("panel: 200 night lock", "panel: login 401")
+                },
+            ),
+            (
+                "has `INFO  selftest: api: /api/qbp/panel: 200 night lock`",
+                |e| {
+                    e.serial = e
+                        .serial
+                        .replace("panel: 200 night lock", "panel: 200 no lock")
+                },
+            ),
+            (
+                "has `INFO  selftest: api: /api/qbp/panel: 200 night lock`",
+                |e| {
+                    e.serial = e
+                        .serial
+                        .replace("panel: 200 night lock", "panel: no answer")
+                },
             ),
             ("has `INFO  selftest: dns: done`", |e| {
                 e.serial = e.serial.replace("INFO  selftest: dns: done", "")

@@ -121,6 +121,9 @@ enum Command {
     /// Print the `password_hash` line for the Pi-hole API's login, from a password piped in on
     /// standard input
     HashPassword,
+    /// Print the `pin_hash` line for the front panel's PIN, from four digits piped in on standard
+    /// input (for example `read -rs PIN; printf %s "$PIN" | cargo xtask hash-pin`)
+    HashPin,
     /// Make qberrypi's own TLS certificate for the Pi-hole API, once, as qberrypi-tls.pem
     MakeCert {
         /// Replace a certificate that is there; qnet must then be pinned again
@@ -235,6 +238,7 @@ fn main() -> Result<()> {
         Command::PanelPreview(args) => panel::run(&args, workspace_root()),
         Command::BootTime { server } => boottime::run(server, workspace_root()),
         Command::HashPassword => hashpw::run(),
+        Command::HashPin => hashpw::run_pin(),
         Command::MakeCert { replace } => cert::run(replace, workspace_root()),
         Command::Probe {
             stage,

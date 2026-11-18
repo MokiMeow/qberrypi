@@ -27,11 +27,14 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use crate::config::TRIAL_CONFIRM_DEFAULT_SECS;
 use crate::slots::{Marker, Slot};
 
 pub mod receive;
@@ -60,6 +63,10 @@ pub enum Cause {
     /// The trial build gave up before it confirmed, for the reason given (one line, made by the
     /// trial itself and never a value from the configuration): logged at ERROR.
     GaveUp(String),
+    /// The owner asked for it from the front panel (`RESTART` on UP): logged at INFO, as the owner's own
+    /// decision. It is asked for only while no update is received and no trial is on
+    /// ([`UpdateCtl::request_owner_restart`]).
+    Owner,
 }
 
 impl std::fmt::Display for Restart {
@@ -68,6 +75,9 @@ impl std::fmt::Display for Restart {
             Self::Tryboot => f.write_str("an update was staged and is tried with tryboot"),
             Self::Plain(Cause::Update) => f.write_str("an update was staged and is tried"),
             Self::Plain(Cause::GaveUp(why)) => write!(f, "the trial gave up: {why}"),
+            Self::Plain(Cause::Owner) => {
+                f.write_str("the owner restarted the board from the panel")
+            }
         }
     }
 }
@@ -114,6 +124,9 @@ pub struct Trial {
     pub began: Instant,
     /// What the trial still waits for; the trial component keeps it current.
     pub waiting_for: Vec<Waiting>,
+    /// How long after `began` the trial's minimum time is up: [`TRIAL_CONFIRM_DEFAULT_SECS`] until the
+    /// trial component says what its settings make of it ([`UpdateCtl::set_trial_minimum`]).
+    pub confirm_after: Duration,
 }
 
 /// How an update's trial ended.
@@ -183,6 +196,24 @@ struct State {
     last: Option<Outcome>,
 }
 
+/// How far the receiver has got, for the panel's percentage: two numbers that the receiver writes and
+/// the panel reads, with no lock between them. They are advisory: each stands alone, and a reader that
+/// sees the one of a moment and the other of the next only draws a percentage a hair off.
+#[derive(Default)]
+struct Progress {
+    /// The bytes of the body that have arrived, the manifest's and the files'.
+    received: AtomicU64,
+    /// The body's whole length, which the manifest's sizes add up to; 0 until the manifest is judged.
+    length: AtomicU64,
+}
+
+impl Progress {
+    fn reset(&self) {
+        self.received.store(0, Ordering::Relaxed);
+        self.length.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Why the receiver may not begin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -236,6 +267,8 @@ pub struct UpdateCtl {
     boot_files: Option<String>,
     card: Arc<dyn BootCard>,
     state: Mutex<State>,
+    /// How much of the update the receiver has taken in; read without the lock.
+    progress: Progress,
     restart: watch::Sender<Option<Restart>>,
 }
 
@@ -258,6 +291,7 @@ impl UpdateCtl {
                 phase: Phase::Idle,
                 last: None,
             }),
+            progress: Progress::default(),
             restart: watch::channel(None).0,
         })
     }
@@ -293,7 +327,17 @@ impl UpdateCtl {
             marker,
             began,
             waiting_for: Waiting::ALL.to_vec(),
+            confirm_after: Duration::from_secs(TRIAL_CONFIRM_DEFAULT_SECS),
         });
+    }
+
+    /// Says how long after init started the trial's minimum time is up, for the time that
+    /// [`View`] shows left (spec §12.5); nothing happens if this boot is not on trial. The trial
+    /// component calls it with the same figure it confirms by.
+    pub fn set_trial_minimum(&self, confirm_after: Duration) {
+        if let Phase::Trial(trial) = &mut self.state().phase {
+            trial.confirm_after = confirm_after;
+        }
     }
 
     /// A copy of the trial this boot is on, if it is on one.
@@ -334,6 +378,7 @@ impl UpdateCtl {
             return Err(Refused::Busy);
         }
         state.phase = Phase::Receiving;
+        self.progress.reset();
         Ok(Receiving {
             ctl: self.clone(),
             staged: false,
@@ -352,12 +397,40 @@ impl UpdateCtl {
         })
     }
 
+    /// Asks for the restart that the owner chose on the front panel (`Cause::Owner`): refused with
+    /// `Err(Busy)` while an update is received or staged and while this boot is on trial, which a restart
+    /// would cut short. The look at the state and the request are one step, so that an update that begins
+    /// at this moment is the one refused. A restart that stands already is asked for again to no effect,
+    /// and that is `Ok`: the board is restarting, as the owner wished.
+    pub fn request_owner_restart(&self) -> Result<(), Busy> {
+        let state = self.state();
+        if state.phase != Phase::Idle {
+            return Err(Busy);
+        }
+        // The first request stands: a later one changes nothing, as this one may find.
+        self.request_restart(Restart::Plain(Cause::Owner));
+        Ok(())
+    }
+
+    /// Runs `act` if no update is received or staged and this boot is not on a trial, and `Err(Busy)` if
+    /// one is. The look at the state and `act` are one step, as in [`UpdateCtl::request_owner_restart`], so
+    /// that an update that begins at this moment is the one refused. `act` runs with the state held: it must
+    /// be short, and must not ask this control for anything.
+    pub fn when_idle<T>(&self, act: impl FnOnce() -> T) -> Result<T, Busy> {
+        let state = self.state();
+        if state.phase != Phase::Idle {
+            return Err(Busy);
+        }
+        Ok(act())
+    }
+
     /// The end of the channel that the supervisor waits on (`supervisor::Plan::restart`).
     pub fn restart_receiver(&self) -> watch::Receiver<Option<Restart>> {
         self.restart.subscribe()
     }
 
-    /// Copies out what the statistics tell, under the lock and no longer than that takes.
+    /// Copies out what the statistics tell and the panel's UPDATE screens draw, under the lock and no
+    /// longer than that takes (the receiver's progress is two atomics, read after it).
     pub fn view(&self) -> View {
         let (state, trial, last) = {
             let state = self.state();
@@ -368,20 +441,44 @@ impl UpdateCtl {
             };
             (word, trial, state.last.clone())
         };
+        let (received, length) = if state == "receiving" {
+            (
+                self.progress.received.load(Ordering::Relaxed),
+                self.progress.length.load(Ordering::Relaxed),
+            )
+        } else {
+            (0, 0)
+        };
         View {
             slot: self.slot,
             boot_files: self.boot_files.clone(),
             state,
-            trial: trial.map(|trial| TrialView {
-                build: trial.marker.build,
-                from: trial.marker.from,
-                secs: trial.began.elapsed().as_secs(),
-                waiting_for: trial.waiting_for,
+            received,
+            length,
+            trial: trial.map(|trial| {
+                let elapsed = trial.began.elapsed();
+                TrialView {
+                    build: trial.marker.build,
+                    from: trial.marker.from,
+                    secs: elapsed.as_secs(),
+                    min_left_secs: whole_secs_up(trial.confirm_after.saturating_sub(elapsed)),
+                    waiting_for: trial.waiting_for,
+                }
             }),
             last,
         }
     }
 }
+
+/// The seconds of `left`, counted up: a trial that has 0.2 s to go has 1 s left on the screen, and
+/// shows 0 only once its minimum time is up.
+fn whole_secs_up(left: Duration) -> u64 {
+    left.as_secs() + u64::from(left.subsec_nanos() > 0)
+}
+
+/// An update is being received or staged, or this boot is on trial: no restart is made now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Busy;
 
 /// The machinery taken for the receiver; dropping it gives it back, unless the update was staged.
 #[must_use = "the machinery is the receiver's for as long as this lives"]
@@ -396,6 +493,20 @@ impl Receiving {
     pub fn staged(mut self) {
         self.staged = true;
     }
+
+    /// Counts `bytes` more of the update as arrived, for the percentage the panel shows.
+    pub fn arrived(&self, bytes: usize) {
+        self.ctl
+            .progress
+            .received
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Says how long the whole update is, in bytes: the manifest's sizes added up, once the manifest is
+    /// judged.
+    pub fn length_is(&self, length: u64) {
+        self.ctl.progress.length.store(length, Ordering::Relaxed);
+    }
 }
 
 impl Drop for Receiving {
@@ -406,11 +517,13 @@ impl Drop for Receiving {
         let mut state = self.ctl.state();
         if state.phase == Phase::Receiving {
             state.phase = Phase::Idle;
+            self.ctl.progress.reset();
         }
     }
 }
 
-/// What `/api/v1/stats` tells of the update machinery, copied out of [`UpdateCtl::view`].
+/// What `/api/v1/stats` and the front panel's UPDATE screens tell of the update machinery, copied out of
+/// [`UpdateCtl::view`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct View {
     /// The running slot; `None` on the old layout.
@@ -419,6 +532,11 @@ pub struct View {
     pub boot_files: Option<String>,
     /// `"idle"`, `"receiving"` or `"trial"`.
     pub state: &'static str,
+    /// While an update is received (or staged): the bytes of it that have arrived; 0 otherwise.
+    pub received: u64,
+    /// While an update is received (or staged): its whole length in bytes, from the manifest; 0 until the
+    /// manifest is judged, and otherwise.
+    pub length: u64,
     /// The trial this boot is on, if it is on one.
     pub trial: Option<TrialView>,
     /// How the last trial ended, if this boot knows of one.
@@ -434,6 +552,9 @@ pub struct TrialView {
     pub from: Slot,
     /// How long ago init started, in whole seconds.
     pub secs: u64,
+    /// The seconds until the trial's minimum time is up, counted up; 0 once it is (what the trial still
+    /// waits for is then `waiting_for`).
+    pub min_left_secs: u64,
     /// What the trial still waits for.
     pub waiting_for: Vec<Waiting>,
 }
@@ -491,6 +612,8 @@ mod tests {
                 slot: Some(Slot::A),
                 boot_files: Some("ab".repeat(32)),
                 state: "idle",
+                received: 0,
+                length: 0,
                 trial: None,
                 last: None,
             }
@@ -645,6 +768,147 @@ mod tests {
             Restart::Plain(Cause::GaveUp("no Wi-Fi".into())).to_string(),
             "the trial gave up: no Wi-Fi"
         );
+        assert_eq!(
+            Restart::Plain(Cause::Owner).to_string(),
+            "the owner restarted the board from the panel"
+        );
+    }
+
+    #[test]
+    fn the_owners_restart_is_asked_for_as_a_plain_restart_with_its_own_cause() {
+        let ctl = on_slot(Slot::A);
+        let mut asked = ctl.restart_receiver();
+        assert_eq!(ctl.request_owner_restart(), Ok(()));
+        assert_eq!(
+            *asked.borrow_and_update(),
+            Some(Restart::Plain(Cause::Owner))
+        );
+        // A second one is no refusal: the board is restarting, as asked. The first stands.
+        assert_eq!(ctl.request_owner_restart(), Ok(()));
+        assert!(!asked.has_changed().unwrap());
+    }
+
+    #[test]
+    fn the_owners_restart_is_refused_while_an_update_is_received_or_staged_or_on_a_trial() {
+        let nothing_asked = |ctl: &UpdateCtl| ctl.restart_receiver().borrow().is_none();
+        // While the receiver has the machinery.
+        let ctl = on_slot(Slot::A);
+        let receiving = ctl.begin_receive().unwrap();
+        assert_eq!(ctl.request_owner_restart(), Err(Busy));
+        assert!(nothing_asked(&ctl));
+        // After it is given back the restart is let through.
+        drop(receiving);
+        assert_eq!(ctl.request_owner_restart(), Ok(()));
+        assert!(!nothing_asked(&ctl));
+
+        // While a staged update waits for its restart.
+        let ctl = on_slot(Slot::A);
+        ctl.begin_receive().unwrap().staged();
+        assert_eq!(ctl.request_owner_restart(), Err(Busy));
+        assert!(nothing_asked(&ctl));
+
+        // While this boot is on trial; once the trial has ended it is let through.
+        let ctl = on_slot(Slot::B);
+        ctl.begin_trial(marker(Slot::B), Instant::now());
+        assert_eq!(ctl.request_owner_restart(), Err(Busy));
+        assert!(nothing_asked(&ctl));
+        ctl.finish(Outcome::confirmed(1));
+        assert_eq!(ctl.request_owner_restart(), Ok(()));
+    }
+
+    #[test]
+    fn an_act_is_done_only_while_no_update_is_received_or_staged_or_on_a_trial() {
+        let ctl = on_slot(Slot::A);
+        assert_eq!(ctl.when_idle(|| 7), Ok(7));
+        let receiving = ctl.begin_receive().unwrap();
+        assert_eq!(
+            ctl.when_idle(|| unreachable!("an update is received")),
+            Err(Busy)
+        );
+        drop(receiving);
+        assert_eq!(ctl.when_idle(|| 8), Ok(8));
+        ctl.begin_receive().unwrap().staged();
+        assert_eq!(
+            ctl.when_idle(|| unreachable!("an update is staged")),
+            Err(Busy)
+        );
+        let ctl = on_slot(Slot::B);
+        ctl.begin_trial(marker(Slot::B), Instant::now());
+        assert_eq!(ctl.when_idle(|| unreachable!("a trial runs")), Err(Busy));
+        ctl.finish(Outcome::confirmed(1));
+        assert_eq!(ctl.when_idle(|| 9), Ok(9));
+    }
+
+    #[test]
+    fn the_receivers_progress_is_counted_and_shown_only_while_it_has_the_machinery() {
+        let ctl = on_slot(Slot::A);
+        let idle = ctl.view();
+        assert_eq!((idle.received, idle.length), (0, 0));
+        let receiving = ctl.begin_receive().unwrap();
+        // Nothing has arrived, and the length is not known until the manifest is judged.
+        assert_eq!((ctl.view().received, ctl.view().length), (0, 0));
+        receiving.arrived(1_000);
+        receiving.arrived(24);
+        let view = ctl.view();
+        assert_eq!(
+            (view.state, view.received, view.length),
+            ("receiving", 1_024, 0)
+        );
+        receiving.length_is(4_096);
+        receiving.arrived(1_024);
+        let view = ctl.view();
+        assert_eq!((view.received, view.length), (2_048, 4_096));
+        // An update that is refused or fails gives the machinery back and its progress with it.
+        drop(receiving);
+        let view = ctl.view();
+        assert_eq!((view.state, view.received, view.length), ("idle", 0, 0));
+        // The next one starts from nothing.
+        let receiving = ctl.begin_receive().unwrap();
+        assert_eq!((ctl.view().received, ctl.view().length), (0, 0));
+        // One that is staged keeps the whole of what it counted, for the screen that waits for the restart.
+        receiving.length_is(10);
+        receiving.arrived(10);
+        receiving.staged();
+        let view = ctl.view();
+        assert_eq!(
+            (view.state, view.received, view.length),
+            ("receiving", 10, 10)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trial_shows_the_time_left_to_its_minimum_and_then_none() {
+        let ctl = on_slot(Slot::B);
+        ctl.begin_trial(marker(Slot::B), Instant::now());
+        // Until the trial component says what its settings make of it, the minimum is the default 120 s.
+        assert_eq!(ctl.view().trial.unwrap().min_left_secs, 120);
+        tokio::time::advance(Duration::from_secs(95)).await;
+        assert_eq!(ctl.view().trial.unwrap().min_left_secs, 25);
+        // The trial component's own figure, counted from the same start.
+        ctl.set_trial_minimum(Duration::from_secs(30));
+        assert_eq!(ctl.view().trial.unwrap().min_left_secs, 0);
+        ctl.set_trial_minimum(Duration::from_secs(100));
+        assert_eq!(ctl.view().trial.unwrap().min_left_secs, 5);
+        // Counted up: with half a second to go there is still 1 s on the screen, and 0 only once it is time.
+        tokio::time::advance(Duration::from_millis(4_500)).await;
+        assert_eq!(ctl.view().trial.unwrap().min_left_secs, 1);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(ctl.view().trial.unwrap().min_left_secs, 0);
+        // What it waits for past the minimum is the view's `waiting_for`, as before.
+        ctl.set_waiting(vec![Waiting::Upstream]);
+        let trial = ctl.view().trial.unwrap();
+        assert_eq!(
+            (trial.min_left_secs, trial.waiting_for),
+            (0, vec![Waiting::Upstream])
+        );
+    }
+
+    #[test]
+    fn the_trial_minimum_is_set_only_on_a_trial() {
+        let ctl = on_slot(Slot::A);
+        ctl.set_trial_minimum(Duration::from_secs(5));
+        assert_eq!(ctl.view().trial, None);
+        assert_eq!(ctl.view().state, "idle");
     }
 
     #[test]

@@ -182,16 +182,25 @@ impl PendingAlerts for AlertStore {
             .iter()
             .filter(|alert| !alert.acked)
             .max_by_key(|alert| (alert.severity, alert.id))?;
-        Some(PanelAlert {
-            id: top.id,
-            kind: top.kind.to_owned(),
-            severity: top.severity.into(),
-            client: top.client,
-            subject: top.subject.clone(),
-            count: top.count,
-            first_unix: top.first_unix,
-            last_unix: top.last_unix,
-        })
+        Some(top.panel_alert())
+    }
+
+    /// The newest `n` alerts that are not acknowledged, the newest first: the ring is in the order
+    /// the alerts were added, which is the order of their ids, so a walk from its end is a walk in
+    /// order of id, and it stops at the `n`th.
+    fn waiting(&self, n: usize) -> Vec<PanelAlert> {
+        self.lock()
+            .alerts
+            .iter()
+            .rev()
+            .filter(|alert| !alert.acked)
+            .take(n)
+            .map(Entry::panel_alert)
+            .collect()
+    }
+
+    fn last_alert_unix(&self) -> Option<u64> {
+        self.lock().last_filed_unix
     }
 
     fn waiting_count(&self) -> u32 {
@@ -345,6 +354,20 @@ impl Entry {
             && self.subject == other.subject
     }
 
+    /// Copies the alert out for the front panel.
+    fn panel_alert(&self) -> PanelAlert {
+        PanelAlert {
+            id: self.id,
+            kind: self.kind.to_owned(),
+            severity: self.severity.into(),
+            client: self.client,
+            subject: self.subject.clone(),
+            count: self.count,
+            first_unix: self.first_unix,
+            last_unix: self.last_unix,
+        }
+    }
+
     /// Copies the alert out for a reader.
     fn view(&self) -> AlertView {
         AlertView {
@@ -384,6 +407,9 @@ struct Inner {
     alerts: VecDeque<Entry>,
     /// The keys that were restored, the oldest first.
     restored: VecDeque<u64>,
+    /// The latest unix time at which an alert was filed, a repeat included, whether or not the alert
+    /// is still in the ring: `None` until one is. An alert that a rate limit dropped was not filed.
+    last_filed_unix: Option<u64>,
     /// The rate limit of each kind seen lately, at most `MAX_KINDS`.
     windows: Vec<KindWindow>,
 }
@@ -403,6 +429,7 @@ impl Inner {
     /// panel offers alerts does not change, and its count and last time say that it came back).
     fn record(&mut self, mut entry: Entry, mono: u64) -> bool {
         if let Some(pos) = self.alerts.iter().position(|a| a.same_as(&entry)) {
+            self.last_filed_unix = Some(entry.last_unix);
             let rev = self.bump();
             let alert = &mut self.alerts[pos];
             alert.count = alert.count.saturating_add(1);
@@ -422,6 +449,7 @@ impl Inner {
             let pos = self.alerts.iter().position(|a| a.acked).unwrap_or(0);
             self.alerts.remove(pos);
         }
+        self.last_filed_unix = Some(entry.last_unix);
         self.next_id += 1;
         entry.id = self.next_id;
         entry.rev = self.bump();
@@ -911,6 +939,117 @@ mod tests {
         store.ack(top.id);
         assert_eq!(panel.waiting_count(), 0);
         assert!(panel.top().is_none());
+    }
+
+    #[test]
+    fn the_panel_reads_the_newest_waiting_alerts_whole_newest_first() {
+        let (store, mono, unix) = store();
+        let panel: &dyn PendingAlerts = &store;
+        assert!(panel.waiting(3).is_empty());
+        for (n, subject) in ["first", "second", "third", "fourth"]
+            .into_iter()
+            .enumerate()
+        {
+            unix.store(1_700_000_000 + n as u64 * 10, Ordering::SeqCst);
+            mono.store(1000 + n as u64, Ordering::SeqCst);
+            let mut raised = alert("threat", subject);
+            raised.severity = if n == 1 {
+                Severity::High
+            } else {
+                Severity::Info
+            };
+            store.raise(raised);
+        }
+
+        // The one raised last first, whatever the severities: not the order `top` offers.
+        let waiting = panel.waiting(3);
+        let subjects: Vec<&str> = waiting.iter().map(|a| a.subject.as_str()).collect();
+        assert_eq!(subjects, ["fourth", "third", "second"]);
+        assert_eq!(panel.top().unwrap().subject, "second");
+        let second = &waiting[2];
+        assert_eq!(
+            (
+                second.id,
+                second.kind.as_str(),
+                second.severity,
+                second.client,
+                second.count,
+                second.first_unix,
+                second.last_unix
+            ),
+            (
+                2,
+                "threat",
+                PanelSeverity::High,
+                Some(client()),
+                1,
+                1_700_000_010,
+                1_700_000_010
+            )
+        );
+        assert_eq!(panel.waiting(0).len(), 0);
+        assert_eq!(panel.waiting(99).len(), 4);
+        assert_eq!(panel.waiting_count(), 4);
+
+        // An acknowledged alert is not waiting, whoever acknowledged it; the rest keep their order.
+        panel.ack(3);
+        assert!(store.ack(4));
+        let subjects =
+            |n| -> Vec<String> { panel.waiting(n).into_iter().map(|a| a.subject).collect() };
+        assert_eq!(subjects(5), ["second", "first"]);
+
+        // A repeat counts and does not move the alert in the order: it was raised when it was.
+        unix.store(1_700_000_500, Ordering::SeqCst);
+        store.raise(alert("threat", "first"));
+        let waiting = panel.waiting(5);
+        assert_eq!(
+            waiting
+                .iter()
+                .map(|a| a.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+        assert_eq!(
+            (
+                waiting[1].count,
+                waiting[1].first_unix,
+                waiting[1].last_unix
+            ),
+            (2, 1_700_000_000, 1_700_000_500)
+        );
+    }
+
+    #[test]
+    fn the_panel_reads_when_the_last_alert_was_filed_acknowledged_or_not() {
+        let (store, _, unix) = store();
+        let panel: &dyn PendingAlerts = &store;
+        assert_eq!(panel.last_alert_unix(), None);
+        store.raise(alert("beacon", "example.org"));
+        assert_eq!(panel.last_alert_unix(), Some(1_700_000_000));
+        // A repeat is a filing too, and an acknowledgement is none.
+        unix.store(1_700_000_070, Ordering::SeqCst);
+        store.raise(alert("beacon", "example.org"));
+        assert_eq!(panel.last_alert_unix(), Some(1_700_000_070));
+        panel.ack(1);
+        assert!(store.ack(1));
+        assert_eq!(panel.waiting_count(), 0);
+        assert_eq!(panel.last_alert_unix(), Some(1_700_000_070));
+
+        // One that a rate limit dropped was not filed. The limit is 20 new alerts of a kind an hour.
+        unix.store(1_700_000_100, Ordering::SeqCst);
+        for n in 0..NEW_PER_HOUR {
+            store.raise(alert("tunnel", &format!("name-{n}.example.org")));
+        }
+        assert_eq!(panel.last_alert_unix(), Some(1_700_000_100));
+        unix.store(1_700_000_200, Ordering::SeqCst);
+        store.raise(alert("tunnel", "one-too-many.example.org"));
+        assert_eq!(store.list(0).suppressed, 1);
+        assert_eq!(panel.last_alert_unix(), Some(1_700_000_100));
+
+        // The clock stepping back is followed: it is when the last one was filed, by the clock.
+        unix.store(1_600_000_000, Ordering::SeqCst);
+        store.raise(alert("beacon", "example.org"));
+        assert_eq!(panel.last_alert_unix(), Some(1_600_000_000));
     }
 
     #[test]

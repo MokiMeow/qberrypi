@@ -237,6 +237,9 @@ pub(crate) fn run(parts: Parts, samples: usize, every: Duration, scale: usize) -
                     lane: slot.lane(),
                     alerts: slot.clone(),
                     devices: slot.clone(),
+                    names: slot.clone(),
+                    system: slot.clone(),
+                    lock: slot.clone(),
                 };
                 let stop = stop.clone();
                 drop(tokio::task::spawn_blocking(move || {

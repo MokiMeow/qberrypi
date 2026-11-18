@@ -47,6 +47,8 @@ use crate::lists::snapshot::{self, Loaded, SNAPSHOT_PATH};
 use crate::lists::{Lists, Source, refresh};
 use crate::live;
 use crate::logbuf::LogBuf;
+use crate::names::{DenyList, OwnerList};
+use crate::panel::lock::PanelState;
 use crate::selftest;
 use crate::sntp::Sntp;
 use crate::status::{self, Status};
@@ -63,7 +65,7 @@ use crate::watch::store::AlertStore;
 use crate::watch::{Event, Watch, analysis, devwatch, feed};
 use crate::wifi;
 use crate::wiring::{
-    self, Extras, Live, LiveDevices, PROC_WIRELESS, SharedResolver, SignalCache, Slot,
+    self, Extras, Live, LiveDevices, LiveNames, PROC_WIRELESS, SharedResolver, SignalCache, Slot,
 };
 
 /// The threads of the blocking pool, beside the runtime's own: the most blocking jobs that run
@@ -171,6 +173,10 @@ struct Shared {
     alerts: Arc<AlertStore>,
     /// The devices that the device watch has heard, and the known list that the API sets.
     devices: Arc<Mutex<Devices>>,
+    /// The owner's allowed and refused names, which the panel and the API edit.
+    names: Arc<OwnerList>,
+    /// The panel's lock and night hours, which the panel and the API edit.
+    panel: Arc<PanelState>,
     /// The receiving end of the resolver's feed and the behaviour detectors, until the analysis
     /// component's first start takes them: the feed has one receiver, so there is one analysis.
     analysis: Analysis,
@@ -272,6 +278,8 @@ impl Lazy {
                 .with_watch(Arc::new(QbpWatch {
                     alerts: shared.alerts.clone(),
                     devices: shared.devices.clone(),
+                    names: shared.names.clone(),
+                    panel: shared.panel.clone(),
                 }))
                 .with_update(receive::Receiver::new(
                     self.ctx.update.clone(),
@@ -347,6 +355,28 @@ impl Lazy {
             dns: dns.clone(),
             lane: slot.lane(),
         }));
+        // The owner's names: one list, which the panel and the API both edit.
+        let names = Arc::new(OwnerList::new(SharedResolver::of(&dns)));
+        slot.fill_names(Arc::new(LiveNames {
+            list: names.clone(),
+            resolver: SharedResolver::of(&dns),
+            deny: DenyList::new(&cfg.dns.deny),
+            clock_set: {
+                let synced = synced.clone();
+                Arc::new(move || *synced.borrow())
+            },
+        }));
+        // The lock and the night hours: one state, which the panel and the API both edit. It starts
+        // from the configuration's PIN and hours, and waits by the DNS task's monotonic clock.
+        let panel = Arc::new(PanelState::new(
+            cfg.panel_boot.pin_hash.clone(),
+            cfg.panel_boot.night,
+            {
+                let clock = dns.clone();
+                Arc::new(move || clock.now().mono_secs)
+            },
+        ));
+        slot.fill_lock(panel.clone());
         dns.set_lane(slot.lane());
 
         let status = Status {
@@ -371,6 +401,8 @@ impl Lazy {
             client,
             alerts,
             devices,
+            names,
+            panel,
             analysis,
         }
     }
@@ -862,7 +894,8 @@ fn snapshot_outcome(job: io::Result<Loaded>, deny: &[String], allow: &[String]) 
 
 /// The self-test of the DNS and status servers and of the API, for the boot in QEMU that asks for
 /// it: waits for `lo`, asks the servers over it, logs in to the API with the card's certificate
-/// as the pin, and logs what they said, then this process's resident memory. It is started once
+/// as the pin, reads the devices, has the owner refuse a made-up name and clear it again and reads the
+/// panel's night hours and lock, and logs what they said, then this process's resident memory. It is started once
 /// the DNS and status servers have bound; the API, which binds later, is waited for.
 async fn dns_selftest(tls_pem: Option<&'static [u8]>) {
     let flags = Path::new(selftest::LO_FLAGS);
@@ -876,6 +909,17 @@ async fn dns_selftest(tls_pem: Option<&'static [u8]>) {
     }
     let api = SocketAddr::from((Ipv4Addr::LOCALHOST, api::PORT));
     let line = selftest::api(api, tls_pem, selftest::API_PASSWORD, selftest::API_WAIT).await;
+    log::info!("{line}");
+    let line = selftest::names(
+        api,
+        dns,
+        tls_pem,
+        selftest::API_PASSWORD,
+        selftest::API_WAIT,
+    )
+    .await;
+    log::info!("{line}");
+    let line = selftest::panel(api, tls_pem, selftest::API_PASSWORD, selftest::API_WAIT).await;
     log::info!("{line}");
     log::info!("selftest: dns: done");
     log::info!("{}", selftest::vmrss_line());
@@ -1949,6 +1993,7 @@ mod tests {
             bssid: [0x00, 0x00, 0x5e, 0x00, 0x53, 0x01],
             freq_mhz: 5180,
             signal_mbm: -5600,
+            since_secs: 0,
         }
     }
 

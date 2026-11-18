@@ -14,7 +14,7 @@
 //! - **The left column** under the lane: the share (`y < 148`) is a door to NAMES, and the clock, `y >= 148`
 //!   down to the key, to SYSTEM. **The funnel and the count** (`x >= 120`) are doors to NAMES too.
 //!
-//! NAMES does not exist in Phase 1 (ruling R1), so its three doors are inert; SYSTEM is the ABOUT reading.
+//! The share, the funnel and the count are doors to NAMES; SYSTEM is the ABOUT reading.
 //! Strong actions are unguarded, and the gate is not one (spec §7.1).
 
 use crate::geometry::Rect;
@@ -89,7 +89,7 @@ pub fn decide(nav: &Nav, world: &World, x: u16, y: u16) -> Tap {
         };
     }
     if x < LEFT_COLUMN_W {
-        // The share is a door to NAMES, which Phase 1 has not; the clock is SYSTEM's.
+        // The share is a door to NAMES; the clock is SYSTEM's.
         return if y < SHARE_END_Y {
             names_door()
         } else {
@@ -103,9 +103,9 @@ pub fn decide(nav: &Nav, world: &World, x: u16, y: u16) -> Tap {
     Tap::None
 }
 
-/// The share's, the funnel's and the count's door to NAMES: inert until NAMES exists (ruling R1).
+/// The share's, the funnel's and the count's door to NAMES.
 fn names_door() -> Tap {
-    Tap::None
+    Tap::Nav(Change::Go(Section::Names))
 }
 
 #[cfg(test)]
@@ -339,20 +339,21 @@ mod tests {
     }
 
     #[test]
-    fn the_clock_column_is_system_and_the_share_and_the_field_are_the_inert_doors_to_names() {
+    fn the_clock_column_is_system_and_the_share_and_the_field_are_doors_to_names() {
         let (nav, world) = live();
+        let names = Tap::Nav(Change::Go(Section::Names));
         let system = Tap::Nav(Change::Go(Section::System));
         // The clock: x < 96, from y 148 down to the key's target.
         for (x, y) in [(0, 148), (50, 190), (95, 211), (10, 160)] {
             assert_eq!(decide(&nav, &world, x, y), system, "({x}, {y})");
         }
-        // The share, above it: NAMES, which Phase 1 does not have.
+        // The share, above it: NAMES.
         for (x, y) in [(0, 72), (50, 114), (95, 147)] {
-            assert_eq!(decide(&nav, &world, x, y), Tap::None, "({x}, {y})");
+            assert_eq!(decide(&nav, &world, x, y), names, "({x}, {y})");
         }
-        // The funnel and the count: NAMES too, inert.
+        // The funnel and the count: NAMES too.
         for (x, y) in [(120, 72), (300, 150), (300, 280), (479, 319), (200, 236)] {
-            assert_eq!(decide(&nav, &world, x, y), Tap::None, "({x}, {y})");
+            assert_eq!(decide(&nav, &world, x, y), names, "({x}, {y})");
         }
         // The gate's own column between the left column and the field, and the rails above the field.
         for (x, y) in [(96, 100), (119, 300), (100, 230)] {
@@ -387,7 +388,7 @@ mod tests {
 
     #[test]
     fn live_taps_do_nothing_when_something_covers_it() {
-        // A state of the whole system answers nothing (P3's own keys), whatever LIVE would have done.
+        // A state of the whole system answers nothing (their own keys, which are not LIVE's), whatever LIVE would have done.
         let (mut nav, world) = live();
         nav.set_whole(Some(crate::os::nav::Whole::Update));
         for (x, y) in [(50, 260), (10, 40), (50, 190)] {

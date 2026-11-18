@@ -7,14 +7,25 @@
 //! touches any of it: the statistics read what the last tick left, under a lock that only the
 //! tick and a request of the statistics take, and the block set's and the cache's sizes, which
 //! the resolver keeps as it goes, are read under the lock the statistics take for their counts.
+//!
+//! The front panel's SYSTEM screens read the board itself, with [`Readings`]: the uptime, the load, the
+//! memory in use and the heat, from `/proc` and `/sys` on the caller's own thread (the panel's, never the
+//! runtime's) every few seconds while one of those screens shows. Each figure is parsed from the text of
+//! its file by a function of its own, and one that the board cannot give is `None`.
 
 use std::collections::VecDeque;
 use std::fs;
+use std::path::Path;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use qb_bench::cpu::{CoreTimes, busy_percent, parse_cores, task_ticks, ticks_per_second};
 use serde_json::{Value, json};
+
+use crate::thermal::{self, BOARD_TEMP};
+
+/// Where the kernel keeps the files [`Readings`] reads.
+pub const PROC: &str = "/proc";
 
 /// How far back the busy shares reach: the newest reading against the newest that is at least
 /// this much older, or against the oldest kept while there is none yet.
@@ -98,6 +109,74 @@ pub fn read_rss_kib() -> Option<u64> {
     fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|text| rss_kib(&text))
+}
+
+/// What the panel reads of the board itself, for UP and the SYSTEM wall: how long it has run, how busy it
+/// has been over the last minute, how much of its memory is in use, and how hot it is. A figure that
+/// could not be read, or whose file said something that is none, is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Readings {
+    /// The seconds since the kernel started (`/proc/uptime`).
+    pub uptime_secs: Option<u64>,
+    /// The load over the last minute in hundredths: `21` is `0.21` (`/proc/loadavg`).
+    pub load_hundredths: Option<u32>,
+    /// The share of the memory in use, in whole per cent: what is not `MemAvailable` of `MemTotal`
+    /// (`/proc/meminfo`).
+    pub memory_pct: Option<u8>,
+    /// The processor's temperature in whole degrees Celsius (`thermal::read_c`).
+    pub temp_c: Option<i8>,
+}
+
+impl Readings {
+    /// The readings of the running board, taken now on the calling thread: four small files of the
+    /// kernel's, microseconds each. Call it from the panel's thread, never from the runtime's.
+    pub fn read() -> Self {
+        Self::read_from(Path::new(PROC), Path::new(BOARD_TEMP))
+    }
+
+    /// The readings of the files `uptime`, `loadavg` and `meminfo` of `proc` and the temperature file
+    /// `temp`, so that a test can read fixtures.
+    pub fn read_from(proc: &Path, temp: &Path) -> Self {
+        let text = |name: &str| fs::read_to_string(proc.join(name)).ok();
+        Self {
+            uptime_secs: text("uptime").as_deref().and_then(parse_uptime),
+            load_hundredths: text("loadavg").as_deref().and_then(parse_load),
+            memory_pct: text("meminfo").as_deref().and_then(parse_memory_pct),
+            temp_c: thermal::read_c(temp),
+        }
+    }
+}
+
+/// The whole seconds of the first number of a `/proc/uptime` text (`12345.67 54321.00`).
+pub fn parse_uptime(text: &str) -> Option<u64> {
+    let secs: f64 = text.split_whitespace().next()?.parse().ok()?;
+    (secs.is_finite() && secs >= 0.0).then_some(secs as u64)
+}
+
+/// The load of the last minute, in hundredths, from a `/proc/loadavg` text (`0.21 0.15 0.10 1/123 4567`).
+pub fn parse_load(text: &str) -> Option<u32> {
+    let load: f64 = text.split_whitespace().next()?.parse().ok()?;
+    (load.is_finite() && (0.0..1_000_000.0).contains(&load)).then(|| (load * 100.0).round() as u32)
+}
+
+/// The share of the memory in use, in whole per cent, from a `/proc/meminfo` text: `MemTotal` less
+/// `MemAvailable`, of `MemTotal`. `None` when either line is missing or the total is none.
+pub fn parse_memory_pct(text: &str) -> Option<u8> {
+    let kib = |key: &str| -> Option<u64> {
+        text.lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()
+    };
+    let (total, available) = (kib("MemTotal")?, kib("MemAvailable")?);
+    if total == 0 {
+        return None;
+    }
+    let used = total.saturating_sub(available.min(total));
+    // At most 100, so a byte holds it.
+    Some(((u128::from(used) * 100 + u128::from(total) / 2) / u128::from(total)) as u8)
 }
 
 /// The readings, for the tick to write and the statistics to read.
@@ -207,6 +286,107 @@ mod tests {
         let text = "Name:\tqberrypi\nVmPeak:\t  9000 kB\nVmRSS:\t  4321 kB\nThreads:\t7\n";
         assert_eq!(rss_kib(text), Some(4321));
         assert_eq!(rss_kib("Name:\tx\n"), None);
+    }
+
+    #[test]
+    fn the_uptime_is_the_whole_seconds_of_the_first_number() {
+        assert_eq!(parse_uptime("12345.67 54321.00\n"), Some(12_345));
+        assert_eq!(parse_uptime("0.99 0.00\n"), Some(0));
+        assert_eq!(parse_uptime("90061 1\n"), Some(90_061));
+        for bad in ["", "\n", "up 1\n", "-3.0 1.0\n", "nan 1\n", "inf 1\n"] {
+            assert_eq!(parse_uptime(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_load_is_the_minute_figure_in_hundredths() {
+        assert_eq!(parse_load("0.21 0.15 0.10 1/123 4567\n"), Some(21));
+        assert_eq!(parse_load("12.50 3.00 1.00 2/200 9\n"), Some(1250));
+        assert_eq!(parse_load("0.00 0.00 0.00 1/1 1\n"), Some(0));
+        // The kernel's two decimals are rounded, not cut, should it ever give a third.
+        assert_eq!(parse_load("0.125 0 0 1/1 1"), Some(13));
+        for bad in ["", "\n", "busy\n", "-0.5 0 0 1/1 1\n", "NaN 0 0 1/1 1\n"] {
+            assert_eq!(parse_load(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_memory_in_use_is_what_is_not_available_of_the_total() {
+        let meminfo = "MemTotal:         948304 kB\nMemFree:          100000 kB\nMemAvailable:     587968 kB\nBuffers:            1000 kB\n";
+        // 360,336 of 948,304 kB is 38.0 per cent.
+        assert_eq!(parse_memory_pct(meminfo), Some(38));
+        let all_free = "MemTotal: 1000 kB\nMemAvailable: 1000 kB\n";
+        let none_free = "MemTotal: 1000 kB\nMemAvailable: 0 kB\n";
+        assert_eq!(parse_memory_pct(all_free), Some(0));
+        assert_eq!(parse_memory_pct(none_free), Some(100));
+        // More available than there is (a kernel's rounding): none in use.
+        assert_eq!(
+            parse_memory_pct("MemTotal: 1000 kB\nMemAvailable: 1200 kB\n"),
+            Some(0)
+        );
+        // `MemTotal` is not taken for a line that only begins with it, and a line without both is no figure.
+        assert_eq!(
+            parse_memory_pct("MemTotalX: 5 kB\nMemAvailable: 1 kB\n"),
+            None
+        );
+        assert_eq!(parse_memory_pct("MemTotal: 1000 kB\n"), None);
+        assert_eq!(parse_memory_pct("MemAvailable: 1000 kB\n"), None);
+        assert_eq!(
+            parse_memory_pct("MemTotal: 0 kB\nMemAvailable: 0 kB\n"),
+            None
+        );
+        assert_eq!(
+            parse_memory_pct("MemTotal: lots\nMemAvailable: 1 kB\n"),
+            None
+        );
+        assert_eq!(parse_memory_pct(""), None);
+    }
+
+    #[test]
+    fn the_readings_come_from_the_files_and_each_figure_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = dir.path();
+        let temp = dir.path().join("temp");
+        // No file: no figure.
+        assert_eq!(Readings::read_from(proc, &temp), Readings::default());
+        fs::write(proc.join("uptime"), "90061.50 1.00\n").unwrap();
+        fs::write(proc.join("loadavg"), "0.21 0.15 0.10 1/123 4567\n").unwrap();
+        fs::write(
+            proc.join("meminfo"),
+            "MemTotal: 1000 kB\nMemAvailable: 620 kB\n",
+        )
+        .unwrap();
+        fs::write(&temp, "46500\n").unwrap();
+        assert_eq!(
+            Readings::read_from(proc, &temp),
+            Readings {
+                uptime_secs: Some(90_061),
+                load_hundredths: Some(21),
+                memory_pct: Some(38),
+                temp_c: Some(47),
+            }
+        );
+        // A file that says nothing leaves its own figure unknown and the others as they were.
+        fs::write(proc.join("loadavg"), "garbage\n").unwrap();
+        fs::remove_file(&temp).unwrap();
+        let readings = Readings::read_from(proc, &temp);
+        assert_eq!(
+            (
+                readings.uptime_secs,
+                readings.load_hundredths,
+                readings.memory_pct,
+                readings.temp_c
+            ),
+            (Some(90_061), None, Some(38), None)
+        );
+    }
+
+    #[test]
+    fn the_running_board_gives_its_uptime_load_and_memory() {
+        let readings = Readings::read();
+        assert!(readings.uptime_secs.is_some_and(|secs| secs > 0));
+        assert!(readings.load_hundredths.is_some());
+        assert!(readings.memory_pct.is_some_and(|pct| pct <= 100));
     }
 
     #[test]

@@ -8,8 +8,11 @@
 //! `crates/qb-panel/tests/reference`.
 //!
 //! Or it is one screen of the panel's OS: `--screen home`, `home-alert`, `home-open`, `gate`, `live`,
-//! `live-gate`, `devices`, `device`, `confirm`, `pause`, `alert` or `about` (every still of
-//! `qb_panel::os::fixture::Still`). The frame is drawn as the goldens draw it, from the same world and
+//! `live-gate`, `devices`, `device`, `confirm`, `pause`, the ALERTS and NAMES screens (`alerts`,
+//! `alerts-none`, `alert`, `names`, `yours`, `name`, `name-locked`, `name-threat`), `about`, SYSTEM's
+//! (`system`, `version`, `wifi`, `uptime`, `nighthours`, `lock`) and the states of the whole system (`boot`,
+//! `night`, `pin`, `update-receiving`, `update-trial`, `update-confirmed`, `update-rolledback`): every still of
+//! `qb_panel::os::fixture::Still`. The frame is drawn as the goldens draw it, from the same world and
 //! navigation and through the same `screens::{view_of, draw}` (or, for LIVE, the Drain's painter), so the
 //! PNG is the pixels of `os-<screen>.png` in the references. `--screen` and `--state` are alternatives.
 //!
@@ -115,7 +118,9 @@ pub struct PreviewArgs {
     #[arg(long, value_enum, default_value_t = State::Normal)]
     pub state: State,
     /// Draw this screen of the panel's OS instead of a Drain still: home, home-alert, home-open, gate,
-    /// live, live-gate, devices, device, confirm, pause, alert or about
+    /// live, live-gate, devices, device, confirm, pause, alerts, alerts-none, alert, names, yours, name,
+    /// name-locked, name-threat, about, system, version, wifi, uptime, nighthours, lock, boot, night, pin,
+    /// update-receiving, update-trial, update-confirmed or update-rolledback
     #[arg(long, value_name = "screen", value_parser = screen_still, conflicts_with = "state")]
     pub screen: Option<Still>,
 }
@@ -619,6 +624,52 @@ mod tests {
             for b in &frames[i + 1..] {
                 assert!(a != b);
             }
+        }
+    }
+
+    /// The stills of the states of the whole system and of SYSTEM's readings (phase 3), by the names the preview
+    /// takes: each is a screen, written by the command as a PNG that is the pixels of its reference.
+    const PHASE_THREE: [&str; 13] = [
+        "system",
+        "wifi",
+        "version",
+        "uptime",
+        "nighthours",
+        "lock",
+        "boot",
+        "night",
+        "pin",
+        "update-receiving",
+        "update-trial",
+        "update-confirmed",
+        "update-rolledback",
+    ];
+
+    #[test]
+    fn every_still_of_phase_three_is_a_screen_the_command_writes_as_its_reference() {
+        let root = tempfile::tempdir().unwrap();
+        for name in PHASE_THREE {
+            let out = root.path().join(format!("{name}.png"));
+            let args = parse(&["--screen", name, "--out", out.to_str().unwrap()]).unwrap();
+            run(&args, root.path()).unwrap();
+            let (width, height, colour, depth, pixels) = decode(&fs::read(&out).unwrap());
+            assert_eq!(
+                (width, height, colour, depth),
+                (480, 320, png::ColorType::Rgba, png::BitDepth::Eight),
+                "{name}"
+            );
+            assert!(
+                pixels == os_reference(name),
+                "--screen {name} is not the pixels of os-{name}.png"
+            );
+        }
+        // Every one of them is one of the stills the loop's tests and the goldens keep, and the help names it.
+        let help = <Line as clap::CommandFactory>::command()
+            .render_long_help()
+            .to_string();
+        for name in PHASE_THREE {
+            assert!(Still::from_name(name).is_some(), "{name}");
+            assert!(help.contains(name), "{name}: {help}");
         }
     }
 

@@ -1063,6 +1063,7 @@ mod tests {
                 signal_dbm: Some(-61),
                 ap: Some("00:00:5e:00:53:01".to_owned()),
                 freq_mhz: Some(5180),
+                joined_secs: None,
             }),
             board_c: Arc::new(|| Some(51)),
             ..status

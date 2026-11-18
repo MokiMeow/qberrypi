@@ -1,8 +1,9 @@
 //! `cargo xtask hash-password`: turns the password for the Pi-hole API's login into the
-//! `password_hash` line that `qberrypi.toml` holds under `[api]`.
+//! `password_hash` line that `qberrypi.toml` holds under `[api]`. `cargo xtask hash-pin` does the same for
+//! the front panel's PIN: four digits, 10,000 rounds, the `pin_hash` line under `[panel]`.
 //!
-//! The password is read from standard input, never from a terminal and never from an argument,
-//! and is never printed; its buffers are wiped when they are dropped.
+//! The password (or PIN) is read from standard input, never from a terminal and never from an argument,
+//! so it is never shown; it is never printed either, and its buffers are wiped when they are dropped.
 //!
 //! A password that could never log in is refused here, not found out at the first login: one that
 //! is not UTF-8, which qnet cannot send in JSON, and one whose login request would be over the
@@ -14,7 +15,7 @@ use std::io::{self, IsTerminal, Read, Write};
 
 use anyhow::{Context, Result, bail, ensure};
 use qberrypi::api::http::MAX_BODY;
-use qberrypi::api::password::PasswordHash;
+use qberrypi::api::password::{PIN_ROUNDS, PasswordHash};
 use zeroize::Zeroizing;
 
 /// The most bytes of password that standard input may hold, before the line ending.
@@ -38,6 +39,18 @@ pub fn hash_line(password: &[u8], salt: [u8; 16]) -> Result<String> {
     );
     let hash = PasswordHash::new(password, salt);
     Ok(format!("password_hash = \"{}\"", hash.to_text()))
+}
+
+/// The `pin_hash = "..."` line for `pin` with `salt`: PBKDF2 with [`PIN_ROUNDS`] rounds over the four ASCII
+/// digits, which is what the panel's lock checks the pad's digits against. An error for anything but exactly
+/// four ASCII digits; it holds none of what was given.
+pub fn pin_line(pin: &[u8], salt: [u8; 16]) -> Result<String> {
+    ensure!(
+        pin.len() == 4 && pin.iter().all(u8::is_ascii_digit),
+        "the PIN must be exactly four digits, 0 to 9"
+    );
+    let hash = PasswordHash::with_rounds(pin, salt, PIN_ROUNDS);
+    Ok(format!("pin_hash = \"{}\"", hash.to_text()))
 }
 
 /// The bytes of the login request body that qnet sends for `password`, `{"password":"..."}` in
@@ -70,6 +83,19 @@ pub fn run() -> Result<()> {
     let line = hash_line(&password, random_salt()?)?;
     println!("{line}");
     eprintln!("put this line under [api] in qberrypi.toml");
+    Ok(())
+}
+
+/// Reads the four digits of a PIN from standard input, as [`run`] reads a password (a pipe or a file, never a
+/// terminal, one line ending dropped), and prints its `pin_hash` line on standard output, with a hint for
+/// what to do with it on standard error.
+pub fn run_pin() -> Result<()> {
+    let pin = read_password_from_stdin()?;
+    let line = pin_line(&pin, random_salt()?)?;
+    println!("{line}");
+    eprintln!(
+        "put this line under [panel] in qberrypi.toml; it is the PIN for this card until you change it"
+    );
     Ok(())
 }
 
@@ -157,6 +183,65 @@ mod tests {
         let text = PasswordHash::new(b"example", [0; 16]).to_text();
         assert_eq!(line, format!("password_hash = \"{text}\""));
         assert!(PasswordHash::parse(&text).is_some());
+    }
+
+    #[test]
+    fn the_pin_line_is_the_hash_of_four_ascii_digits_with_the_rounds_of_a_pin() {
+        let line = pin_line(b"1234", [0; 16]).unwrap();
+        let text = line
+            .strip_prefix("pin_hash = \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("the line is `pin_hash = \"...\"`");
+        assert!(text.starts_with("$pbkdf2-sha256$i=10000$"), "{text}");
+        assert_eq!(PIN_ROUNDS, 10_000);
+        let hash = PasswordHash::parse(text).unwrap();
+        assert_eq!(hash.rounds(), 10_000);
+        assert!(hash.verify(b"1234") && !hash.verify(b"1235") && !hash.verify(b"4321"));
+        // The panel's lock reads the config's line as it reads the one hash-pin prints: the pad's digits
+        // 1, 2, 3 and 4 are right.
+        let lock = qberrypi::panel::lock::Lock::new(
+            qberrypi::panel::lock::parse_pin_hash(text),
+            std::sync::Arc::new(|| 0),
+        );
+        let right = lock.verify(Zeroizing::new([1, 2, 3, 4]));
+        assert_eq!(right, qberrypi::panel::lock::Check::Right);
+        let wrong = lock.verify(Zeroizing::new([1, 2, 3, 5]));
+        assert_eq!(wrong, qberrypi::panel::lock::Check::Wrong);
+        // A PIN may start with a zero, and the same PIN gets another line with another salt.
+        assert!(pin_line(b"0000", [0; 16]).is_ok() && pin_line(b"0509", [1; 16]).is_ok());
+        assert_ne!(line, pin_line(b"1234", [1; 16]).unwrap());
+    }
+
+    #[test]
+    fn anything_but_four_ascii_digits_gets_no_pin_line_and_the_error_holds_none_of_it() {
+        for bad in [
+            &b""[..],
+            b"1",
+            b"123",
+            b"12345",
+            b"12a4",
+            b"abcd",
+            b" 123",
+            b"123 ",
+            b"1 2 ",
+            b"-123",
+            b"+123",
+            b"12.4",
+            b"\xd9\xa1\xd9\xa2",
+            b"12\xff4",
+            b"\x001234",
+            b"1234\n",
+            b"secret-pin",
+        ] {
+            let e = pin_line(bad, [0; 16]).unwrap_err();
+            assert_eq!(e.to_string(), "the PIN must be exactly four digits, 0 to 9");
+            assert!(!format!("{e:#}").contains("secret") && !format!("{e:#}").contains("123"));
+        }
+        // What is read from a pipe loses its one line ending first.
+        let read = read_password(Cursor::new(b"4821\n")).unwrap();
+        assert!(pin_line(&read, [0; 16]).is_ok());
+        let read = read_password(Cursor::new(b"4821\n\n")).unwrap();
+        assert!(pin_line(&read, [0; 16]).is_err());
     }
 
     #[test]

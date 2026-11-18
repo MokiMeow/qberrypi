@@ -12,11 +12,17 @@
 //! either direction, counts from outside the 24 hours before the time asked for are not shown,
 //! and new queries are counted at once.
 //!
+//! Each tracked name also has its count for the local day, and the [`TOP_NAMES`] names blocked
+//! most often that day are kept in a list of their own, [`Stats::top_today`]. A block updates
+//! both with a few comparisons and no scan. A change of the local day, in either direction, starts
+//! the day's counts over: the list at once, and each name's count when the name is next blocked.
+//!
 //! Everything is bounded: the log never holds more entries than its capacity, the tracker never
-//! more names than its own, each with 24 hourly counts, and the history exactly 144 buckets of 40
-//! bytes. Nothing but the history is reserved up front; the rest grows with what is recorded. All
-//! arithmetic on counts and times is saturating, or cannot leave its range: no time, offset, name
-//! or count makes a call panic or wrap.
+//! more names than its own, each with 24 hourly counts and one for the day, the day's list
+//! [`TOP_NAMES`] names, and the history exactly 144 buckets of 40 bytes. Nothing but the history
+//! is reserved up front; the rest grows with what is recorded. All arithmetic on counts and times
+//! is saturating, or cannot leave its range: no time, offset, name or count makes a call panic or
+//! wrap.
 //!
 //! The names are stored as given, so the bounds in bytes follow the longest name. With the
 //! capacities [`Resolver`](crate::Resolver) uses and the names it records, which are up to 1,003
@@ -32,6 +38,8 @@ use crate::lru::Lru;
 pub const QUERY_LOG_CAPACITY: usize = 50_000;
 /// The number of blocked names whose 24-hour counts are kept; the least recently blocked goes.
 pub const BLOCKED_NAMES_TRACKED: usize = 1_024;
+/// The number of names [`Stats::top_today`] lists.
+pub const TOP_NAMES: usize = 8;
 
 /// The seconds one history bucket covers.
 pub const BUCKET_SECS: u64 = 600;
@@ -137,22 +145,39 @@ pub struct LastBlocked {
     pub count_24h: u32,
 }
 
-/// How often one name was blocked in each of the 24 monotonic hours ending at `hour`.
+/// How often one name was blocked in each of the 24 monotonic hours ending at `hour`, and how
+/// often in the local day it was last blocked in.
 struct HourlyBlocks {
     /// The latest hour in which the name was blocked.
     hour: u64,
     /// The blocks of hour `h` are in bucket `h % 24`, for the 24 hours ending at `hour`. Each
     /// stays at `u16::MAX` once full.
     buckets: [u16; WINDOW_HOURS],
+    /// The [`Stats::epoch`] that `today` counts: the local day it was last blocked in.
+    epoch: u32,
+    /// The blocks in that day. Stays at `u32::MAX` once full.
+    today: u32,
 }
 
 impl HourlyBlocks {
-    /// No blocks yet, as of `hour`.
-    fn new(hour: u64) -> Self {
+    /// No blocks yet, as of `hour`, in the day numbered `epoch`.
+    fn new(hour: u64, epoch: u32) -> Self {
         Self {
             hour,
             buckets: [0; WINDOW_HOURS],
+            epoch,
+            today: 0,
         }
+    }
+
+    /// Counts one block in the day numbered `epoch` and returns the day's count: the count starts
+    /// again at 1 if the name was last blocked in another day.
+    fn add_today(&mut self, epoch: u32) -> u32 {
+        if self.epoch != epoch {
+            (self.epoch, self.today) = (epoch, 0);
+        }
+        self.today = self.today.saturating_add(1);
+        self.today
     }
 
     /// The bucket that holds the blocks of `hour`.
@@ -195,6 +220,24 @@ impl HourlyBlocks {
     }
 }
 
+/// One name of the most blocked names of the local day.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TopName {
+    /// The name, as it was recorded.
+    pub name: Box<str>,
+    /// How often it was blocked today.
+    pub count: u32,
+}
+
+impl core::fmt::Debug for TopName {
+    /// The count only: the name is something the house asked for.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TopName")
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The counters, the most recently blocked name, the ten-minute history and the log of recent
 /// queries.
 pub struct Stats {
@@ -202,6 +245,10 @@ pub struct Stats {
     utc_offset: i32,
     /// The local day of the latest record, as days since the epoch; `None` before the first.
     day: Option<i64>,
+    /// Which stretch of one local day `today` and the blocked names' day counts belong to: it
+    /// goes up every time `day` changes, so that a wall clock that steps back to a day it has
+    /// left does not bring that day's old counts back.
+    epoch: u32,
     /// The counts of `day`.
     today: Counts,
     /// The counts since start.
@@ -218,6 +265,9 @@ pub struct Stats {
     blocked: Lru<Box<str>, HourlyBlocks>,
     /// The name blocked last and the wall-clock time of that block.
     last_blocked: Option<(Box<str>, u64)>,
+    /// The names blocked most often in the local day of the latest record, most often first; of
+    /// two with the same count, the one that reached it first. At most [`TOP_NAMES`].
+    top: Vec<TopName>,
 }
 
 impl Stats {
@@ -229,6 +279,7 @@ impl Stats {
         Self {
             utc_offset: 0,
             day: None,
+            epoch: 0,
             today: Counts::default(),
             total: Counts::default(),
             history: [HistoryBucket::default(); HISTORY_BUCKETS],
@@ -236,6 +287,7 @@ impl Stats {
             log: VecDeque::new(),
             blocked: Lru::new(tracked_names),
             last_blocked: None,
+            top: Vec::new(),
         }
     }
 
@@ -259,15 +311,22 @@ impl Stats {
         if outcome == Outcome::Blocked {
             let hour = now.mono_secs / HOUR_SECS;
             let key: Box<str> = name.into();
-            match self.blocked.get_mut(&key) {
-                Some(blocks) => blocks.add(hour),
-                None => {
-                    let mut blocks = HourlyBlocks::new(hour);
+            let epoch = self.epoch;
+            let count = match self.blocked.get_mut(&key) {
+                Some(blocks) => {
                     blocks.add(hour);
+                    blocks.add_today(epoch)
+                }
+                None => {
+                    let mut blocks = HourlyBlocks::new(hour, epoch);
+                    blocks.add(hour);
+                    let count = blocks.add_today(epoch);
                     // Whichever name this evicts was blocked least recently.
                     self.blocked.insert(key.clone(), blocks);
+                    count
                 }
-            }
+            };
+            self.note_top(&key, count);
             self.last_blocked = Some((key, now.unix_secs));
         }
 
@@ -283,6 +342,67 @@ impl Stats {
             qtype,
             outcome,
         });
+    }
+
+    /// Puts one more block of `name` in the list of the most blocked names of the day. `count` is
+    /// the name's count for the day, which the tracker has just worked out.
+    ///
+    /// A few comparisons and, only when `name` enters the list, one copy of it: the per-block
+    /// copy of `record` already allocates more than this. A name that is on the list is counted
+    /// there, so one that the tracker lost to a newer name and began again does not fall back.
+    fn note_top(&mut self, name: &str, count: u32) {
+        let mut at = if let Some(at) = self.top.iter().position(|top| &*top.name == name) {
+            if let Some(top) = self.top.get_mut(at) {
+                top.count = top.count.saturating_add(1).max(count);
+            }
+            at
+        } else if self.top.len() < TOP_NAMES {
+            self.top.push(TopName {
+                name: name.into(),
+                count,
+            });
+            self.top.len().saturating_sub(1)
+        } else {
+            let last = self.top.len().saturating_sub(1);
+            match self.top.last_mut() {
+                // Only a name that beats the least of them takes its place.
+                Some(least) if count > least.count => {
+                    *least = TopName {
+                        name: name.into(),
+                        count,
+                    };
+                    last
+                }
+                _ => return,
+            }
+        };
+        // Up past every name that it now beats; a name it ties stays ahead of it.
+        while let Some(before) = at.checked_sub(1) {
+            let beats = matches!(
+                (self.top.get(before), self.top.get(at)),
+                (Some(ahead), Some(this)) if ahead.count < this.count
+            );
+            if !beats {
+                break;
+            }
+            self.top.swap(before, at);
+            at = before;
+        }
+    }
+
+    /// The names blocked most often in the local day of `now`, most often first, at most
+    /// [`TOP_NAMES`] of them: empty if that is another day than the latest record's, as
+    /// [`today`](Self::today) is. A copy of eight names at most, with no scan.
+    ///
+    /// The counts are those of the names the tracker holds ([`BLOCKED_NAMES_TRACKED`]): a name
+    /// that the tracker dropped for newer ones and that was then blocked again counts only from
+    /// that block, unless it was on the list, which counts it itself.
+    pub fn top_today(&self, now: Now) -> Vec<TopName> {
+        if self.day == Some(self.local_day(now)) {
+            self.top.clone()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Counts the query that [`record`](Self::record) has just recorded as a block of a threat
@@ -409,6 +529,9 @@ impl Stats {
         if self.day != Some(day) {
             self.day = Some(day);
             self.today = Counts::default();
+            // The names' day counts are of the day that has ended, and the list with them.
+            self.epoch = self.epoch.wrapping_add(1);
+            self.top.clear();
         }
     }
 
@@ -635,6 +758,271 @@ mod tests {
             }
         );
         assert_eq!(s.blocked.len(), 2);
+    }
+
+    /// The most blocked names of the day of `unix_secs`, as `(name, count)`.
+    fn top(s: &Stats, unix_secs: u64) -> Vec<(String, u32)> {
+        s.top_today(at(1, unix_secs))
+            .into_iter()
+            .map(|top| (top.name.into(), top.count))
+            .collect()
+    }
+
+    /// Blocks `name` `times` times at the wall clock `unix_secs`.
+    fn block(s: &mut Stats, name: &str, times: u32, unix_secs: u64) {
+        for _ in 0..times {
+            s.record(name, 1, Outcome::Blocked, at(1, unix_secs));
+        }
+    }
+
+    #[test]
+    fn the_top_is_ordered_by_count_and_a_tie_by_who_got_there_first() {
+        let mut s = Stats::new(100, 10);
+        assert!(top(&s, MIDNIGHT_UTC).is_empty());
+        block(&mut s, "a.example.com", 2, MIDNIGHT_UTC);
+        block(&mut s, "b.example.com", 1, MIDNIGHT_UTC);
+        s.record("c.example.com", 1, Outcome::Forwarded, at(1, MIDNIGHT_UTC));
+        assert_eq!(
+            top(&s, MIDNIGHT_UTC),
+            [("a.example.com".into(), 2), ("b.example.com".into(), 1)]
+        );
+        // b catches up with a, and stays behind it: a was at 2 first.
+        block(&mut s, "b.example.com", 1, MIDNIGHT_UTC);
+        assert_eq!(
+            top(&s, MIDNIGHT_UTC),
+            [("a.example.com".into(), 2), ("b.example.com".into(), 2)]
+        );
+        // And passes it by going on.
+        block(&mut s, "b.example.com", 1, MIDNIGHT_UTC);
+        block(&mut s, "c.example.com", 3, MIDNIGHT_UTC);
+        assert_eq!(
+            top(&s, MIDNIGHT_UTC),
+            [
+                ("b.example.com".into(), 3),
+                ("c.example.com".into(), 3),
+                ("a.example.com".into(), 2)
+            ]
+        );
+        // The names are as recorded and the count is the day's, however it is spelled elsewhere.
+        assert_eq!(s.top_today(at(1, MIDNIGHT_UTC))[0].count, 3);
+    }
+
+    #[test]
+    fn the_top_holds_eight_and_a_name_must_beat_the_last_to_enter() {
+        let mut s = Stats::new(100, 100);
+        for (i, count) in [5, 4, 4, 3, 3, 3, 2, 2].into_iter().enumerate() {
+            block(&mut s, &format!("n{i}.example.com"), count, MIDNIGHT_UTC);
+        }
+        let full = top(&s, MIDNIGHT_UTC);
+        assert_eq!(full.len(), TOP_NAMES);
+        // A ninth name that only ties the last stays out, however often it is blocked up to that.
+        block(&mut s, "late.example.com", 2, MIDNIGHT_UTC);
+        assert_eq!(top(&s, MIDNIGHT_UTC), full);
+        // One more block beats it: the name that held the last place goes, and the newcomer takes
+        // its place in the order, behind the names that were at 3 before it and ahead of the 2.
+        block(&mut s, "late.example.com", 1, MIDNIGHT_UTC);
+        let after = top(&s, MIDNIGHT_UTC);
+        assert_eq!(after.len(), TOP_NAMES);
+        assert_eq!(after[5], ("n5.example.com".into(), 3));
+        assert_eq!(after[6], ("late.example.com".into(), 3));
+        assert_eq!(after[7], ("n6.example.com".into(), 2));
+        assert!(!after.iter().any(|(name, _)| name == "n7.example.com"));
+        // A name that came in under the least of them never makes the list.
+        block(&mut s, "low.example.com", 1, MIDNIGHT_UTC);
+        assert_eq!(top(&s, MIDNIGHT_UTC), after);
+    }
+
+    #[test]
+    fn the_top_starts_over_with_the_day_in_either_direction() {
+        let next = MIDNIGHT_UTC + 86_400;
+        let mut s = Stats::new(100, 10);
+        block(&mut s, "a.example.com", 3, MIDNIGHT_UTC);
+        assert_eq!(top(&s, MIDNIGHT_UTC), [("a.example.com".into(), 3)]);
+        // Before any query of the new day the list is the old day's, and not today's.
+        assert!(top(&s, next).is_empty());
+        block(&mut s, "b.example.com", 1, next);
+        block(&mut s, "a.example.com", 1, next);
+        assert_eq!(
+            top(&s, next),
+            [("b.example.com".into(), 1), ("a.example.com".into(), 1)]
+        );
+        // A name that was blocked on the day before counts from 1 again, not from 3.
+        assert_eq!(s.total().blocked, 5);
+        // The wall clock steps back to the first day: that day's counts are not brought back.
+        block(&mut s, "a.example.com", 1, MIDNIGHT_UTC);
+        assert_eq!(top(&s, MIDNIGHT_UTC), [("a.example.com".into(), 1)]);
+        assert!(top(&s, next).is_empty());
+        // The 24-hour count follows the monotonic clock and was not touched by any of it.
+        assert_eq!(s.last_blocked(at(1, 0)).unwrap().count_24h, 5);
+    }
+
+    #[test]
+    fn the_top_follows_the_local_day() {
+        let mut s = Stats::new(100, 10);
+        s.set_utc_offset(-18_000);
+        // Five hours behind UTC: 05:00 UTC is midnight where the clock is.
+        let midnight_local = MIDNIGHT_UTC + 18_000;
+        block(&mut s, "a.example.com", 1, midnight_local - 1);
+        block(&mut s, "a.example.com", 1, midnight_local - 100);
+        assert_eq!(top(&s, midnight_local - 1), [("a.example.com".into(), 2)]);
+        block(&mut s, "a.example.com", 1, midnight_local);
+        assert_eq!(top(&s, midnight_local), [("a.example.com".into(), 1)]);
+    }
+
+    #[test]
+    fn a_name_the_tracker_dropped_does_not_fall_back_on_the_list() {
+        // The tracker holds two names; the list holds up to eight.
+        let mut s = Stats::new(100, 2);
+        block(&mut s, "a.example.com", 5, MIDNIGHT_UTC);
+        block(&mut s, "b.example.com", 1, MIDNIGHT_UTC);
+        // Evicts a, whose count the tracker loses.
+        block(&mut s, "c.example.com", 2, MIDNIGHT_UTC);
+        assert_eq!(s.blocked.len(), 2);
+        assert!(s.blocked.peek(&"a.example.com".into()).is_none());
+        // The list still has a with its 5; blocked again it is 6, not 1.
+        block(&mut s, "a.example.com", 1, MIDNIGHT_UTC);
+        assert_eq!(
+            top(&s, MIDNIGHT_UTC),
+            [
+                ("a.example.com".into(), 6),
+                ("c.example.com".into(), 2),
+                ("b.example.com".into(), 1)
+            ]
+        );
+        // The tracker holds a again, from this block.
+        assert_eq!(
+            s.blocked.peek(&"a.example.com".into()).map(|b| b.today),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn day_counts_saturate() {
+        let mut blocks = HourlyBlocks::new(0, 7);
+        blocks.today = u32::MAX - 1;
+        assert_eq!(blocks.add_today(7), u32::MAX);
+        assert_eq!(blocks.add_today(7), u32::MAX);
+        // Another day starts it over.
+        assert_eq!(blocks.add_today(8), 1);
+    }
+
+    #[test]
+    fn a_top_name_shows_its_count_and_not_its_name_in_debug() {
+        let top = TopName {
+            name: "secret.example.org".into(),
+            count: 12,
+        };
+        let shown = format!("{top:?}");
+        assert!(shown.contains("12") && !shown.contains("secret"), "{shown}");
+    }
+
+    /// What the day's top adds to each blocked answer, which is `note_top` and one more counter:
+    /// the list full, for a name that is not on it, and for the names that are. Run in release:
+    /// `cargo test -p qb-dns --release the_days_top_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing test for release builds; see the comment above it"]
+    fn the_days_top_costs_little_per_blocked_answer() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const CALLS: usize = 20_000_000;
+        const ROUNDS: usize = 5;
+        const OTHERS: usize = 4_096;
+
+        let mut s = Stats::new(0, BLOCKED_NAMES_TRACKED);
+        let on_list: Vec<String> = (0..TOP_NAMES)
+            .map(|i| format!("top{i}.ads.example.com"))
+            .collect();
+        for (i, name) in on_list.iter().enumerate() {
+            block(&mut s, name, 1_000 + i as u32, MIDNIGHT_UTC);
+        }
+        assert_eq!(s.top.len(), TOP_NAMES);
+        let others: Vec<String> = (0..OTHERS)
+            .map(|i| format!("t{i}.tracker.example.net"))
+            .collect();
+        let per_call = |s: &mut Stats, names: &[String], count: u32| {
+            let mut fastest = f64::MAX;
+            for _ in 0..ROUNDS {
+                let started = Instant::now();
+                for i in 0..CALLS / ROUNDS {
+                    s.note_top(black_box(&names[i % names.len()]), black_box(count));
+                }
+                fastest =
+                    fastest.min(started.elapsed().as_nanos() as f64 / (CALLS / ROUNDS) as f64);
+            }
+            fastest
+        };
+        let full = s.top.clone();
+        let miss = per_call(&mut s, &others, 1);
+        // Nothing changed: a name under the last of the list never enters it.
+        assert_eq!(s.top, full);
+        // The name with the most blocks is the first of the list.
+        let leader = [on_list[TOP_NAMES - 1].clone()];
+        let first = per_call(&mut s, &leader, 1);
+        let each = per_call(&mut s, &on_list, 1);
+        println!(
+            "note_top, list full: a name that is not on it {miss:.1} ns, the first of the list {first:.1} ns, \
+             each of the list in turn {each:.1} ns"
+        );
+    }
+
+    /// Random blocks of a dozen names over three local days, with a clock that steps back now and
+    /// then, checked against plain counts: the list is the eight names with the most blocks that
+    /// day, a tie going to the one that got there first. The tracker is wide enough to lose no
+    /// name.
+    #[test]
+    fn the_top_matches_plain_counts_over_random_blocks() {
+        const NAMES: usize = 12;
+        let mut rng = Rng::new(11);
+        let mut s = Stats::new(8, 64);
+        // For each name: its blocks in the current day and the step of the last of them.
+        let mut model: Vec<(u32, u64)> = vec![(0, 0); NAMES];
+        let mut day = 0u64;
+        let (mut entered, mut rolled, mut full) = (0, 0, 0);
+        for step in 1..=30_000u64 {
+            // Mostly the same day, now and then the next, and once in a while one before.
+            match rng.below(1_000) {
+                0..=2 => day += 1,
+                3 => day = day.saturating_sub(1),
+                _ => {}
+            }
+            let unix = MIDNIGHT_UTC + day * 86_400 + 100;
+            let before = top(&s, unix);
+            // The counts start over when a record is made in another day than the last one's.
+            if s.day != Some(i64::try_from(unix / 86_400).unwrap()) {
+                model = vec![(0, 0); NAMES];
+                rolled += 1;
+            }
+            // The first names are blocked most often.
+            let i = rng.below(NAMES).min(rng.below(NAMES));
+            let name = format!("n{i}.example.com");
+            if rng.below(5) == 0 {
+                s.record(&name, 1, Outcome::Forwarded, at(1, unix));
+            } else {
+                s.record(&name, 1, Outcome::Blocked, at(1, unix));
+                model[i] = (model[i].0 + 1, step);
+            }
+            let mut want: Vec<(usize, (u32, u64))> = model
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, m)| m.0 > 0)
+                .collect();
+            want.sort_by_key(|&(_, (count, at))| (std::cmp::Reverse(count), at));
+            let want: Vec<(String, u32)> = want
+                .into_iter()
+                .take(TOP_NAMES)
+                .map(|(i, (count, _))| (format!("n{i}.example.com"), count))
+                .collect();
+            let got = top(&s, unix);
+            entered += usize::from(before != got);
+            assert_eq!(got, want, "step {step}");
+            full += usize::from(got.len() == TOP_NAMES);
+        }
+        assert!(
+            entered > 1_000 && rolled > 50 && full > 10_000,
+            "{entered} changes, {rolled} resets, {full} full lists"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ Date: 2026-11-12. Status: design for the panel-os milestones (P1–P3). Binding 
 rules come first: **nothing may slow a cached, blocked or forwarded answer**, privacy, one static
 binary, and the Pi writes nothing to the card in permanent mode outside an update.
 
-**Source of truth for the look:** round 8 of the mockups, home "1 · Wall" (owner-approved):
+**Source of truth for the look:** round 8 of the mockups, home "1 · Wall" (owner-approved), for P1 (P2 and P3 follow round 9's mix, §12):
 `README.md`, `src/screens.js`, `src/homes.js` (the `wall` home and `systemDoors`), `src/parts.js`,
 `src/stage.js`, `src/common.js`, `src/d6.js`, and the stills `r8-wall-<screen>@2x.png` (960×640,
 nearest-neighbour 2× of the 480×320 panel). Where this spec and the JS disagree on a coordinate,
@@ -529,3 +529,70 @@ edit made in the last poll interval before a power cut is lost; the panel says n
 4. **WI-FI's second line is the upstream's answer time**, which the Pi measures, not the router's.
 5. **YOUR LIST shows the newest three** (no scrolling: taps only); the rest are in qnet.
 6. **Night does not switch the backlight** until a P3 check shows it can be switched.
+
+## 12. Phases 2–3 look (round 9 mix)
+
+Decided by the owner (2026-11-17): P2 and P3 are drawn as round 9's recommended mix, `?pick=ACCCA`
+(alerts A, names C, system C, update C, the other states A). The round 9 folder (`README.md`,
+`src/kit.js`, `src/ca.js`, `src/cc.js`, round 8's harness in `src/`, stills
+`r9-<A|C>-<screen>@2x.png`) is the source of truth for coordinates and words of these screens, as
+round 8 is for P1; implementers get it as `QBP_MOCKUP9_DIR`. Every rule in §§3–9 still holds where
+round 9 says nothing; where round 9's drawing and this section disagree, this section wins.
+
+| Screen | Drawn as | Round 9 source |
+|---|---|---|
+| ALERTS, ALERT, nothing to report | A: the watch log on tractor-feed paper (newest printed last, at the bottom, over `hh:mm  WATCH CONTINUES` and the cursor; `n ON THE LOG`); an alert is its slip torn off, stamped | `ca.js` `alerts`, `alert` |
+| PIN | A: the authorisation slip (`ENTER THE PIN` / `CHOOSE A PIN` / `WRONG PIN` / `WAIT m:ss`, four boxes, `FOR` what is signed for, `THE OWNER`) beside round 8's twelve keys | `ca.js` `pin`, `kit.js` `pinPad9` |
+| STARTING | A: the ticked checklist (`PANEL ON` … `DNS ANSWERING`) | `ca.js` `boot` |
+| NIGHT | A: the paper's margins in `BLUE_NIGHT`, the hour 96 px `BLUE_DEEP`, `NIGHT WATCH` | `ca.js` `night` |
+| NAMES, YOUR LIST, NAME | C: the manifold (a pipe a name, thickness by count, valve shut blue / open white, a threat sealed with a plate); `YOUR OWN n ▸` / `VALVES YOU SET`; one name as a mimic | `cc.js` `names`, `yours`, `name`, `kit.js` `nameFacts`, `keys9`, `listDoor9` |
+| SYSTEM | C: the one-line mimic (router, Wi-Fi link, the box with its two slots and readings), `NIGHT` / `LOCK` / `ABOUT` keys under it | `cc.js` `system` |
+| WI-FI | C: the link drawn large, `REJOIN` | `cc.js` `wifi` |
+| UPDATE ×4 | C: the changeover, two slots and DNS drawn unbroken | `cc.js` `update` |
+| VERSION, UP, NIGHT HOURS, LOCK, ABOUT | round 8's plain readings (§3.8), until the owner asks otherwise | round 8 `screens.js` `reading` |
+
+The floor keys keep each concept's dress: stubs under a perforation on A's screens (`keys9(.., 'A')`),
+a thin outline on C's (`'C'`). §3.6, §3.7 and §3.8's SYSTEM wall are replaced by the above; §3.8's
+reading table holds for the five plain readings.
+
+**Where the build differs from the round 9 drawing, and why:**
+
+1. **No device on a name (privacy, §11.3).** C's NAME starts its pipe at a device node and A's
+   manifest shows `ASKED MOSTLY BY`; the Pi keeps no who-asked-what record and gains none. NAME's
+   left node reads `THE HOUSE` (inert, no door), the pipe runs from it to the valve, and NAMES' rows
+   show the name and its count only (C's rows already do).
+2. **The alert's stamp is what the Pi did, mapped in Rust from the kind** (no new tracking):
+   `threat` and `rebind` → `REFUSED` (the answer was blocked); `new_device` → `ADMITTED` (it joined
+   and got the newcomer's default); `arp_spoof`, `dga`, `tunnel`, `beacon`, `burst` and any other kind
+   → `OBSERVED` (nothing was blocked because of it). The precedence word is `URGENT` for High,
+   `ROUTINE` otherwise. A threat's or rebind's slip: its name line is a door to NAME.
+3. **Only readings the Pi has.** SYSTEM's figure under ROUTER is the band (`5 GHZ`), not the router's
+   answer time; WI-FI's last line is `upstream answers in n ms` (§11.4). The spare slot's box says
+   `KEPT` (the Pi does not know the spare's version); the box's line is `LAST UPDATE CONFIRMED` /
+   `LAST UPDATE ROLLED BACK` / `NO UPDATE SINCE START`, with no date. On UPDATE the left box is the
+   slot that served before the update and the right the new one, by their real letters; a version
+   is written only for the build that runs. ALERTS' nothing-to-report lines are `LAST ENTRY FILED`
+   (the store's last alert, left out when there never was one) and `WATCH OPENED` (this boot's
+   start, the clock minus the uptime; left out while the clock is not set).
+4. **Motion at rest is the log's cursor alone** (10×18, 4 frames on, 4 off at 8 fps; a write of
+   18 rows). C's scope and sweep are not built (ALERTS is A's); UPDATE's DNS dot is drawn still;
+   REJOIN's dashes follow the real link (all dark and `JOINING` until it is back), not a timer.
+5. **The trial's figure** is `m:ss` to the trial's minimum time; past it, while the trial still
+   waits, the figure names what it waits for (`WI-FI`, `CLOCK`, `UPSTREAM`).
+6. **NIGHT with an alert waiting**: `NIGHT WATCH` becomes `n ON THE LOG` in white (A's night has no
+   drop to whiten). An arriving alert still does not light the screen.
+7. **A threat's NAME** has `BACK` on the left and `NEVER ALLOWED` (hollow, `G3`) where the right key
+   would be (round 9's word replaces §3.7's `THREAT · STAYS`); the line is `On a threat list.
+   Threats are never allowed.` The other NAME keys follow §3.7 (`KEEP REFUSED` + `ALLOW NAME`,
+   `KEEP ANSWERED` + `REFUSE NAME`, and the take-back keys `REFUSE AGAIN` / `ANSWER AGAIN` on the
+   owner's own entries); the padlock sits on the strong key and on the valve's handle.
+8. **YOUR LIST's right figure** is the weekday the entry was set on the panel (`TODAY` for today);
+   entries pushed from qnet have none. The Pi keeps that day beside the owner's list in qberrypi
+   (memory only), never in qb-dns's answer-path structure.
+9. **VERSION has no CHECK NOW** (§11.1), so A's VERSION page is not built; VERSION is the plain
+   reading.
+
+**Reference images:** the P2/P3 goldens (§9) are compared with the round 9 still of the concept
+that draws them (`os-alerts` with `r9-A-alerts@2x.png`, `os-names` with `r9-C-names@2x.png`, `os-wifi`
+with `r9-C-detail@2x.png`, …) and the plain readings with round 8's. `os-name-threat` is added.
+The regions that differ by points 1, 3, 5 and 8 are listed as expected differences.

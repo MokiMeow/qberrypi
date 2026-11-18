@@ -491,7 +491,9 @@ impl Api {
 
     /// `POST /api/dns/blocking`: `{"blocking": true}` resumes, `{"blocking": false, "timer": n}`
     /// pauses for `n` seconds rounded up, and any other body changes nothing. Other fields are
-    /// ignored. The answer is the GET's, read back after the change.
+    /// ignored. The answer is the GET's, read back after the change. A pause lets the ads lists
+    /// through and keeps the threat lists and the owner's refused names blocked, as the panel's
+    /// gate does: it is the same pause.
     fn set_blocking(&self, body: &[u8], started: Instant) -> Reply {
         let Ok(body) = serde_json::from_slice::<Value>(body) else {
             return error(400, NO_VALID_JSON, started);

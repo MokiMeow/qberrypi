@@ -16,8 +16,15 @@ use super::hex;
 /// The rounds of PBKDF2 that a new hash takes.
 pub const ROUNDS: u32 = 100_000;
 
+/// The rounds of PBKDF2 that a PIN's hash takes (`cargo xtask hash-pin`, the panel's own PIN).
+///
+/// A PIN is four digits, so the hash is no protection against someone who holds it; what it keeps is
+/// that no PIN is stored in clear, and the check runs on the panel's thread, so it is the fewest rounds a
+/// line may name ([`PasswordHash::parse`]): about 100 ms or less on the Pi.
+pub const PIN_ROUNDS: u32 = 10_000;
+
 /// The fewest rounds a line may name.
-const MIN_ROUNDS: u32 = 10_000;
+const MIN_ROUNDS: u32 = PIN_ROUNDS;
 
 /// The most rounds a line may name.
 const MAX_ROUNDS: u32 = 10_000_000;
@@ -49,6 +56,23 @@ impl PasswordHash {
             salt,
             hash: derive(password, &salt, ROUNDS),
         }
+    }
+
+    /// Hashes `password` with `salt` and `rounds` rounds, kept within what a line may name (10,000 to
+    /// 10,000,000), so that the result always round-trips through [`PasswordHash::to_text`] and
+    /// [`PasswordHash::parse`]. A PIN uses [`PIN_ROUNDS`].
+    pub fn with_rounds(password: &[u8], salt: [u8; SALT_LEN], rounds: u32) -> Self {
+        let rounds = rounds.clamp(MIN_ROUNDS, MAX_ROUNDS);
+        Self {
+            rounds,
+            salt,
+            hash: derive(password, &salt, rounds),
+        }
+    }
+
+    /// The rounds that made this hash: what a check of a password costs.
+    pub fn rounds(&self) -> u32 {
+        self.rounds
     }
 
     /// Reads a line as [`PasswordHash::to_text`] writes it, with the rounds it names; `None` for
@@ -134,6 +158,18 @@ mod tests {
             back.verify(b"correct horse") && !back.verify(b"correct horsf") && !back.verify(b"")
         );
         assert_eq!(format!("{back:?}"), "<redacted>");
+    }
+
+    #[test]
+    fn a_hash_with_its_own_rounds_keeps_them_within_what_a_line_may_name() {
+        let pin = PasswordHash::with_rounds(b"1234", [3; 16], PIN_ROUNDS);
+        assert_eq!(pin.rounds(), PIN_ROUNDS);
+        let text = pin.to_text();
+        assert!(text.starts_with("$pbkdf2-sha256$i=10000$"), "{text}");
+        let back = PasswordHash::parse(&text).unwrap();
+        assert!(back.verify(b"1234") && !back.verify(b"1235"));
+        assert_eq!(PasswordHash::with_rounds(b"x", [0; 16], 1).rounds(), 10_000);
+        assert_eq!(PasswordHash::new(b"x", [0; 16]).rounds(), ROUNDS);
     }
 
     #[test]

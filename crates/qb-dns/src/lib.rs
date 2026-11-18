@@ -10,6 +10,7 @@ mod cache;
 pub mod decide;
 mod lru;
 pub mod name;
+pub mod owner;
 pub mod parse;
 mod query;
 pub mod stats;
@@ -18,8 +19,9 @@ pub(crate) mod testutil;
 
 pub use blockset::{BlockSet, BlockSetBuilder, InvalidName, ListClass};
 pub use decide::{Action, Filter, Pending, Resolver, ThreatHit, UpstreamOutcome};
+pub use owner::{OWNER_NAMES_MAX, OwnerNames, OwnerNamesError, OwnerSide};
 pub use parse::{ListStats, RuleKind};
-pub use stats::{Counts, HistoryBucket, LastBlocked, LogEntry, Outcome, Stats};
+pub use stats::{Counts, HistoryBucket, LastBlocked, LogEntry, Outcome, Stats, TOP_NAMES, TopName};
 
 /// The time of one call: the library reads no clock of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

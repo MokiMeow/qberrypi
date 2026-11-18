@@ -23,6 +23,18 @@ pub struct WifiStatus {
     /// The frequency, in MHz, of the channel the access point is joined on, if it is known: what the
     /// join found when it scanned. It is what `wifi.hint_mhz` takes.
     pub freq_mhz: Option<u32>,
+    /// The monotonic second the link came up on, as the kernel counts them (`sys::uptime`; the panel's own
+    /// uptime is on the same clock): what `linked n days` counts from. `None` while the link is down.
+    pub joined_secs: Option<u64>,
+}
+
+impl WifiStatus {
+    /// How many seconds the link has held, at the monotonic second `now_secs`; `None` while it is down. A
+    /// `now_secs` before the join (clocks read a moment apart) is no time at all.
+    pub fn linked_secs(&self, now_secs: u64) -> Option<u64> {
+        self.joined_secs
+            .map(|joined| now_secs.saturating_sub(joined))
+    }
 }
 
 /// Everything known at one moment.
@@ -80,7 +92,9 @@ pub trait BlockingControl: Send + Sync {
     /// The seconds of a pause that are left, rounded up; `None` while blocking is on.
     fn paused_left_secs(&self) -> Option<u16>;
 
-    /// Pauses blocking for `secs` seconds from now; a pause that is running is replaced.
+    /// Pauses blocking for `secs` seconds from now; a pause that is running is replaced. The
+    /// ads lists and the deny entries let their names through for the pause; the threat lists and
+    /// the owner's refused names stay blocked.
     fn pause_for(&self, secs: u16);
 
     /// Turns blocking on again, ending a pause that is running.

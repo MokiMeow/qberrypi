@@ -93,7 +93,7 @@ use crate::api::http::{Head, Reply};
 use crate::api::routes::{error_with, ok};
 use crate::bootpart::ACTIVE_CONFIG;
 use crate::slots::{self, Marker, Mode, Select, Slot};
-use crate::update::{CardAccess, Cause, Restart, UpdateCtl};
+use crate::update::{CardAccess, Cause, Receiving, Restart, UpdateCtl};
 
 /// The path of the route, which the connection recognises from the head.
 pub const PATH: &str = "/api/qbp/update";
@@ -520,9 +520,15 @@ impl Receiver {
                 "an update is being received or staged, or a trial is under way",
             ),
         })?;
-        let mut body = body.take(head.length);
+        // What arrives is counted for the panel's percentage, from the first byte of the manifest on.
+        let mut body = Counted {
+            inner: body.take(head.length),
+            receiving: &receiving,
+        };
 
         let manifest = read_manifest(&mut body, head.length)?;
+        // The manifest's sizes add up to the length, so that is the figure the percentage is of.
+        receiving.length_is(head.length);
         log::info!("{}", start_line(&manifest, head.length));
         let Some(running) = self.ctl.slot() else {
             // `begin_receive` refuses a boot with no slot, so this cannot be reached.
@@ -710,6 +716,21 @@ impl Receiver {
                 selected
             }
         })
+    }
+}
+
+/// A reader that tells the machinery how many bytes it has handed out, as they arrive: the receiver reads
+/// the whole body through one, so the panel can show how much of the update is in.
+struct Counted<'a, R> {
+    inner: R,
+    receiving: &'a Receiving,
+}
+
+impl<R: Read> Read for Counted<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let got = self.inner.read(buf)?;
+        self.receiving.arrived(got);
+        Ok(got)
     }
 }
 
@@ -2148,6 +2169,77 @@ mod tests {
         let body: Vec<u8> = offer.pieces().concat();
         let received = receiver.receive(&head_of(body.len() as u64), &mut io::Cursor::new(body));
         (received, ctl)
+    }
+
+    /// A body that reports, before each read, how much of it the machinery has counted as arrived.
+    struct Spy {
+        inner: io::Cursor<Vec<u8>>,
+        ctl: Arc<UpdateCtl>,
+        seen: Vec<(u64, u64)>,
+    }
+
+    impl Read for Spy {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let view = self.ctl.view();
+            self.seen.push((view.received, view.length));
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn the_bytes_that_arrive_are_counted_against_the_length_the_manifest_adds_up_to() {
+        let (_dir, card, _) = card_of_slot_a();
+        let ctl = UpdateCtl::new(Some(Slot::A), Some(running_digest()), card);
+        let receiver = Receiver::new(ctl.clone(), RUNNING);
+        let body: Vec<u8> = Offer::new(RUNNING + 1, Slot::B, Mode::Software)
+            .pieces()
+            .concat();
+        let total = body.len() as u64;
+        let mut spy = Spy {
+            inner: io::Cursor::new(body),
+            ctl: ctl.clone(),
+            seen: Vec::new(),
+        };
+
+        let received = receiver.receive(&head_of(total), &mut spy);
+
+        assert_eq!(received.reply().status, 200, "{:?}", received.reply().body);
+        // Nothing before the first byte, and no length until the manifest is judged.
+        assert_eq!(spy.seen[0], (0, 0));
+        assert!(spy.seen.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        // Once it is judged the length is the whole body's, with part of it still to come.
+        assert!(
+            spy.seen
+                .iter()
+                .any(|&(got, length)| length == total && 0 < got && got < total),
+            "{:?}",
+            spy.seen
+        );
+        // Staged, the whole of it is in and the machinery stays taken for the screen that waits.
+        let view = ctl.view();
+        assert_eq!(
+            (view.state, view.received, view.length),
+            ("receiving", total, total)
+        );
+    }
+
+    #[test]
+    fn an_update_that_stops_arriving_gives_the_machinery_and_its_progress_back() {
+        let (_dir, card, _) = card_of_slot_a();
+        let ctl = UpdateCtl::new(Some(Slot::A), Some(running_digest()), card);
+        let receiver = Receiver::new(ctl.clone(), RUNNING);
+        let mut body: Vec<u8> = Offer::new(RUNNING + 1, Slot::B, Mode::Software)
+            .pieces()
+            .concat();
+        let total = body.len() as u64;
+        // The head says all of it, and the stream stops with the last file unfinished.
+        body.truncate(body.len() - 10);
+
+        let received = receiver.receive(&head_of(total), &mut io::Cursor::new(body));
+
+        assert_eq!(received.reply().status, 400);
+        let view = ctl.view();
+        assert_eq!((view.state, view.received, view.length), ("idle", 0, 0));
     }
 
     #[test]

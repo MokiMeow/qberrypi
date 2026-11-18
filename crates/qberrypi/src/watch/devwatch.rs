@@ -633,6 +633,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_gate_shuts_when_it_is_due_also_while_the_watch_waits_for_the_interface() {
         let (devices, exemption) = inventory_with_two();
+        let start = devices.lock().unwrap().rev();
         let mut watch = Box::pin(run(devices.clone(), Arc::new(NullSink), "nosuch0"));
         // The watch is asleep with no gate open, and waits for ever for one.
         tokio::select! {
@@ -668,7 +669,7 @@ mod tests {
         assert!(!exemption.is_exempt(IpAddr::V4(ip(5))));
         assert_eq!(gates, None);
         // Two gates opened and two shut.
-        assert_eq!(rev, 4);
+        assert_eq!(rev, start + 4);
         // Nothing is due, and it sleeps on, and a late gate is shut too.
         tokio::select! {
             ended = &mut watch => panic!("the device watch ended: {ended:?}"),

@@ -20,6 +20,10 @@
 //! | `PUT devices/policy` | `{"exempt_default": b, "block": n, "rev"}` for `{"exempt_default": b, "block": ["02:00:00:00:00:01", ...], "if_rev": r}` |
 //! | `PUT devices/labels` | `{"labels": n, "rev"}` for `{"labels": [["02:00:00:00:00:01", "Desk PC"], ...], "append": false, "complete": true}` |
 //! | `PUT devices/gate` | `{"gate_left_secs": n, "rev"}` for `{"mac": "02:00:00:00:00:01", "secs": 300}` |
+//! | `GET names` | `{"rev", "allow": [...], "refuse": [...], "top_today": [{"name", "count"}, ...]}` |
+//! | `PUT names` | `{"allow": n, "refuse": n, "rev"}` for `{"allow": [...], "refuse": [...], "append": false, "complete": true, "if_rev": r}` |
+//! | `GET panel` | `{"night": "23-07" or null, "lock": {"on", "source"}}` |
+//! | `PUT panel` | the same answer, for `{"night": "HH-HH" or null, "pin_hash": "<line>" or null}` (either key may be left out) |
 //!
 //! The known list may be longer than a body can be (4 KiB, about 230 addresses), so it can be sent in
 //! chunks: `append` (default false) says whether the chunk is added to the list that is being sent
@@ -85,6 +89,38 @@
 //! `full`, and a refusal never repeats the address. Gates live in memory only, are not pushed back
 //! by the desktop and shut by themselves, also when the board restarts.
 //!
+//! The owner's names are the names that the owner allows and refuses (`qb_dns::OwnerNames`), in
+//! memory only: the desktop sends them again after the board starts. `refuse` blocks a name and its
+//! subdomains for every device, ADS PASS ones too; `allow` lets through a name that an ads list or
+//! the configuration's `dns.deny` blocks, never one that a threat list does. Both keys are required
+//! in a body (a list may be empty), and each name is validated as a `dns.deny` entry is: a domain
+//! name, lower-cased and without a trailing dot on the way in. Each side holds at most 128 different
+//! names. A long list is sent in chunks, as the known list is: `append` (default false) and
+//! `complete` (default true) say whether a chunk starts the list or is added to it, and whether it
+//! is the last, which is when the list takes the place of the one in force; a name that is on both
+//! sides stays on both (the resolver refuses it). `rev` moves with every change of the list by anyone,
+//! the desktop or the front panel; a push that leaves the list as it is does not move it. With
+//! `"if_rev"` a chunk changes nothing, and nothing that is being sent either, and the answer is a 409
+//! `{"error": ..., "rev": current}`, unless `if_rev` is the revision now. `GET names` gives each side
+//! sorted, so the same set is the same answer, and `top_today`, the names blocked most often in the
+//! resolver's local day, most often first, at most eight; it is empty after midnight until the first
+//! block of the day. A push of the desktop keeps the front panel's entries it names as they are.
+//!
+//! The panel's night hours and lock are one small state, in memory only, which the front panel edits too
+//! (`crate::panel::lock::PanelState`). `GET panel` gives the night hours as `HH-HH` (the hour the
+//! screen goes dark and the hour it wakes, `null` for no night) and whether the lock is on and where its
+//! PIN came from: `"config"` (the slot's `[panel] pin_hash`, which survives a restart), `"api"` (pushed
+//! from here for this boot) or `"panel"` (set on the screen, until the next restart, which is what qnet
+//! tells the owner), `null` while it is off. The hash is never in an answer. `PUT panel` takes `night` and
+//! `pin_hash`, either or both: `night` is `"HH-HH"` (two different hours, 00 to 23) or `null` for none;
+//! `pin_hash` is the hash of a PIN with exactly 10,000 rounds, as `cargo xtask hash-pin` prints it: the
+//! bare `$pbkdf2-sha256$i=10000$<salt>$<hash>`, or the whole line `pin_hash = "<hash>"` (the line ending
+//! and other white space around the line are dropped; see [`lock::parse_pushed_pin_hash`]), or `null`,
+//! which turns the lock off for this boot. The latest set wins for the boot, and qnet pushes its hash
+//! again after each start. A body with neither key, a night that is no `HH-HH`, or a hash that is no line
+//! of a PIN is a 400 and changes nothing, and no answer repeats a piece of the body. The answer is the
+//! state after the change, as `GET` gives it.
+//!
 //! A body is read whole before anything changes: one bad key or address, or a flag that is not
 //! `true` or `false`, is a 400 and nothing is restored or replaced. No answer to a bad body repeats a piece of it. The lock of the device
 //! inventory is held for a copy of its view, for `set_known`, `set_exempt` or `set_policy`, and
@@ -103,6 +139,8 @@ use serde_json::{Value, json};
 use super::hex;
 use super::http::Reply;
 use super::routes::{Error, METHOD_NOT_ALLOWED, NO_VALID_JSON, NOT_FOUND, error, ok};
+use crate::names::{LoadError, OwnerList, Push};
+use crate::panel::lock::{self, LockControl, PanelState, Source};
 use crate::watch::devices::{
     DeviceView, Devices, EditError, Label, MAX_BLOCK, MAX_EXEMPT, MAX_GATE_SECS, MAX_LABELS,
     with_devices,
@@ -147,6 +185,18 @@ const BAD_GATE: Error = (
     "bad_request",
     "\"mac\" must be an Ethernet address and \"secs\" a whole number of seconds from 0 to 3600",
 );
+/// A body of `PUT names` that is not an object with `allow` and `refuse` lists of domain names, of
+/// at most [`qb_dns::OWNER_NAMES_MAX`] different ones on a side.
+const BAD_NAMES: Error = (
+    "bad_request",
+    "\"allow\" and \"refuse\" must be lists of at most 128 different domain names each",
+);
+/// A body of `PUT panel` with no `night` or `pin_hash`, a `night` that is not `"HH-HH"` (two different
+/// hours, 00 to 23) or null, or a `pin_hash` that is not the line of `cargo xtask hash-pin` or null.
+const BAD_PANEL: Error = (
+    "bad_request",
+    "\"night\" must be \"HH-HH\" (two different hours, 00 to 23) or null, and \"pin_hash\" the line that cargo xtask hash-pin prints or null; at least one is needed",
+);
 /// A body whose `if_rev` is there and is not a whole number.
 const BAD_IF_REV: Error = ("bad_request", "\"if_rev\" must be a whole revision number");
 /// A push made on a revision that the inventory has left behind.
@@ -179,6 +229,10 @@ pub struct QbpWatch {
     pub alerts: Arc<AlertStore>,
     /// The devices that the device watch has heard, with the known list.
     pub devices: Arc<Mutex<Devices>>,
+    /// The names that the owner allows and refuses, which the front panel edits too.
+    pub names: Arc<OwnerList>,
+    /// The panel's night hours and lock, which the front panel edits too.
+    pub panel: Arc<PanelState>,
 }
 
 /// The endpoints, by the path after `/api/qbp/`.
@@ -202,6 +256,10 @@ enum Route {
     Labels,
     /// `devices/gate`.
     Gate,
+    /// `names`, which answers `GET` and `PUT`.
+    Names,
+    /// `panel`, which answers `GET` and `PUT`.
+    Panel,
 }
 
 impl Route {
@@ -217,6 +275,8 @@ impl Route {
             "devices/policy" => Route::Policy,
             "devices/labels" => Route::Labels,
             "devices/gate" => Route::Gate,
+            "names" => Route::Names,
+            "panel" => Route::Panel,
             _ => {
                 let id = rest.strip_prefix("alerts/")?.strip_suffix("/ack")?;
                 if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -227,17 +287,18 @@ impl Route {
         })
     }
 
-    /// The one method that the endpoint answers.
-    fn method(self) -> &'static str {
+    /// Whether the endpoint answers `method`: one method each, but `names` and `panel`, which have two.
+    fn answers(self, method: &str) -> bool {
         match self {
-            Route::Alerts | Route::Devices => "GET",
-            Route::Ack(_) => "POST",
+            Route::Alerts | Route::Devices => method == "GET",
+            Route::Ack(_) => method == "POST",
             Route::Restore
             | Route::Known
             | Route::Exempt
             | Route::Policy
             | Route::Labels
-            | Route::Gate => "PUT",
+            | Route::Gate => method == "PUT",
+            Route::Names | Route::Panel => method == "GET" || method == "PUT",
         }
     }
 }
@@ -256,7 +317,7 @@ pub(super) fn handle(
     let Some(route) = Route::at(rest) else {
         return error(404, NOT_FOUND, started);
     };
-    if method != route.method() {
+    if !route.answers(method) {
         return error(405, METHOD_NOT_ALLOWED, started);
     }
     if query.is_some() && route != Route::Alerts {
@@ -272,6 +333,10 @@ pub(super) fn handle(
         Route::Policy => policy(watch, body, started),
         Route::Labels => labels(watch, body, started),
         Route::Gate => gate(watch, body, started),
+        Route::Names if method == "GET" => names(&watch.names, started),
+        Route::Names => push_names(&watch.names, body, started),
+        Route::Panel if method == "GET" => panel(&watch.panel, started),
+        Route::Panel => push_panel(&watch.panel, body, started),
     }
 }
 
@@ -594,6 +659,130 @@ fn gate(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
     }
 }
 
+/// `GET names`: the revision, the names the owner allows and refuses, each side sorted, and the names
+/// blocked most often today. The list is locked for a copy of its names, the resolver for a copy of
+/// at most eight, and the JSON is made after both are let go.
+fn names(list: &OwnerList, started: Instant) -> Reply {
+    let view = list.view();
+    let top: Vec<Value> = list
+        .top_today()
+        .iter()
+        .map(|top| json!({ "name": &*top.name, "count": top.count }))
+        .collect();
+    ok(
+        json!({
+            "rev": view.rev,
+            "allow": view.allow,
+            "refuse": view.refuse,
+            "top_today": top,
+        }),
+        started,
+    )
+}
+
+/// `PUT names`: takes a chunk of the owner's lists, as [`OwnerList::load`] says with the flags
+/// `append` (default false) and `complete` (default true) and with `if_rev`, and answers how many names
+/// each side holds in the list the chunk belongs to and the revision after. Both lists are
+/// required, and everything is read and checked before the list is touched: a name that is no domain
+/// name, more than [`qb_dns::OWNER_NAMES_MAX`] different ones on a side, a flag that is not true or false or
+/// an `if_rev` that is no whole number is a 400, and no answer repeats a piece of the body. A stale
+/// `if_rev` is a 409 with the revision that is.
+fn push_names(list: &OwnerList, body: &[u8], started: Instant) -> Reply {
+    let value = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return error(400, NO_VALID_JSON, started),
+    };
+    let (allow, refuse) = match (
+        string_list(&value, "allow", BAD_NAMES),
+        string_list(&value, "refuse", BAD_NAMES),
+    ) {
+        (Ok(allow), Ok(refuse)) => (allow, refuse),
+        _ => return error(400, BAD_NAMES, started),
+    };
+    let (Some(append), Some(complete)) = (
+        flag(&value, "append", false),
+        flag(&value, "complete", true),
+    ) else {
+        return error(400, BAD_FLAG, started);
+    };
+    let Some(if_rev) = if_rev(&value) else {
+        return error(400, BAD_IF_REV, started);
+    };
+    let pushed = list.load(Push {
+        allow: &allow,
+        refuse: &refuse,
+        append,
+        complete,
+        if_rev,
+    });
+    match pushed {
+        Ok(loaded) => ok(
+            json!({ "allow": loaded.allow, "refuse": loaded.refuse, "rev": loaded.rev }),
+            started,
+        ),
+        Err(LoadError::Stale(current)) => stale(current, started),
+        Err(LoadError::Invalid | LoadError::TooMany) => error(400, BAD_NAMES, started),
+    }
+}
+
+/// The state that `GET panel` and `PUT panel` answer: the night hours as `HH-HH` (or null) and whether the
+/// lock is on and where its PIN came from. Never the hash.
+fn panel_state(state: &PanelState) -> Value {
+    let view = state.lock_view();
+    json!({
+        "night": state.night().map(lock::hours_text),
+        "lock": { "on": view.on, "source": view.source.map(Source::as_str) },
+    })
+}
+
+/// `GET panel`: the night hours and the lock, from the panel's own state, which is locked for a copy
+/// of a few words and for no longer.
+fn panel(state: &PanelState, started: Instant) -> Reply {
+    ok(panel_state(state), started)
+}
+
+/// `PUT panel`: sets the night hours, the PIN's hash, or both, for this boot, and answers the state after
+/// the change as `GET` gives it. The body is read and checked whole first: a `night` that is not
+/// `"HH-HH"` (two different hours) or null, a `pin_hash` that is not the hash of a PIN, bare or in the
+/// line `hash-pin` prints ([`lock::parse_pushed_pin_hash`]), or null, or neither key, is a 400 and
+/// changes nothing. `null` turns the
+/// night off, or the lock. The hash is not in the answer, and nothing of the body is.
+fn push_panel(state: &PanelState, body: &[u8], started: Instant) -> Reply {
+    let value = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return error(400, NO_VALID_JSON, started),
+    };
+    // `None`: the key is not there and the setting stays. `Some(None)`: null.
+    let night = match value.get("night") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(text)) => match lock::parse_hours(text) {
+            Some(hours) => Some(Some(hours)),
+            None => return error(400, BAD_PANEL, started),
+        },
+        Some(_) => return error(400, BAD_PANEL, started),
+    };
+    let pin = match value.get("pin_hash") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(Value::String(text)) => match lock::parse_pushed_pin_hash(text) {
+            Some(hash) => Some(Some(hash)),
+            None => return error(400, BAD_PANEL, started),
+        },
+        Some(_) => return error(400, BAD_PANEL, started),
+    };
+    if night.is_none() && pin.is_none() {
+        return error(400, BAD_PANEL, started);
+    }
+    if let Some(night) = night {
+        state.set_night(night);
+    }
+    if let Some(hash) = pin {
+        state.lock().set_hash(hash, Source::Api);
+    }
+    ok(panel_state(state), started)
+}
+
 /// The 409 for a push made on a revision that is not the one now: Pi-hole's error object, and the
 /// revision that is, which is what the desktop reads the lists again on.
 fn stale(current: u64, started: Instant) -> Reply {
@@ -660,7 +849,10 @@ fn lock(devices: &Mutex<Devices>) -> MutexGuard<'_, Devices> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use qb_dns::{Counts, HistoryBucket, LogEntry};
+    use qb_dns::{
+        Action, BlockSetBuilder, Counts, HistoryBucket, ListClass, LogEntry, Now, Resolver,
+        Transport,
+    };
 
     use super::*;
     use crate::alerts::{Alert, AlertSink, Severity};
@@ -668,8 +860,10 @@ mod tests {
     use crate::api::password::PasswordHash;
     use crate::api::routes::{Api, Facts};
     use crate::api::seams::{Client, ServerStats};
+    use crate::panel::alerts::PendingAlerts;
     use crate::watch::frames::{Arp, DHCP_REQUEST, Dhcp};
     use crate::watch::store::key_of;
+    use crate::wiring::SharedResolver;
 
     /// The address that the tests log in from.
     const ME: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 7);
@@ -714,24 +908,55 @@ mod tests {
         Arc::new(|| (100, UNIX))
     }
 
+    /// A resolver that blocks `ads.example.com` and the threat `evil.example.net`, whose clock stands
+    /// still at second 100 of `UNIX`.
+    fn resolver() -> SharedResolver {
+        let mut builder = BlockSetBuilder::new();
+        builder.add_list(b"0.0.0.0 ads.example.com\n");
+        builder.add_list_as(b"0.0.0.0 evil.example.net\n", ListClass::Threat);
+        SharedResolver {
+            resolver: Arc::new(Mutex::new(Resolver::new(builder.build()))),
+            now: Arc::new(|| Now {
+                mono_secs: 100,
+                unix_secs: UNIX,
+            }),
+        }
+    }
+
+    /// The panel's state of a boot with the default night hours and no PIN, on a clock that stands still.
+    fn panel_state_at_start() -> Arc<PanelState> {
+        Arc::new(PanelState::new(None, Some((23, 7)), Arc::new(|| 1_000)))
+    }
+
     /// An API with a watch over an empty store and an empty inventory, and a session on it.
     struct Setup {
         api: Api,
         watch: Arc<QbpWatch>,
         sid: String,
+        /// The resolver that the owner's names are swapped into.
+        resolver: SharedResolver,
     }
 
     impl Setup {
         fn new() -> Self {
             let store = Arc::new(AlertStore::new(clock()));
-            let devices = Devices::new(None, Ipv4Addr::new(192, 0, 2, 1), clock());
+            // The revision counts from 0, as each test says what a change makes it.
+            let devices = Devices::new(None, Ipv4Addr::new(192, 0, 2, 1), clock()).starting_at(0);
+            let resolver = resolver();
             let watch = Arc::new(QbpWatch {
                 alerts: store,
                 devices: Arc::new(Mutex::new(devices)),
+                names: Arc::new(OwnerList::new(resolver.clone()).starting_at(0)),
+                panel: panel_state_at_start(),
             });
             let api = plain_api().with_watch(watch.clone());
             let sid = login(&api);
-            Setup { api, watch, sid }
+            Setup {
+                api,
+                watch,
+                sid,
+                resolver,
+            }
         }
 
         /// What the API answers to `method` `target` with `body`, with the session.
@@ -1956,6 +2181,652 @@ mod tests {
         assert_eq!(devices["exempt_default"], json!(false));
     }
 
+    /// Sends `body` to `PUT names`, and gives the status and the answer.
+    fn put_names(setup: &Setup, body: &str) -> (u16, Value) {
+        setup.send("PUT", "/api/qbp/names", body)
+    }
+
+    /// The body of `GET names`.
+    fn get_names(setup: &Setup) -> Value {
+        let (status, body) = setup.send("GET", "/api/qbp/names", "");
+        assert_eq!(status, 200);
+        body
+    }
+
+    /// Whether the resolver the API's lists are swapped into blocks `name`: answers it itself.
+    fn blocked(setup: &Setup, name: &str) -> bool {
+        let mut packet = vec![0, 7, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            packet.push(u8::try_from(label.len()).unwrap());
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+        let now = (setup.resolver.now)();
+        matches!(
+            setup
+                .resolver
+                .resolver
+                .lock()
+                .unwrap()
+                .handle_query(&packet, Transport::Udp, now),
+            Action::Reply(_)
+        )
+    }
+
+    #[test]
+    fn the_names_start_empty_and_a_push_shows_sorted_and_reaches_the_resolver() {
+        let setup = Setup::new();
+        let empty = get_names(&setup);
+        assert_eq!(
+            (
+                &empty["rev"],
+                &empty["allow"],
+                &empty["refuse"],
+                &empty["top_today"]
+            ),
+            (&json!(0), &json!([]), &json!([]), &json!([]))
+        );
+        assert!(empty["took"].is_number());
+        assert!(blocked(&setup, "ads.example.com") && !blocked(&setup, "mine.example.org"));
+
+        let (status, body) = put_names(
+            &setup,
+            r#"{"allow": ["ads.EXAMPLE.com."], "refuse": ["z.example.org", "Mine.Example.Org", "z.example.org"], "other": 1}"#,
+        );
+        assert_eq!(
+            (status, &body["allow"], &body["refuse"], &body["rev"]),
+            (200, &json!(1), &json!(2), &json!(1))
+        );
+        assert!(body["took"].is_number());
+        // Sorted and normalised, and in force at once: an ad that the owner allows is let through, a
+        // name that the owner refuses and its subdomains are blocked, a threat stays blocked.
+        let shown = get_names(&setup);
+        assert_eq!(shown["allow"], json!(["ads.example.com"]));
+        assert_eq!(
+            shown["refuse"],
+            json!(["mine.example.org", "z.example.org"])
+        );
+        assert_eq!(shown["rev"], json!(1));
+        assert!(!blocked(&setup, "ads.example.com"));
+        assert!(blocked(&setup, "mine.example.org") && blocked(&setup, "sub.z.example.org"));
+        assert!(blocked(&setup, "evil.example.net"));
+
+        // The same lists again, in another order and spelling, change nothing, and the revision stays.
+        let (_, body) = put_names(
+            &setup,
+            r#"{"refuse": ["MINE.example.org", "z.example.org."], "allow": ["ads.example.com"]}"#,
+        );
+        assert_eq!(
+            (&body["allow"], &body["refuse"], &body["rev"]),
+            (&json!(1), &json!(2), &json!(1))
+        );
+        // `[]` and `[]` clears both, and the resolver has no owner names left.
+        let (_, body) = put_names(&setup, r#"{"allow": [], "refuse": []}"#);
+        assert_eq!(
+            (&body["allow"], &body["refuse"], &body["rev"]),
+            (&json!(0), &json!(0), &json!(2))
+        );
+        assert!(blocked(&setup, "ads.example.com") && !blocked(&setup, "mine.example.org"));
+        assert!(
+            setup
+                .resolver
+                .resolver
+                .lock()
+                .unwrap()
+                .owner_names()
+                .is_empty()
+        );
+        assert_eq!(get_names(&setup)["rev"], json!(2));
+    }
+
+    #[test]
+    fn the_names_of_the_day_are_the_resolvers_most_refused_first() {
+        let setup = Setup::new();
+        put_names(&setup, r#"{"allow": [], "refuse": ["mine.example.org"]}"#);
+        for name in [
+            "ads.example.com",
+            "mine.example.org",
+            "ads.example.com",
+            "evil.example.net",
+        ] {
+            assert!(blocked(&setup, name));
+        }
+        let top = get_names(&setup)["top_today"].clone();
+        assert_eq!(
+            top,
+            json!([
+                { "name": "ads.example.com", "count": 2 },
+                { "name": "mine.example.org", "count": 1 },
+                { "name": "evil.example.net", "count": 1 },
+            ])
+        );
+    }
+
+    #[test]
+    fn names_in_chunks_take_effect_with_the_last_one() {
+        let setup = Setup::new();
+        let (_, body) = put_names(
+            &setup,
+            r#"{"allow": [], "refuse": ["a.example.org"], "append": false, "complete": false}"#,
+        );
+        assert_eq!((&body["refuse"], &body["rev"]), (&json!(1), &json!(0)));
+        assert!(!blocked(&setup, "a.example.org"));
+        assert_eq!(get_names(&setup)["refuse"], json!([]));
+        let (_, body) = put_names(
+            &setup,
+            r#"{"allow": ["ads.example.com"], "refuse": ["b.example.org"], "append": true, "complete": false}"#,
+        );
+        assert_eq!(
+            (&body["allow"], &body["refuse"], &body["rev"]),
+            (&json!(1), &json!(2), &json!(0))
+        );
+        let (_, body) = put_names(
+            &setup,
+            r#"{"allow": [], "refuse": ["c.example.org"], "append": true, "complete": true}"#,
+        );
+        assert_eq!(
+            (&body["allow"], &body["refuse"], &body["rev"]),
+            (&json!(1), &json!(3), &json!(1))
+        );
+        assert!(blocked(&setup, "a.example.org") && blocked(&setup, "c.example.org"));
+        assert!(!blocked(&setup, "ads.example.com"));
+        assert_eq!(
+            get_names(&setup)["refuse"],
+            json!(["a.example.org", "b.example.org", "c.example.org"])
+        );
+    }
+
+    #[test]
+    fn a_bad_body_of_names_is_a_400_and_changes_nothing_and_repeats_nothing() {
+        let setup = Setup::new();
+        put_names(&setup, r#"{"allow": [], "refuse": ["kept.example.org"]}"#);
+        // A list that is being sent, which a bad chunk must not touch either.
+        put_names(
+            &setup,
+            r#"{"allow": [], "refuse": ["sent.example.org"], "complete": false}"#,
+        );
+        let many = |n: usize| -> String {
+            let names: Vec<String> = (0..n).map(|i| format!("n{i}.example.org")).collect();
+            json!(names).to_string()
+        };
+        let too_many = format!(r#"{{"allow": [], "refuse": {}}}"#, many(129));
+        let bad = [
+            "",
+            "[]",
+            "{}",
+            r#"{"allow": ["#,
+            r#"{"allow": []}"#,
+            r#"{"refuse": []}"#,
+            r#"{"allow": null, "refuse": []}"#,
+            r#"{"allow": [], "refuse": "secret.example.org"}"#,
+            r#"{"allow": [5], "refuse": []}"#,
+            r#"{"allow": [], "refuse": [["secret.example.org"]]}"#,
+            r#"{"allow": [], "refuse": ["secret name.example.org"]}"#,
+            r#"{"allow": [], "refuse": ["secret.example.org", "*.example.org"]}"#,
+            r#"{"allow": ["secret..example.org"], "refuse": []}"#,
+            r#"{"allow": [], "refuse": ["192.0.2.1"]}"#,
+            r#"{"allow": [], "refuse": ["secret.example.org", ""]}"#,
+            r#"{"allow": [], "refuse": [], "append": "yes"}"#,
+            r#"{"allow": [], "refuse": [], "complete": 0}"#,
+            r#"{"allow": [], "refuse": [], "if_rev": "1"}"#,
+            r#"{"allow": [], "refuse": [], "if_rev": -1}"#,
+            r#"{"allow": [], "refuse": [], "if_rev": 1.5}"#,
+            &too_many,
+        ];
+        for body in bad {
+            let (status, answer) = put_names(&setup, body);
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(error_key(&answer), "bad_request", "{body}");
+            // The refusal repeats no name of the body.
+            let text = answer.to_string();
+            assert!(
+                !text.contains("secret") && !text.contains("192.0"),
+                "{body}"
+            );
+        }
+        // The list stays, with its revision, and so does the list that was being sent.
+        let shown = get_names(&setup);
+        assert_eq!(
+            (&shown["refuse"], &shown["rev"]),
+            (&json!(["kept.example.org"]), &json!(1))
+        );
+        let (_, body) = put_names(&setup, r#"{"allow": [], "refuse": [], "append": true}"#);
+        assert_eq!((&body["refuse"], &body["rev"]), (&json!(1), &json!(2)));
+        assert_eq!(get_names(&setup)["refuse"], json!(["sent.example.org"]));
+        // 128 names a side are the most, and the same name in many spellings is one.
+        let full = format!(r#"{{"allow": {0}, "refuse": {0}}}"#, many(128));
+        let (status, body) = put_names(&setup, &full);
+        assert_eq!(
+            (status, &body["allow"], &body["refuse"]),
+            (200, &json!(128), &json!(128))
+        );
+        let (status, body) = put_names(
+            &setup,
+            r#"{"allow": [], "refuse": ["A.example.org", "a.example.org.", "A.EXAMPLE.ORG"]}"#,
+        );
+        assert_eq!((status, &body["refuse"]), (200, &json!(1)));
+    }
+
+    #[test]
+    fn a_push_of_names_on_an_old_revision_is_a_409_with_the_revision_and_changes_nothing() {
+        let setup = Setup::new();
+        let (_, body) = put_names(&setup, r#"{"allow": [], "refuse": ["a.example.org"]}"#);
+        assert_eq!(body["rev"], json!(1));
+        // The front panel edits meanwhile: the desktop's `if_rev` is behind.
+        setup
+            .watch
+            .names
+            .set("panel.example.org", qb_dns::OwnerSide::Refuse, Some(UNIX))
+            .unwrap();
+        assert_eq!(get_names(&setup)["rev"], json!(2));
+
+        let (status, body) = put_names(
+            &setup,
+            r#"{"allow": [], "refuse": ["x.example.org"], "if_rev": 1}"#,
+        );
+        assert_eq!(status, 409);
+        assert_eq!((error_key(&body), &body["rev"]), ("stale", &json!(2)));
+        assert!(body["took"].is_number());
+        assert!(!body.to_string().contains("example.org"));
+        assert!(!blocked(&setup, "x.example.org") && blocked(&setup, "panel.example.org"));
+        assert_eq!(get_names(&setup)["rev"], json!(2));
+
+        // It reads again, merges, and pushes on the revision that is: the panel's entry stays in the
+        // list it sent, so the entry is as the panel left it.
+        let (status, body) = put_names(
+            &setup,
+            r#"{"allow": [], "refuse": ["a.example.org", "panel.example.org", "x.example.org"], "if_rev": 2}"#,
+        );
+        assert_eq!(
+            (status, &body["refuse"], &body["rev"]),
+            (200, &json!(3), &json!(3))
+        );
+        assert_eq!(
+            setup
+                .watch
+                .names
+                .hold("panel.example.org")
+                .unwrap()
+                .set_unix,
+            Some(UNIX)
+        );
+        // A push that changes nothing is fine on the revision that is, and moves none.
+        let (_, body) = put_names(
+            &setup,
+            r#"{"allow": [], "refuse": ["a.example.org", "panel.example.org", "x.example.org"], "if_rev": 3}"#,
+        );
+        assert_eq!(body["rev"], json!(3));
+        // `if_rev` 0 is a revision like another.
+        let (status, _) = put_names(&setup, r#"{"allow": [], "refuse": [], "if_rev": 0}"#);
+        assert_eq!(status, 409);
+    }
+
+    #[test]
+    fn an_edit_of_the_panel_moves_the_names_revision_and_shows_in_the_names() {
+        let setup = Setup::new();
+        let names = &setup.watch.names;
+        names
+            .set("Mine.Example.org", qb_dns::OwnerSide::Refuse, Some(UNIX))
+            .unwrap();
+        names
+            .set("ads.example.com", qb_dns::OwnerSide::Allow, Some(UNIX))
+            .unwrap();
+        let shown = get_names(&setup);
+        assert_eq!(shown["rev"], json!(2));
+        assert_eq!(shown["refuse"], json!(["mine.example.org"]));
+        assert_eq!(shown["allow"], json!(["ads.example.com"]));
+        assert!(blocked(&setup, "mine.example.org") && !blocked(&setup, "ads.example.com"));
+        // Taking one back is an edit too.
+        assert_eq!(names.forget("mine.example.org"), Ok(true));
+        assert_eq!(get_names(&setup)["rev"], json!(3));
+        assert!(!blocked(&setup, "mine.example.org"));
+    }
+
+    #[test]
+    fn a_panel_ack_shows_in_the_alert_list_and_an_api_ack_empties_what_waits() {
+        let setup = Setup::new();
+        let panel: &dyn PendingAlerts = &*setup.watch.alerts;
+        setup.raise("threat", Some(client(7)), "evil.example.net");
+        setup.raise("new_device", None, "02:00:00:00:00:09");
+        let listed = setup.listed();
+        let (threat, device) = (
+            listed[0]["id"].as_u64().unwrap(),
+            listed[1]["id"].as_u64().unwrap(),
+        );
+        let rev = get_alerts_rev(&setup);
+        assert_eq!(panel.waiting_count(), 2);
+        assert_eq!(panel.waiting(3).len(), 2);
+
+        // The panel acknowledges the newest: the desktop's poll after `rev` shows it acknowledged.
+        panel.ack(device);
+        let (status, body) = setup.send("GET", &format!("/api/qbp/alerts?since={rev}"), "");
+        assert_eq!(status, 200);
+        let changed = body["alerts"].as_array().unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(
+            (changed[0]["id"].as_u64(), &changed[0]["acked"]),
+            (Some(device), &json!(true))
+        );
+        assert_eq!(panel.waiting_count(), 1);
+        assert_eq!(panel.waiting(3)[0].id, threat);
+
+        // The desktop acknowledges the other: nothing waits for the panel any more.
+        let (status, _) = setup.send("POST", &format!("/api/qbp/alerts/{threat}/ack"), "");
+        assert_eq!(status, 200);
+        assert!(panel.waiting(3).is_empty());
+        assert_eq!(panel.waiting_count(), 0);
+        // The last alert was filed at the store's time, whoever acknowledged it.
+        assert_eq!(panel.last_alert_unix(), Some(UNIX));
+    }
+
+    /// The store's revision, as `GET alerts` tells it.
+    fn get_alerts_rev(setup: &Setup) -> u64 {
+        let (_, body) = setup.send("GET", "/api/qbp/alerts", "");
+        body["rev"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn names_answer_get_and_put_and_a_405_for_the_rest_and_a_404_with_a_query() {
+        let setup = Setup::new();
+        for method in ["POST", "DELETE", "PATCH", "HEAD", "OPTIONS", "get", "put"] {
+            let (status, body) = setup.send(
+                method,
+                "/api/qbp/names",
+                r#"{"allow": [], "refuse": ["a.example.org"]}"#,
+            );
+            assert_eq!(status, 405, "{method}");
+            assert_eq!(error_key(&body), "method_not_allowed", "{method}");
+        }
+        for (method, path) in [
+            ("GET", "/api/qbp/names/"),
+            ("GET", "/api/qbp/Names"),
+            ("PUT", "/api/qbp/names/"),
+            ("PUT", "/api/qbp/names/allow"),
+            ("GET", "/api/qbp/names?x=1"),
+            ("GET", "/api/qbp/names?"),
+            ("PUT", "/api/qbp/names?if_rev=0"),
+        ] {
+            let (status, body) = setup.send(
+                method,
+                path,
+                r#"{"allow": [], "refuse": ["a.example.org"]}"#,
+            );
+            assert_eq!(status, 404, "{method} {path}");
+            assert_eq!(error_key(&body), "not_found", "{method} {path}");
+        }
+        assert_eq!(get_names(&setup)["rev"], json!(0));
+        assert!(!blocked(&setup, "a.example.org"));
+    }
+
+    /// The state of the lock as the panel sees it.
+    fn lock_of(setup: &Setup) -> (bool, Option<Source>) {
+        let view = setup.watch.panel.lock_view();
+        (view.on, view.source)
+    }
+
+    /// A PIN's hash line for the digits `pin`, 10,000 rounds, and a salt of its own.
+    fn pin_line(pin: &[u8; 4]) -> String {
+        crate::api::password::PasswordHash::with_rounds(
+            pin,
+            [5; 16],
+            crate::api::password::PIN_ROUNDS,
+        )
+        .to_text()
+    }
+
+    #[test]
+    fn the_panel_starts_with_the_hours_and_no_lock_and_says_only_that() {
+        let setup = Setup::new();
+        let (status, body) = setup.send("GET", "/api/qbp/panel", "");
+        assert_eq!(status, 200);
+        assert_eq!(body["night"], json!("23-07"));
+        assert_eq!(body["lock"], json!({"on": false, "source": null}));
+        // The answer holds what it says, and the time it took.
+        assert!(
+            body.as_object().unwrap().len() == 3 && body["took"].is_f64(),
+            "{body}"
+        );
+        // A boot with a PIN in its configuration says where it lives, and nothing of the hash.
+        let hash = crate::api::password::PasswordHash::parse(&pin_line(b"1234")).unwrap();
+        let watch = Arc::new(QbpWatch {
+            alerts: setup.watch.alerts.clone(),
+            devices: setup.watch.devices.clone(),
+            names: setup.watch.names.clone(),
+            panel: Arc::new(PanelState::new(Some(hash), None, Arc::new(|| 1_000))),
+        });
+        let api = plain_api().with_watch(watch);
+        let sid = login(&api);
+        let (status, body) = ask(&api, "GET", "/api/qbp/panel", Some(&sid), b"");
+        assert_eq!(status, 200);
+        assert_eq!(body["night"], Value::Null);
+        assert_eq!(body["lock"], json!({"on": true, "source": "config"}));
+        let text = body.to_string();
+        assert!(!text.contains("pbkdf2") && !text.contains("hash"), "{text}");
+    }
+
+    #[test]
+    fn a_push_sets_the_night_and_the_pin_and_the_panel_sees_both() {
+        let setup = Setup::new();
+        let line = pin_line(b"4321");
+        let (status, body) = setup.send(
+            "PUT",
+            "/api/qbp/panel",
+            &json!({"night": "22-06", "pin_hash": line}).to_string(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["night"], json!("22-06"));
+        assert_eq!(body["lock"], json!({"on": true, "source": "api"}));
+        // The answer never carries the hash, nor the body's words.
+        let text = body.to_string();
+        assert!(!text.contains(&line) && !text.contains("pbkdf2"), "{text}");
+        // The panel's own state is the one that changed, and it checks the PIN pushed.
+        assert_eq!(setup.watch.panel.night(), Some((22, 6)));
+        assert_eq!(lock_of(&setup), (true, Some(Source::Api)));
+        assert_eq!(
+            setup
+                .watch
+                .panel
+                .verify(zeroize::Zeroizing::new([4, 3, 2, 1])),
+            crate::panel::lock::Check::Right
+        );
+        let (_, again) = setup.send("GET", "/api/qbp/panel", "");
+        assert_eq!(again["night"], json!("22-06"));
+        assert_eq!(again["lock"], json!({"on": true, "source": "api"}));
+        // One key at a time leaves the other as it is.
+        let (status, body) = setup.send("PUT", "/api/qbp/panel", r#"{"night": "01-05"}"#);
+        assert_eq!(status, 200);
+        assert_eq!(body["night"], json!("01-05"));
+        assert_eq!(body["lock"]["on"], json!(true));
+        let (status, body) = setup.send(
+            "PUT",
+            "/api/qbp/panel",
+            &json!({"pin_hash": pin_line(b"0000")}).to_string(),
+        );
+        assert_eq!((status, &body["night"]), (200, &json!("01-05")));
+        assert_eq!(
+            setup
+                .watch
+                .panel
+                .verify(zeroize::Zeroizing::new([4, 3, 2, 1])),
+            crate::panel::lock::Check::Wrong,
+            "the latest set wins"
+        );
+    }
+
+    #[test]
+    fn a_push_takes_the_line_hash_pin_prints_as_well_as_the_bare_hash() {
+        let setup = Setup::new();
+        let right = |digits: [u8; 4]| setup.watch.panel.verify(zeroize::Zeroizing::new(digits));
+        // The whole line as the tool prints it, line ending and all: qnet sends what it was given.
+        let printed = format!("pin_hash = \"{}\"\n", pin_line(b"4321"));
+        let (status, body) = setup.send(
+            "PUT",
+            "/api/qbp/panel",
+            &json!({"pin_hash": printed}).to_string(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["lock"], json!({"on": true, "source": "api"}));
+        let text = body.to_string();
+        assert!(
+            !text.contains("pbkdf2") && !text.contains("pin_hash"),
+            "{text}"
+        );
+        assert_eq!(right([4, 3, 2, 1]), crate::panel::lock::Check::Right);
+        // The bare hash still works, and the latest set wins.
+        let (status, _) = setup.send(
+            "PUT",
+            "/api/qbp/panel",
+            &json!({"pin_hash": pin_line(b"0000")}).to_string(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(right([4, 3, 2, 1]), crate::panel::lock::Check::Wrong);
+        assert_eq!(right([0, 0, 0, 0]), crate::panel::lock::Check::Right);
+    }
+
+    #[test]
+    fn a_null_clears_the_pin_and_turns_the_night_off() {
+        let setup = Setup::new();
+        setup.send(
+            "PUT",
+            "/api/qbp/panel",
+            &json!({"pin_hash": pin_line(b"1234")}).to_string(),
+        );
+        assert_eq!(lock_of(&setup), (true, Some(Source::Api)));
+        let (status, body) = setup.send("PUT", "/api/qbp/panel", r#"{"pin_hash": null}"#);
+        assert_eq!(status, 200);
+        assert_eq!(body["lock"], json!({"on": false, "source": null}));
+        assert_eq!(body["night"], json!("23-07"), "the other key stays");
+        assert_eq!(lock_of(&setup), (false, None));
+        let (status, body) = setup.send("PUT", "/api/qbp/panel", r#"{"night": null}"#);
+        assert_eq!(status, 200);
+        assert_eq!(body["night"], Value::Null);
+        assert_eq!(setup.watch.panel.night(), None);
+        let (_, shown) = setup.send("GET", "/api/qbp/panel", "");
+        assert_eq!(shown["night"], Value::Null);
+        // Both at once.
+        let (status, _) = setup.send(
+            "PUT",
+            "/api/qbp/panel",
+            &json!({"night": "23-07", "pin_hash": pin_line(b"1111")}).to_string(),
+        );
+        assert_eq!(status, 200);
+        let (status, body) = setup.send(
+            "PUT",
+            "/api/qbp/panel",
+            r#"{"night": null, "pin_hash": null}"#,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["night"], Value::Null);
+        assert_eq!(body["lock"]["on"], json!(false));
+    }
+
+    #[test]
+    fn a_bad_body_of_the_panel_is_a_400_and_changes_nothing_and_repeats_nothing() {
+        let setup = Setup::new();
+        let good = pin_line(b"1234");
+        setup.send(
+            "PUT",
+            "/api/qbp/panel",
+            &json!({"pin_hash": good, "night": "22-06"}).to_string(),
+        );
+        let salt = "05".repeat(16);
+        let hash = "ab".repeat(32);
+        let too_slow = format!("$pbkdf2-sha256$i=10000000${salt}${hash}");
+        let too_fast = format!("$pbkdf2-sha256$i=9999${salt}${hash}");
+        // A hash of a password, not of a PIN: it would hold the panel's thread for a second.
+        let password_rounds = format!("$pbkdf2-sha256$i=100000${salt}${hash}");
+        let bad = [
+            "".to_owned(),
+            "[]".to_owned(),
+            "{".to_owned(),
+            "{}".to_owned(),
+            r#"{"other": 1}"#.to_owned(),
+            r#"{"night": "secret-night"}"#.to_owned(),
+            r#"{"night": "7-23"}"#.to_owned(),
+            r#"{"night": "07-07"}"#.to_owned(),
+            r#"{"night": "24-01"}"#.to_owned(),
+            r#"{"night": "off"}"#.to_owned(),
+            r#"{"night": 23}"#.to_owned(),
+            r#"{"night": ["23-07"]}"#.to_owned(),
+            r#"{"pin_hash": "secret-pin"}"#.to_owned(),
+            r#"{"pin_hash": ""}"#.to_owned(),
+            r#"{"pin_hash": 1234}"#.to_owned(),
+            r#"{"pin_hash": false}"#.to_owned(),
+            json!({"pin_hash": too_slow}).to_string(),
+            json!({"pin_hash": too_fast}).to_string(),
+            json!({"pin_hash": password_rounds}).to_string(),
+            json!({"pin_hash": format!("pin_hash = \"{password_rounds}\"")}).to_string(),
+            json!({"pin_hash": format!("{good} ")}).to_string(),
+            // A wrapper that is not exactly the line `hash-pin` prints changes nothing.
+            json!({"pin_hash": format!("pin_hash = \"{good}")}).to_string(),
+            json!({"pin_hash": format!("pin_hash=\"{good}\"")}).to_string(),
+            json!({"pin_hash": format!("pin_hash = '{good}'")}).to_string(),
+            json!({"pin_hash": format!("pin_hash = \"{good}\" # mine")}).to_string(),
+            json!({"pin_hash": format!("pin_hash = \"{} \"", pin_line(b"9999"))}).to_string(),
+            json!({"pin_hash": format!("password_hash = \"{good}\"")}).to_string(),
+            json!({"night": "01-02", "pin_hash": format!("pin_hash = \"{}", pin_line(b"9999"))})
+                .to_string(),
+            // A good half does not carry a bad one.
+            json!({"night": "01-02", "pin_hash": "secret-pin"}).to_string(),
+            json!({"night": "secret-night", "pin_hash": pin_line(b"9999")}).to_string(),
+            json!({"night": null, "pin_hash": 5}).to_string(),
+        ];
+        for body in &bad {
+            let (status, answer) = setup.send("PUT", "/api/qbp/panel", body);
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(error_key(&answer), "bad_request", "{body}");
+            let text = answer.to_string();
+            assert!(
+                !text.contains("secret") && !text.contains(&hash) && !text.contains(&salt),
+                "{body}"
+            );
+        }
+        // Nothing changed: the night, the lock, and the PIN that is checked.
+        assert_eq!(setup.watch.panel.night(), Some((22, 6)));
+        assert_eq!(lock_of(&setup), (true, Some(Source::Api)));
+        assert_eq!(
+            setup
+                .watch
+                .panel
+                .verify(zeroize::Zeroizing::new([1, 2, 3, 4])),
+            crate::panel::lock::Check::Right
+        );
+    }
+
+    #[test]
+    fn the_panel_answers_get_and_put_and_a_405_for_the_rest_and_a_404_with_a_query() {
+        let setup = Setup::new();
+        for method in ["POST", "DELETE", "PATCH", "HEAD", "OPTIONS", "get", "put"] {
+            let (status, body) = setup.send(method, "/api/qbp/panel", r#"{"night": null}"#);
+            assert_eq!(status, 405, "{method}");
+            assert_eq!(error_key(&body), "method_not_allowed", "{method}");
+        }
+        for (method, path) in [
+            ("GET", "/api/qbp/panel/"),
+            ("GET", "/api/qbp/Panel"),
+            ("PUT", "/api/qbp/panel/lock"),
+            ("GET", "/api/qbp/panel?x=1"),
+            ("PUT", "/api/qbp/panel?night=off"),
+        ] {
+            let (status, body) = setup.send(method, path, r#"{"night": null}"#);
+            assert_eq!(status, 404, "{method} {path}");
+            assert_eq!(error_key(&body), "not_found", "{method} {path}");
+        }
+        assert_eq!(setup.watch.panel.night(), Some((23, 7)));
+        // Behind the login like every path under /api/qbp/.
+        let (status, _) = ask(&setup.api, "GET", "/api/qbp/panel", None, b"");
+        assert_eq!(status, 401);
+        let (status, _) = ask(
+            &setup.api,
+            "PUT",
+            "/api/qbp/panel",
+            None,
+            br#"{"night": null}"#,
+        );
+        assert_eq!(status, 401);
+        assert_eq!(setup.watch.panel.night(), Some((23, 7)));
+    }
+
     #[test]
     fn a_known_path_with_another_method_is_a_405_and_changes_nothing() {
         let setup = Setup::new();
@@ -2053,7 +2924,7 @@ mod tests {
         let setup = Setup::new();
         setup.raise("dga", Some(client(7)), "random NXDOMAIN names");
         setup.hear(mac(5), "laptop");
-        let body = br#"{"acked": ["0123456789abcdef"], "known": ["02:00:00:00:00:05"], "exempt": ["02:00:00:00:00:05"], "exempt_default": true, "block": ["02:00:00:00:00:05"], "labels": [["02:00:00:00:00:05", "Desk PC"]], "mac": "02:00:00:00:00:05", "secs": 60}"#;
+        let body = br#"{"acked": ["0123456789abcdef"], "known": ["02:00:00:00:00:05"], "exempt": ["02:00:00:00:00:05"], "exempt_default": true, "block": ["02:00:00:00:00:05"], "labels": [["02:00:00:00:00:05", "Desk PC"]], "allow": ["allowed.example.org"], "refuse": ["refused.example.org"], "mac": "02:00:00:00:00:05", "secs": 60}"#;
         let requests = [
             ("GET", "/api/qbp/alerts"),
             ("GET", "/api/qbp/alerts?since=0"),
@@ -2065,6 +2936,8 @@ mod tests {
             ("PUT", "/api/qbp/devices/policy"),
             ("PUT", "/api/qbp/devices/labels"),
             ("PUT", "/api/qbp/devices/gate"),
+            ("GET", "/api/qbp/names"),
+            ("PUT", "/api/qbp/names"),
             ("GET", "/api/qbp/nope"),
             ("GET", "/api/qbp/"),
             ("DELETE", "/api/qbp/alerts"),
@@ -2090,6 +2963,12 @@ mod tests {
             (&devices["exempt_default"], &devices["block_macs"]),
             (&json!(false), &json!([]))
         );
+        // No name was allowed or refused.
+        let names = get_names(&setup);
+        assert_eq!(
+            (&names["rev"], &names["allow"], &names["refuse"]),
+            (&json!(0), &json!([]), &json!([]))
+        );
         // No label, no gate and no revision moved.
         assert_eq!(devices["rev"], json!(0));
         assert_eq!(devices["devices"][0]["label"], json!(null));
@@ -2108,6 +2987,8 @@ mod tests {
             ("PUT", "/api/qbp/devices/policy"),
             ("PUT", "/api/qbp/devices/labels"),
             ("PUT", "/api/qbp/devices/gate"),
+            ("GET", "/api/qbp/names"),
+            ("PUT", "/api/qbp/names"),
             ("GET", "/api/qbp/"),
         ] {
             let (status, body) = ask(&api, method, path, Some(&sid), b"{}");
@@ -2171,19 +3052,25 @@ mod tests {
             })
         };
         let store = Arc::new(AlertStore::new(probe));
-        let devices = Arc::new(Mutex::new(Devices::new(
-            None,
-            Ipv4Addr::new(192, 0, 2, 1),
-            clock(),
-        )));
+        let devices = Arc::new(Mutex::new(
+            Devices::new(None, Ipv4Addr::new(192, 0, 2, 1), clock()).starting_at(0),
+        ));
         cell.set(devices.clone()).ok().unwrap();
+        let resolver = resolver();
         let watch = Arc::new(QbpWatch {
             alerts: store,
             devices,
+            names: Arc::new(OwnerList::new(resolver.clone()).starting_at(0)),
+            panel: panel_state_at_start(),
         });
         let api = plain_api().with_watch(watch.clone());
         let sid = login(&api);
-        let setup = Setup { api, watch, sid };
+        let setup = Setup {
+            api,
+            watch,
+            sid,
+            resolver,
+        };
 
         // Three devices are heard and none is listed: the list raises three alerts.
         for n in 20..23 {

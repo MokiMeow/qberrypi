@@ -12,7 +12,10 @@
 //!
 //! - `top()` is the newest unacknowledged alert of the highest severity, mapped to a
 //!   [`PanelAlert`] whose `id` is the alert's `AlertView.id`;
-//! - `waiting_count()` is how many alerts are not acknowledged;
+//! - `waiting_count()` is how many alerts are not acknowledged, and `waiting(n)` the newest `n` of them,
+//!   the newest first, each a [`PanelAlert`] (the ALERTS list);
+//! - `last_alert_unix()` is when the store last filed an alert at all, for the screen that says
+//!   `NOTHING TO REPORT`;
 //! - `ack(id)` is the store's `ack(id)`;
 //! - the store's `Severity` has the same three variants, so a `From` impl is enough.
 //!
@@ -77,6 +80,16 @@ pub trait PendingAlerts: Send + Sync {
     /// How many alerts are waiting: not acknowledged.
     fn waiting_count(&self) -> u32;
 
+    /// The newest `n` alerts that are waiting, the newest first: the one raised last, which is the
+    /// one with the highest id, and not the one that repeated last, as for `top`. One pass over the
+    /// store under its own lock, and one copy of at most `n` alerts.
+    fn waiting(&self, n: usize) -> Vec<PanelAlert>;
+
+    /// The Unix time of the last time any alert was raised, repeats included, or `None` when none
+    /// ever was since the board started. Acknowledged alerts count, and so do those that the store
+    /// has since let go: it is when the watch last filed one.
+    fn last_alert_unix(&self) -> Option<u64>;
+
     /// Marks the alert `id` as seen, so that `top` stops giving it. An `id` that is not known is
     /// not an error.
     fn ack(&self, id: u64);
@@ -94,6 +107,14 @@ impl PendingAlerts for NoAlerts {
         0
     }
 
+    fn waiting(&self, _n: usize) -> Vec<PanelAlert> {
+        Vec::new()
+    }
+
+    fn last_alert_unix(&self) -> Option<u64> {
+        None
+    }
+
     fn ack(&self, _id: u64) {}
 }
 
@@ -106,6 +127,8 @@ mod tests {
         let alerts: &dyn PendingAlerts = &NoAlerts;
         assert!(alerts.top().is_none());
         assert_eq!(alerts.waiting_count(), 0);
+        assert!(alerts.waiting(3).is_empty());
+        assert_eq!(alerts.last_alert_unix(), None);
         alerts.ack(7);
         assert!(alerts.top().is_none());
     }

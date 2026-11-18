@@ -11,7 +11,7 @@ use crate::cache::{CACHE_CAPACITY, Cache, Hit, Key, STALE_TTL, is_definitive, li
 use crate::name::{MAX_NAME_LEN, normalize};
 use crate::query::{Parsed, Question, ResponseCode, parse_query};
 use crate::stats::{BLOCKED_NAMES_TRACKED, Outcome, QUERY_LOG_CAPACITY, Stats};
-use crate::{BlockSet, ListClass, Now, Transport};
+use crate::{BlockSet, ListClass, Now, OwnerNames, Transport};
 
 /// The name of the canary domain that Firefox asks for before it turns DNS over HTTPS on: a
 /// resolver that answers it with NXDOMAIN tells the browser to leave its DNS to the network.
@@ -34,7 +34,8 @@ pub enum Filter {
     All,
     /// The threat lists alone, for a client that is exempt from ad blocking: a name that only an
     /// ads list or a deny entry blocks is answered as if it were on no list, from the cache or an
-    /// upstream. The DoH canary, the local answers and a pause apply as for any client.
+    /// upstream. The DoH canary and the local answers apply as for any client; a pause holds every
+    /// client to the threat lists, so for this one it changes nothing.
     ThreatsOnly,
 }
 
@@ -163,11 +164,15 @@ enum Decision {
 /// - The blocked-name counts, under 1 MB: 1,024 names of at most 253 bytes, as only a name that
 ///   could be on a list is blocked, each with 24 hourly counts.
 /// - The history, about 6 KB: 144 ten-minute buckets of 40 bytes each, always all there.
+/// - The owner's names, about 70 KB: 128 allowed and 128 refused names of at most 253 bytes.
 ///
 /// The block set has no cap of its own: whoever builds it caps the size of the lists.
 pub struct Resolver {
     /// The names to block.
     blockset: BlockSet,
+    /// The names the owner allows and refuses, beside the block set so that a new block set
+    /// leaves them as they are. Empty until set.
+    owner: OwnerNames,
     /// Upstream answers by name, type and DO bit.
     cache: Cache,
     /// The counters and the query log.
@@ -183,6 +188,7 @@ impl Resolver {
     pub fn new(blockset: BlockSet) -> Self {
         Self {
             blockset,
+            owner: OwnerNames::default(),
             cache: Cache::new(CACHE_CAPACITY),
             stats: Stats::new(QUERY_LOG_CAPACITY, BLOCKED_NAMES_TRACKED),
             paused_until: None,
@@ -205,6 +211,23 @@ impl Resolver {
         std::mem::replace(&mut self.blockset, blockset)
     }
 
+    /// Replaces the owner's names (see [`OwnerNames`]) and gives the old ones back; the block set,
+    /// the cache, the pause and the statistics stay as they are. The names take effect on the next
+    /// query.
+    ///
+    /// Build `names` before taking the lock on the resolver, and drop what comes back after
+    /// letting it go: nothing here moves more than the two lists' handles, and the caller frees
+    /// the old names where and when it likes, as for [`replace_blockset`](Self::replace_blockset).
+    #[must_use = "drop the old names after the lock on the resolver is let go"]
+    pub fn set_owner_names(&mut self, names: OwnerNames) -> OwnerNames {
+        std::mem::replace(&mut self.owner, names)
+    }
+
+    /// The owner's names now in force.
+    pub fn owner_names(&self) -> &OwnerNames {
+        &self.owner
+    }
+
     /// Decides one packet from a client. Never panics, whatever the bytes.
     ///
     /// This is [`handle_query_threat`](Self::handle_query_threat) without the report of a threat;
@@ -224,11 +247,20 @@ impl Resolver {
     /// 3. The DoH canary, [`DOH_CANARY`], gets NXDOMAIN for any type, unless the canary was
     ///    turned off with [`set_doh_canary`](Self::set_doh_canary). It is counted as answered
     ///    here, not as blocked, so a deny entry for it changes nothing.
-    /// 4. A blocked name gets the blocked reply, unless blocking is paused. If the block is of
-    ///    a threat list, the packet's [`ThreatHit`] comes back with it, and the query is also
-    ///    counted in [`Counts::blocked_threat`](crate::Counts::blocked_threat). For a client held
+    /// 4. A blocked name gets the blocked reply. While blocking is paused every client is held
+    ///    to [`Filter::ThreatsOnly`], whatever it is held to otherwise: an ads list and a `deny`
+    ///    entry let their names through, and a threat list and the owner's refusals still block.
+    ///    If the block is of a threat list, the packet's [`ThreatHit`] comes back with it, and
+    ///    the query is also counted in
+    ///    [`Counts::blocked_threat`](crate::Counts::blocked_threat). For a client held
     ///    to [`Filter::ThreatsOnly`] ([`handle_query_filtered`](Self::handle_query_filtered)) only
-    ///    a block of a threat list applies, and any other name goes on to step 5.
+    ///    a block of a threat list applies, and any other name goes on to step 5. The owner's
+    ///    names ([`set_owner_names`](Self::set_owner_names)) come into it: a name the owner
+    ///    refuses is blocked for every client, as one that no list holds, so it is never a threat
+    ///    on the owner's account; a name that only an ads list or a `deny` entry blocks, and the
+    ///    owner allows, is not blocked; a name on a threat list stays blocked whatever the owner
+    ///    says of it, bar the configuration's own `allow` entries. A refused name wins over an
+    ///    allowed one, and a pause lifts neither a refusal nor a threat.
     /// 5. A cached answer is sent, every TTL being the lifetime it has left.
     /// 6. A stale one is sent with short TTLs, and an upstream is asked to renew it unless one
     ///    was asked within the last seconds.
@@ -376,15 +408,27 @@ impl Resolver {
     }
 
     /// Whether the block set blocks `name`, whether or not blocking is paused: what a query for
-    /// it would get if blocking were on. The allow rules apply as they do to a query.
+    /// it would get if blocking were on. The allow rules of the configuration apply as they do
+    /// to a query; the owner's names ([`set_owner_names`](Self::set_owner_names)) are not asked.
     ///
     /// `name` may be spelled as the log holds it or as a client wrote it: it is lower-cased and
     /// loses one trailing dot first, in a buffer on the stack, so nothing is allocated. A name
     /// that cannot be on a list (a character outside `a-z 0-9 - _`, an empty label, a last label
     /// of digits only, or more than 253 bytes) is not blocked, as in [`Resolver::handle_query`].
     pub fn lists(&self, name: &str) -> bool {
+        self.list_class(name).is_some()
+    }
+
+    /// The class of the list that blocks `name`, as [`lists`](Self::lists) reads it: `None` if the
+    /// block set does not block it. A `deny` entry of the configuration is an [`ListClass::Ads`]
+    /// block; the set does not tell it from an ad. Neither a pause nor the owner's names are
+    /// asked, so a threat is a [`ListClass::Threat`] even if the owner has allowed it.
+    ///
+    /// For a reading, never for deciding a query: it normalises its argument, in a buffer on the
+    /// stack, and allocates nothing.
+    pub fn list_class(&self, name: &str) -> Option<ListClass> {
         let mut buf = [0; MAX_NAME_LEN];
-        normalize(name.as_bytes(), &mut buf).is_some_and(|name| self.blockset.is_blocked(name))
+        normalize(name.as_bytes(), &mut buf).and_then(|name| self.blockset.verdict(name))
     }
 
     /// Sets local time minus UTC in seconds, which places the midnight where "today" starts.
@@ -440,16 +484,65 @@ impl Resolver {
     }
 
     /// The class of the block that `question` is to get at `now` for a client held to `filter`,
-    /// or `None` if it is to get none: blocking is paused, or the name is not one the block set
-    /// could hold, or does not block, or blocks only as an ad and the client is held to threats
-    /// only.
+    /// or `None` if it is to get none: the name is not one the block set could hold, or does not
+    /// block, or blocks only as an ad and the client is held to threats only, or blocks only as
+    /// an ad and the owner allows the name. A name the owner refuses is blocked whatever the
+    /// client is held to.
+    ///
+    /// A pause holds every client to [`Filter::ThreatsOnly`] (the ads lists and the `deny`
+    /// entries let their names through), and no more: a threat list and the owner's refusals
+    /// still block, for the exempt clients as for any other. The unpaused path is the one check
+    /// of the deadline that it always was, and the paused path is kept cold and apart from it.
     fn block_class(&self, question: &Question, now: Now, filter: Filter) -> Option<ListClass> {
         if self.paused_until(now).is_some() {
-            return None;
+            return self.block_class_while_paused(question);
         }
-        self.blockset
-            .verdict(question.block_key()?)
-            .filter(|&class| filter == Filter::All || class == ListClass::Threat)
+        self.block_class_for(question, filter)
+    }
+
+    /// [`block_class`](Self::block_class) while blocking is paused: every client is held to
+    /// threats only. Kept apart and cold, so that the unpaused path is laid out as it was.
+    #[cold]
+    #[inline(never)]
+    fn block_class_while_paused(&self, question: &Question) -> Option<ListClass> {
+        self.block_class_for(question, Filter::ThreatsOnly)
+    }
+
+    /// The class of the block for a client held to `filter`, pause aside.
+    #[inline(always)]
+    fn block_class_for(&self, question: &Question, filter: Filter) -> Option<ListClass> {
+        let key = question.block_key()?;
+        let class = self.blockset.verdict(key);
+        // With no owner names, which is the usual case, this is the whole cost of them.
+        if self.owner.is_empty() {
+            return class.filter(|&class| filter == Filter::All || class == ListClass::Threat);
+        }
+        self.block_class_with_owner_names(key, class, filter)
+    }
+
+    /// [`block_class`](Self::block_class) for a name that the block set gives `class`, when the
+    /// owner has names of their own: kept apart so that the usual case does not carry it.
+    #[inline(never)]
+    fn block_class_with_owner_names(
+        &self,
+        key: &str,
+        class: Option<ListClass>,
+        filter: Filter,
+    ) -> Option<ListClass> {
+        if self.owner.refuses(key) {
+            // For every client, the exempt ones too. It is a threat only if a list says so.
+            return Some(if class == Some(ListClass::Threat) {
+                ListClass::Threat
+            } else {
+                ListClass::Ads
+            });
+        }
+        // An ad is lifted; a threat is not, and never was on the lists of ads.
+        let class = match class {
+            Some(ListClass::Ads) if self.owner.allows(key) => None,
+            other => other,
+        };
+        class.filter(|&class| filter == Filter::All || class == ListClass::Threat)
     }
 
     /// The reply to `question` from the cache, or `None` on a miss. A stored answer that cannot
@@ -539,7 +632,7 @@ mod tests {
         Q_AAAA_EDNS, Q_DIG, Q_DO, Q_MIXED, Q_NODATA, Q_PLAIN, R_A, R_NODATA, R_NXDOMAIN, Rng,
         decode, query, unhex,
     };
-    use crate::{BlockSetBuilder, Counts, ListClass};
+    use crate::{BlockSetBuilder, Counts, ListClass, OwnerSide};
 
     /// The query of Review Focus 2: `Q_PLAIN` with the one label `a.b`, 3 bytes, put before
     /// `example.com`.
@@ -860,14 +953,321 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_forwards_a_threat_for_a_client_held_to_threats_only_as_for_any_other() {
+    fn a_pause_blocks_a_threat_for_a_client_held_to_threats_only_as_for_any_other() {
         let mut r = threat_resolver();
         r.pause_until(1300);
         let (action, hit) = ask_as(&mut r, Filter::ThreatsOnly, "x.bad.example.net", 1, 1299);
-        assert!(matches!(action, Action::Forward(_)));
-        assert_eq!(hit, None);
-        let (_, hit) = ask_as(&mut r, Filter::ThreatsOnly, "x.bad.example.net", 1, 1300);
+        assert!(is_blocked_reply(&reply(action)));
         assert!(hit.is_some());
+        let (action, hit) = ask_as(&mut r, Filter::ThreatsOnly, "x.bad.example.net", 1, 1300);
+        assert!(is_blocked_reply(&reply(action)));
+        assert!(hit.is_some());
+    }
+
+    #[test]
+    fn a_pause_holds_every_client_to_threats_only() {
+        let mut r = threat_resolver();
+        r.pause_until(1300);
+        // The ads list lets its name through for a client held to every list, and for one held to
+        // threats only, which a pause does not change; a threat is blocked for both.
+        for filter in [Filter::All, Filter::ThreatsOnly] {
+            let (action, hit) = ask_as(&mut r, filter, "ads.example.com", 1, 1299);
+            assert!(matches!(action, Action::Forward(_)), "{filter:?}");
+            assert_eq!(hit, None);
+            let (action, hit) = ask_as(&mut r, filter, "x.bad.example.net", 1, 1299);
+            assert!(is_blocked_reply(&reply(action)), "{filter:?}");
+            assert!(hit.is_some(), "{filter:?}");
+        }
+        // Once the pause ends the ads list blocks for a client held to every list again.
+        let (action, _) = ask_as(&mut r, Filter::All, "ads.example.com", 1, 1300);
+        assert!(is_blocked_reply(&reply(action)));
+        let (action, _) = ask_as(&mut r, Filter::ThreatsOnly, "ads.example.com", 1, 1300);
+        assert!(matches!(action, Action::Forward(_)));
+    }
+
+    /// `r` with the owner's names set to `allow` and `refuse`, as a caller does it.
+    fn with_owner(mut r: Resolver, allow: &[&str], refuse: &[&str]) -> Resolver {
+        drop(r.set_owner_names(OwnerNames::new(allow, refuse).unwrap()));
+        r
+    }
+
+    /// Whether `r` blocks `name` for a client held to `filter` at 100: the blocked reply, or the
+    /// name goes on, and whether it reports a threat.
+    fn blocks(r: &mut Resolver, filter: Filter, name: &str) -> (bool, bool) {
+        blocks_at(r, filter, name, 100)
+    }
+
+    /// [`blocks`] at the monotonic second `mono`.
+    fn blocks_at(r: &mut Resolver, filter: Filter, name: &str, mono: u64) -> (bool, bool) {
+        let (action, hit) = ask_as(r, filter, name, 1, mono);
+        let blocked = match action {
+            Action::Reply(bytes) => is_blocked_reply(&bytes),
+            Action::Forward(_) => false,
+            other => panic!("neither blocked nor forwarded: {other:?}"),
+        };
+        (blocked, hit.is_some())
+    }
+
+    #[test]
+    fn a_name_the_owner_refuses_is_blocked_for_every_client_and_is_no_threat() {
+        let mut r = with_owner(resolver(), &[], &["Refused.Example.org."]);
+        for filter in [Filter::All, Filter::ThreatsOnly] {
+            // Itself, a subdomain, any spelling: blocked. Not a threat, so no hit.
+            for name in [
+                "refused.example.org",
+                "a.b.refused.example.org",
+                "REFUSED.example.ORG",
+            ] {
+                assert_eq!(
+                    blocks(&mut r, filter, name),
+                    (true, false),
+                    "{filter:?} {name}"
+                );
+            }
+            // A name that only ends the same way is not a subdomain.
+            assert_eq!(
+                blocks(&mut r, filter, "notrefused.example.org"),
+                (false, false)
+            );
+            assert_eq!(blocks(&mut r, filter, "example.org"), (false, false));
+        }
+        // Counted as blocked, never as a threat.
+        let today = r.stats().today(at(100));
+        assert_eq!((today.blocked, today.blocked_threat), (6, 0));
+        assert_eq!(r.stats().total().blocked_threat, 0);
+        // The block is of the owner's making: the lists do not hold the name.
+        assert!(!r.lists("refused.example.org"));
+        assert_eq!(r.list_class("refused.example.org"), None);
+        // The qtype does not matter.
+        let (action, _) = ask_as(&mut r, Filter::All, "refused.example.org", 28, 101);
+        assert_eq!(decode(&reply(action)).answers[0].data.to_string(), "::");
+    }
+
+    #[test]
+    fn a_refused_name_beats_the_cache_and_a_cleared_one_is_answered_again() {
+        let mut r = resolver();
+        let (action, _) = ask_as(&mut r, Filter::All, "cached.example.org", 1, 1000);
+        let Action::Forward(p) = action else {
+            panic!("not forwarded: {action:?}")
+        };
+        let answer = answer_for(&p, 1).to_vec().unwrap();
+        relayed(r.handle_upstream(&p, &answer, Transport::Udp, at(1000)));
+        let (action, _) = ask_as(&mut r, Filter::All, "cached.example.org", 1, 1001);
+        assert_eq!(decode(&reply(action)).answers.len(), 2);
+
+        let old = r.set_owner_names(OwnerNames::new([] as [&str; 0], ["example.org"]).unwrap());
+        assert!(old.is_empty());
+        for filter in [Filter::All, Filter::ThreatsOnly] {
+            let (action, hit) = ask_as(&mut r, filter, "cached.example.org", 1, 1002);
+            assert!(is_blocked_reply(&reply(action)) && hit.is_none());
+        }
+        // Taken back, the stored answer is served again, and the old names come back to the
+        // caller to free.
+        let old = r.set_owner_names(OwnerNames::default());
+        assert_eq!(old.refuse_names().collect::<Vec<_>>(), ["example.org"]);
+        let (action, _) = ask_as(&mut r, Filter::All, "cached.example.org", 1, 1003);
+        assert_eq!(decode(&reply(action)).answers.len(), 2);
+    }
+
+    #[test]
+    fn a_name_the_owner_allows_is_let_through_unless_a_threat_list_holds_it() {
+        let mut b = BlockSetBuilder::new();
+        b.add_list(b"0.0.0.0 ads.example.com\n||tracker.example.net^\n");
+        b.deny("denied.example.org").unwrap();
+        b.add_list_as(
+            b"||bad.example.net^\n0.0.0.0 evil.example.com\n",
+            ListClass::Threat,
+        );
+        let mut r = with_owner(
+            Resolver::new(b.build()),
+            &[
+                "ads.example.com",
+                "tracker.example.net",
+                "denied.example.org",
+                "bad.example.net",
+                "evil.example.com",
+            ],
+            &[],
+        );
+        for filter in [Filter::All, Filter::ThreatsOnly] {
+            // An ad, a subdomain of an ad suffix and a deny entry are let through: forwarded.
+            for name in [
+                "ads.example.com",
+                "tracker.example.net",
+                "x.tracker.example.net",
+                "denied.example.org",
+                "x.denied.example.org",
+            ] {
+                assert_eq!(
+                    blocks(&mut r, filter, name),
+                    (false, false),
+                    "{filter:?} {name}"
+                );
+            }
+            // A threat stays blocked and reported, whatever the owner says: the suffix entry, a
+            // subdomain of it and an exact entry.
+            for name in ["bad.example.net", "x.bad.example.net", "evil.example.com"] {
+                assert_eq!(
+                    blocks(&mut r, filter, name),
+                    (true, true),
+                    "{filter:?} {name}"
+                );
+            }
+        }
+        // Without the owner's names the ads are blocked again for a client held to every list.
+        drop(r.set_owner_names(OwnerNames::default()));
+        assert_eq!(
+            blocks(&mut r, Filter::All, "ads.example.com"),
+            (true, false)
+        );
+        assert_eq!(
+            blocks(&mut r, Filter::All, "x.denied.example.org"),
+            (true, false)
+        );
+        // What the lists say is the same all along.
+        assert_eq!(r.list_class("x.bad.example.net"), Some(ListClass::Threat));
+        assert_eq!(r.list_class("X.Denied.Example.Org."), Some(ListClass::Ads));
+        assert_eq!(r.list_class("example.org"), None);
+        assert_eq!(r.list_class("not a name"), None);
+    }
+
+    #[test]
+    fn a_refused_threat_is_still_a_threat() {
+        let mut r = with_owner(
+            threat_resolver(),
+            &[],
+            &["bad.example.net", "ads.example.com"],
+        );
+        assert_eq!(
+            blocks(&mut r, Filter::All, "x.bad.example.net"),
+            (true, true)
+        );
+        assert_eq!(
+            blocks(&mut r, Filter::ThreatsOnly, "bad.example.net"),
+            (true, true)
+        );
+        // An ad that the owner also refuses is a block of the owner's, not a threat.
+        assert_eq!(
+            blocks(&mut r, Filter::ThreatsOnly, "ads.example.com"),
+            (true, false)
+        );
+        assert_eq!(r.stats().total().blocked_threat, 2);
+    }
+
+    #[test]
+    fn a_name_refused_and_allowed_is_refused_and_a_pause_lifts_only_the_allowed_ad() {
+        let mut r = with_owner(
+            resolver(),
+            &["example.org", "ads.example.com"],
+            &["a.example.org"],
+        );
+        assert_eq!(blocks(&mut r, Filter::All, "a.example.org"), (true, false));
+        assert_eq!(
+            blocks(&mut r, Filter::All, "x.a.example.org"),
+            (true, false)
+        );
+        // The allowed parent lets the rest through, as there is nothing to block.
+        assert_eq!(blocks(&mut r, Filter::All, "b.example.org"), (false, false));
+        assert_eq!(
+            blocks(&mut r, Filter::All, "ads.example.com"),
+            (false, false)
+        );
+        // A pause does not lift what the owner refuses, for any client, any more than a threat.
+        r.pause_until(1300);
+        for filter in [Filter::All, Filter::ThreatsOnly] {
+            assert_eq!(
+                blocks_at(&mut r, filter, "a.example.org", 1299),
+                (true, false),
+                "{filter:?}"
+            );
+            assert_eq!(
+                blocks_at(&mut r, filter, "x.a.example.org", 1299),
+                (true, false),
+                "{filter:?}"
+            );
+        }
+        // It still lets through what only an ads list or a deny entry blocks, for any client.
+        let mut r = with_owner(resolver(), &[], &["a.example.org"]);
+        r.pause_until(1300);
+        assert_eq!(
+            blocks_at(&mut r, Filter::All, "ads.example.com", 1299),
+            (false, false)
+        );
+        assert_eq!(
+            blocks_at(&mut r, Filter::All, "ads.example.com", 1300),
+            (true, false)
+        );
+    }
+
+    #[test]
+    fn the_owners_names_survive_a_new_block_set() {
+        let mut r = with_owner(resolver(), &["ads.example.com"], &["refused.example.org"]);
+        assert_eq!(
+            blocks(&mut r, Filter::All, "refused.example.org"),
+            (true, false)
+        );
+        assert_eq!(
+            blocks(&mut r, Filter::All, "ads.example.com"),
+            (false, false)
+        );
+
+        let mut b = BlockSetBuilder::new();
+        b.add_list(b"0.0.0.0 ads.example.com\n");
+        drop(r.replace_blockset(b.build()));
+        assert_eq!(
+            blocks(&mut r, Filter::All, "refused.example.org"),
+            (true, false)
+        );
+        assert_eq!(
+            blocks(&mut r, Filter::All, "ads.example.com"),
+            (false, false)
+        );
+        r.set_blockset(BlockSet::default());
+        assert_eq!(
+            blocks(&mut r, Filter::All, "refused.example.org"),
+            (true, false)
+        );
+        assert_eq!(r.owner_names().refuse_names().len(), 1);
+        assert_eq!(
+            r.owner_names().side("x.refused.example.org"),
+            Some(OwnerSide::Refuse)
+        );
+    }
+
+    #[test]
+    fn empty_owner_names_change_nothing() {
+        let mut plain = threat_resolver();
+        let mut empty = with_owner(threat_resolver(), &[], &[]);
+        assert!(empty.owner_names().is_empty());
+        for (filter, name) in [
+            (Filter::All, "ads.example.com"),
+            (Filter::ThreatsOnly, "ads.example.com"),
+            (Filter::All, "x.bad.example.net"),
+            (Filter::ThreatsOnly, "x.bad.example.net"),
+            (Filter::All, "example.org"),
+            (Filter::ThreatsOnly, "example.org"),
+        ] {
+            assert_eq!(
+                blocks(&mut plain, filter, name),
+                blocks(&mut empty, filter, name),
+                "{filter:?} {name}"
+            );
+        }
+        assert_eq!(plain.stats().total(), empty.stats().total());
+    }
+
+    #[test]
+    fn a_refused_name_is_counted_among_the_most_blocked_of_the_day() {
+        let mut r = with_owner(resolver(), &[], &["refused.example.org"]);
+        for _ in 0..3 {
+            blocks(&mut r, Filter::ThreatsOnly, "refused.example.org");
+        }
+        blocks(&mut r, Filter::All, "ads.example.com");
+        let top = r.stats().top_today(at(100));
+        assert_eq!(
+            top.iter().map(|t| (&*t.name, t.count)).collect::<Vec<_>>(),
+            [("refused.example.org", 3), ("ads.example.com", 1)]
+        );
     }
 
     // The block check comes before the cache for every client that is held to every list, so an
@@ -911,22 +1311,32 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_resolver_reports_no_threat() {
+    fn a_paused_resolver_still_reports_a_threat_and_not_an_ad() {
         let mut r = threat_resolver();
         r.pause_until(1300);
         let (action, hit) =
             r.handle_query_threat(&query(7, "x.bad.example.net", 1), Transport::Udp, at(1299));
+        assert!(is_blocked_reply(&reply(action)));
+        assert!(hit.is_some());
+        let (action, hit) =
+            r.handle_query_threat(&query(7, "ads.example.com", 1), Transport::Udp, at(1299));
         assert!(matches!(action, Action::Forward(_)));
         assert_eq!(hit, None);
         assert_eq!(
             r.stats().total(),
             Counts {
-                queries: 1,
+                queries: 2,
+                blocked: 1,
+                blocked_threat: 1,
                 forwarded: 1,
                 ..Counts::default()
             }
         );
-        // Once the pause ends the same name is a threat again.
+        // Once the pause ends the ad is blocked again, and the threat as before.
+        let (action, hit) =
+            r.handle_query_threat(&query(7, "ads.example.com", 1), Transport::Udp, at(1300));
+        assert!(is_blocked_reply(&reply(action)));
+        assert_eq!(hit, None);
         let (_, hit) =
             r.handle_query_threat(&query(7, "x.bad.example.net", 1), Transport::Udp, at(1300));
         assert!(hit.is_some());

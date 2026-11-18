@@ -2334,4 +2334,111 @@ mod tests {
             check_ns(guarded.exempt(), other),
         );
     }
+
+    /// Run in release:
+    /// `cargo test -p qberrypi --release -- --ignored decide_cost_owner_names --nocapture`.
+    ///
+    /// The cost that the owner's names add to `decide`, which runs on the listener's receive loop:
+    /// for a cached, a blocked and a forwarded name, one the owner refuses and an ad the owner
+    /// allows, asked by a client that is not exempt, on a `Dns` with both of the owner's lists
+    /// empty and on one with 128 names in each. The Dns of the first column is built as
+    /// `decide_cost_with_an_exempt_set`'s is, with the same names, so its first three rows are what
+    /// that test's "no client" column gives, and what the code before the owner's names gave: with
+    /// the lists empty a query pays for two `is_empty` checks and nothing else. The two take turns
+    /// in batches of 2,000 calls, the one that goes first changing every time, and each is the
+    /// median of its batches. The last two rows take another path on each side (a name the owner
+    /// refuses is blocked at once, as a listed one is, instead of asked upstream), so their
+    /// "adds" is no price of the lookup; it is printed for reading, and only the first three rows,
+    /// which take one path on both sides, are held to a bound.
+    #[ignore = "a timing, for release builds"]
+    #[tokio::test]
+    async fn decide_cost_owner_names() {
+        // 128 names in each list, of which a few are looked up: two or three searches of seven
+        // steps for each list. A scan of the lists would be far over this.
+        const ALLOWED_NS: f64 = 1_000.0;
+
+        let up = FakeUpstream::start(Reply::Answer(ip("192.0.2.10"))).await;
+        let upstreams = || Upstreams::with(vec![up.addr], ms(300), ms(600));
+        let denied = || {
+            lists::from_config(
+                &[
+                    "ads.example.org".to_owned(),
+                    "ads-allowed.example.org".to_owned(),
+                ],
+                &[],
+            )
+            .build()
+        };
+        let make = || Dns::new(denied(), upstreams(), Box::new(FixedOffset(0)));
+        let (empty, full) = (make(), make());
+        let fill = |prefix: &str, last: &str| {
+            let mut names: Vec<String> = (0..127)
+                .map(|i| format!("{prefix}{i}.example.net"))
+                .collect();
+            names.push(last.to_owned());
+            names
+        };
+        let owner = qb_dns::OwnerNames::new(
+            fill("allow-", "ads-allowed.example.org"),
+            fill("refuse-", "refused.example.org"),
+        )
+        .unwrap();
+        assert_eq!(
+            (owner.allow_names().len(), owner.refuse_names().len()),
+            (128, 128)
+        );
+        drop(full.resolver().set_owner_names(owner));
+        assert!(empty.resolver().owner_names().is_empty());
+        let other = client(200);
+
+        let cached = client::query(5, "cached.example.org", TYPE_A).unwrap();
+        for dns in [&empty, &full] {
+            assert!(dns.answer(&cached, Transport::Udp).await.is_some());
+        }
+        let blocked = client::query(6, "ads.example.org", TYPE_A).unwrap();
+        let forwarded = client::query(7, "elsewhere.example.org", TYPE_A).unwrap();
+        let refused = client::query(8, "refused.example.org", TYPE_A).unwrap();
+        let allowed = client::query(9, "ads-allowed.example.org", TYPE_A).unwrap();
+        // What each of them gets, in the order: empty, 128 + 128.
+        let rows: [(&str, &[u8], [bool; 2]); 5] = [
+            ("cached", &cached, [false, false]),
+            ("blocked", &blocked, [false, false]),
+            ("forwarded", &forwarded, [true, true]),
+            // The owner's refused name: asked upstream while nobody refuses it, else blocked.
+            ("refused by the owner", &refused, [true, false]),
+            // An ad on the lists: blocked while nobody allows it, else asked upstream.
+            ("ad allowed by the owner", &allowed, [false, true]),
+        ];
+        for (label, packet, forwards) in rows {
+            for (dns, forwards) in [&empty, &full].into_iter().zip(forwards) {
+                let action = dns.decide_from(packet, Transport::Udp, other);
+                assert_eq!(matches!(action, Action::Forward(_)), forwards, "{label}");
+            }
+        }
+
+        println!("decide, median ns per query over {BATCHES} batches of {BATCH}:");
+        println!(
+            "{:<26}{:>10}{:>12}{:>9}",
+            "", "both empty", "128 + 128", "adds"
+        );
+        for (row, (label, packet, _)) in rows.into_iter().enumerate() {
+            let (mut without, mut with) = (Vec::new(), Vec::new());
+            for batch in 0..BATCHES {
+                if batch % 2 == 0 {
+                    without.push(batch_ns_from(&empty, packet, other));
+                    with.push(batch_ns_from(&full, packet, other));
+                } else {
+                    with.push(batch_ns_from(&full, packet, other));
+                    without.push(batch_ns_from(&empty, packet, other));
+                }
+            }
+            let (without, with) = (median(without), median(with));
+            let adds = with - without;
+            println!("{label:<26}{without:>10.0}{with:>12.0}{adds:>+9.0}");
+            assert!(
+                row >= 3 || adds < ALLOWED_NS,
+                "{label}: the owner's names add {adds:.0} ns a query, which is over {ALLOWED_NS}"
+            );
+        }
+    }
 }

@@ -60,7 +60,7 @@ use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use log::Level;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 use crate::bootpart::{self, ACTIVE_CONFIG, BOOT_DEV, MOUNT_POINT, OWN_DIR, Restore};
 use crate::config::{self, Config, Fault};
@@ -81,7 +81,7 @@ use crate::sys::{self, Watchdog};
 use crate::update::{self, BootCard, CardAccess, Cause, Outcome, Restart, UpdateCtl};
 use crate::wifi::kernel::KernelRadio;
 use crate::wifi::{self, WifiStatus};
-use crate::wiring::{SignalCache, Slot};
+use crate::wiring::{LiveSystem, SignalCache, Slot};
 use crate::{BUILD_EPOCH, VERSION};
 
 const CONSOLE: &str = "/dev/console";
@@ -952,7 +952,8 @@ fn load_wifi_modules(
 
 /// What the panel is given to work with: the configured touch calibration, and the slot that
 /// stands for the resolver, for its numbers, for its switch, for the names its lane shows, for
-/// the watchdog's alerts and for the device inventory; the first service component to start fills it.
+/// the watchdog's alerts, for the device inventory, for the owner's names, for the board itself and for the lock
+/// and the night hours; the first service component to start fills it, and `serve` fills the board itself at once.
 fn panel_deps(cfg: &Config, slot: &Arc<Slot>) -> Deps {
     Deps {
         source: slot.clone(),
@@ -962,6 +963,9 @@ fn panel_deps(cfg: &Config, slot: &Arc<Slot>) -> Deps {
         lane: slot.lane(),
         alerts: slot.clone(),
         devices: slot.clone(),
+        names: slot.clone(),
+        system: slot.clone(),
+        lock: slot.clone(),
     }
 }
 
@@ -1382,6 +1386,12 @@ async fn serve(
     update: Arc<UpdateCtl>,
 ) -> ! {
     let slot = Slot::new();
+    // The panel's hold on the board itself: the update machinery and the Wi-Fi's rejoin. It needs no resolver, so
+    // it is there from the panel's first frame, for a boot that is on trial.
+    slot.fill_system(Arc::new(LiveSystem::new(
+        update.clone(),
+        slot.rejoin_notify(),
+    )));
     let signal = SignalCache::new();
     // The services and the tick get a receiver of the Wi-Fi's status; the Wi-Fi component owns the sender.
     let (status_sender, status) = watch::channel(WifiStatus::Starting);
@@ -1736,8 +1746,17 @@ fn wifi_component(parts: &BoardParts) -> Option<Component> {
     let (cfg, log, wlan_present) = (parts.cfg, parts.log, parts.wlan_present);
     let status = parts.status_sender.take()?;
     let saves = parts.saves.clone();
+    // The owner's rejoin is the slot's notify, which outlives each start of this component.
+    let rejoin = parts.slot.rejoin_notify();
     Some(Component::task("wifi", true, move || {
-        wifi_service(cfg, log, wlan_present, status.clone(), saves.clone())
+        wifi_service(
+            cfg,
+            log,
+            wlan_present,
+            status.clone(),
+            saves.clone(),
+            rejoin.clone(),
+        )
     }))
 }
 
@@ -1748,12 +1767,13 @@ async fn wifi_service(
     wlan_present: bool,
     sender: watch::Sender<WifiStatus>,
     saves: Arc<LogSaves>,
+    rejoin: Arc<Notify>,
 ) -> Ended {
     let mut status = sender.subscribe();
     let mut report = |next: WifiStatus| {
         sender.send_replace(next);
     };
-    let mut joining = pin!(wifi_task(cfg, wlan_present, &mut report));
+    let mut joining = pin!(wifi_task(cfg, wlan_present, &mut report, &rejoin));
     // Opened when the first join needs it.
     let mut route: Option<Route> = None;
     // Whether the join that holds now was given its address, and when that was last tried.
@@ -1791,11 +1811,13 @@ async fn wifi_service(
 /// be made there is nothing to join as: either is logged, and the task then
 /// waits for ever. An interface that cannot be opened is tried again every
 /// `REOPEN_EVERY`. Once `wifi::run` has the interface it never gives it back,
-/// and `report` hears each change of status.
+/// `report` hears each change of status, and `rejoin` is what the owner notifies to have a held link
+/// ended and joined again.
 async fn wifi_task(
     cfg: &Config,
     wlan_present: bool,
     report: &mut (dyn FnMut(WifiStatus) + Send),
+    rejoin: &Notify,
 ) -> Infallible {
     if !wlan_present {
         log::warn!("wifi: wlan0 is absent, not joining");
@@ -1811,7 +1833,7 @@ async fn wifi_task(
     };
     loop {
         match KernelRadio::open(WLAN).await {
-            Ok(mut radio) => match wifi::run(&mut radio, &join, report).await {},
+            Ok(mut radio) => match wifi::run(&mut radio, &join, report, rejoin).await {},
             Err(error) => {
                 log::warn!("wifi: wlan0 could not be opened: {error}");
                 tokio::time::sleep(REOPEN_EVERY).await;
@@ -1945,7 +1967,8 @@ enum Leaving {
 /// The level and the line that `reason` is logged with when the board leaves.
 ///
 /// The configured time passing is the board's plan and the line the QEMU scenarios look for, and
-/// so is the restart that an update stages (INFO); a trial that gives up, and anything else, is an
+/// so is the restart that an update stages (INFO), and the one the owner asks for on the front panel
+/// (INFO, and no name, label or address in it); a trial that gives up, and anything else, is an
 /// error that restarts the board.
 fn leaving_line(reason: &Reason) -> (Level, String) {
     match reason {
@@ -1955,6 +1978,9 @@ fn leaving_line(reason: &Reason) -> (Level, String) {
         }
         Reason::Restart(restart @ Restart::Plain(Cause::GaveUp(_))) => {
             (Level::Error, format!("update: restarting: {restart}"))
+        }
+        Reason::Restart(restart @ Restart::Plain(Cause::Owner)) => {
+            (Level::Info, format!("supervisor: restarting: {restart}"))
         }
         other => (Level::Error, format!("supervisor: restarting: {other}")),
     }
@@ -3699,6 +3725,7 @@ mod tests {
             bssid: [0; 6],
             freq_mhz: 5180,
             signal_mbm: -5600,
+            since_secs: 0,
         }
     }
 
@@ -4562,12 +4589,13 @@ mod tests {
         let mut report = |status: WifiStatus| reported.push(status);
 
         // A board without the interface says so, and never joins.
-        let task = wifi_task(&cfg, false, &mut report);
+        let rejoin = Notify::new();
+        let task = wifi_task(&cfg, false, &mut report, &rejoin);
         assert!(timeout(Duration::from_millis(300), task).await.is_err());
         assert_eq!(CAPTURE.lines(), ["WARN wifi: wlan0 is absent, not joining"]);
 
         // An interface that cannot be opened is said so, and left to be opened again later.
-        let task = wifi_task(&cfg, true, &mut report);
+        let task = wifi_task(&cfg, true, &mut report, &rejoin);
         assert!(timeout(Duration::from_secs(1), task).await.is_err());
         assert_eq!(
             CAPTURE.lines()[1..],
@@ -5641,6 +5669,26 @@ mod tests {
         deps.alerts.ack(1);
     }
 
+    // The panel's lock is the slot's: until the services fill it, no PIN passes (the strong keys ask, and nothing
+    // is accepted), and once it is filled it is the one the API edits.
+    #[test]
+    fn the_panels_lock_is_the_slots_and_fails_closed_until_it_is_filled() {
+        use crate::panel::lock::{Check, PanelState};
+        let slot = Slot::new();
+        let deps = panel_deps(&config::parse(EXAMPLE).unwrap(), &slot);
+        assert!(deps.lock.lock_view().on);
+        assert_eq!(
+            deps.lock.verify(zeroize::Zeroizing::new([1, 2, 3, 4])),
+            Check::Wait(1)
+        );
+        slot.fill_lock(Arc::new(PanelState::new(None, None, Arc::new(|| 0))));
+        assert!(!deps.lock.lock_view().on);
+        assert_eq!(
+            deps.lock.verify(zeroize::Zeroizing::new([1, 2, 3, 4])),
+            Check::Right
+        );
+    }
+
     // What the panel is given answers as nothing until the resolver is in the slot.
     #[test]
     fn the_panels_switch_does_nothing_until_the_resolver_is_in_the_slot() {
@@ -6548,6 +6596,15 @@ mod tests {
         );
         let software = Reason::Restart(Restart::Plain(Cause::Update));
         assert_eq!(leaving_line(&software).0, Level::Info);
+        // The owner's own restart from the panel is the board's plan, and its line says whose it was.
+        let owner = Reason::Restart(Restart::Plain(Cause::Owner));
+        assert_eq!(
+            leaving_line(&owner),
+            (
+                Level::Info,
+                "supervisor: restarting: the owner restarted the board from the panel".to_owned()
+            )
+        );
         let gave_up = Reason::Restart(Restart::Plain(Cause::GaveUp("no clock".into())));
         let (level, line) = leaving_line(&gave_up);
         assert_eq!(level, Level::Error);
@@ -6566,6 +6623,7 @@ mod tests {
         for plain in [
             Reason::Restart(Restart::Plain(Cause::Update)),
             Reason::Restart(Restart::Plain(Cause::GaveUp("x".into()))),
+            Reason::Restart(Restart::Plain(Cause::Owner)),
             Reason::ReturnAfter,
             Reason::NoAssociation,
             Reason::ComponentFailed("dns"),

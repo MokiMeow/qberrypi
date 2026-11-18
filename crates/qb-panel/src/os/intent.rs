@@ -8,6 +8,8 @@
 
 use std::fmt;
 
+use zeroize::{Zeroize, Zeroizing};
+
 use crate::os::world::Mac;
 
 /// What the main gate or a device's gate is to do.
@@ -35,24 +37,78 @@ pub enum Verdict {
     ClearRefuse,
 }
 
-/// Four PIN digits, each 0 to 9, as the pad gives them to the one that verifies them.
+/// One digit of the PIN, 0 to 9, as a key of the pad gives it. A PIN digit is a secret wherever it goes: its `Debug`
+/// prints none, so no log line that prints a `Tap` or a `Change` can leak one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Digit(u8);
+
+impl Digit {
+    /// The digit; a value over 9 is not a digit and is kept as 9.
+    pub const fn new(digit: u8) -> Self {
+        Self(if digit > 9 { 9 } else { digit })
+    }
+
+    /// The digit's value, 0 to 9.
+    pub const fn value(self) -> u8 {
+        self.0
+    }
+}
+
+impl fmt::Debug for Digit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Digit(*)")
+    }
+}
+
+/// Four PIN digits, each 0 to 9, as the pad gives them to the one that verifies or keeps them (spec §7.3).
 ///
-/// A placeholder for the lock (P3): the lock will hold them zeroized from the pad to the check. Its
-/// `Debug` prints no digit.
-#[derive(Clone, PartialEq, Eq)]
-pub struct PinDigits([u8; 4]);
+/// They are held in a `Zeroizing<[u8; 4]>` from the pad to the verify: they are wiped when the value is dropped.
+/// `Debug` prints no digit, and two sets are compared in constant time, so that no use of `==` on them leaks
+/// how many digits matched.
+#[derive(Clone)]
+pub struct PinDigits(Zeroizing<[u8; 4]>);
 
 impl PinDigits {
     /// The digits as typed; a value over 9 is not a digit and is kept as 9.
     pub fn new(digits: [u8; 4]) -> Self {
-        Self(digits.map(|digit| digit.min(9)))
+        Self(Zeroizing::new(digits.map(|digit| digit.min(9))))
     }
 
-    /// The digits.
-    pub fn digits(&self) -> [u8; 4] {
+    /// The digits, borrowed: nothing is copied out of the wiped holder.
+    pub fn digits(&self) -> &[u8; 4] {
+        &self.0
+    }
+
+    /// The digits in their wiped holder, for `Lock::verify(Zeroizing<[u8; 4]>)`.
+    pub fn into_zeroizing(self) -> Zeroizing<[u8; 4]> {
         self.0
     }
+
+    /// Puts `digit` at place `at`; a place past the fourth is ignored. The pad types with it.
+    pub(crate) fn put(&mut self, at: usize, digit: Digit) {
+        if let Some(place) = self.0.get_mut(at) {
+            *place = digit.value();
+        }
+    }
+
+    /// Wipes every digit to 0.
+    pub(crate) fn wipe(&mut self) {
+        self.0.zeroize();
+    }
 }
+
+impl PartialEq for PinDigits {
+    /// Every digit is looked at whatever the first ones are.
+    fn eq(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .fold(0_u8, |differ, (a, b)| differ | (a ^ b))
+            == 0
+    }
+}
+
+impl Eq for PinDigits {}
 
 impl fmt::Debug for PinDigits {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -105,6 +161,9 @@ pub enum Intent {
     SetPin(PinDigits),
     /// Turn the lock off. Strong.
     ClearPin,
+    /// The four digits typed on the PIN pad, to be checked against the PIN: the answer goes back to the pad through
+    /// `nav::verified`. Never asked for itself: it is how the asking is answered.
+    Verify(PinDigits),
 }
 
 impl Intent {
@@ -126,7 +185,8 @@ impl Intent {
             | Self::Ack(_)
             | Self::NightHours { .. }
             | Self::SleepNow
-            | Self::Rejoin => false,
+            | Self::Rejoin
+            | Self::Verify(_) => false,
         }
     }
 }
@@ -160,6 +220,7 @@ impl fmt::Debug for Intent {
             Self::Restart => f.write_str("Restart"),
             Self::SetPin(_) => f.write_str("SetPin(..)"),
             Self::ClearPin => f.write_str("ClearPin"),
+            Self::Verify(_) => f.write_str("Verify(..)"),
         }
     }
 }
@@ -216,6 +277,8 @@ mod tests {
             (Intent::NightHours { from: 23, to: 7 }, false),
             (Intent::SleepNow, false),
             (Intent::Rejoin, false),
+            // The check of typed digits is never asked for: it is how the asking is answered.
+            (Intent::Verify(PinDigits::new([1, 2, 3, 4])), false),
         ]
     }
 
@@ -256,6 +319,7 @@ mod tests {
                 verdict: Verdict::Allow,
             },
             Intent::SetPin(PinDigits::new([4, 9, 7, 3])),
+            Intent::Verify(PinDigits::new([4, 9, 7, 3])),
         ];
         for intent in intents {
             let said = format!("{intent:?}");
@@ -279,7 +343,20 @@ mod tests {
 
     #[test]
     fn digits_are_kept_as_digits() {
-        assert_eq!(PinDigits::new([1, 2, 3, 4]).digits(), [1, 2, 3, 4]);
-        assert_eq!(PinDigits::new([0, 10, 255, 9]).digits(), [0, 9, 9, 9]);
+        assert_eq!(PinDigits::new([1, 2, 3, 4]).digits(), &[1, 2, 3, 4]);
+        assert_eq!(PinDigits::new([0, 10, 255, 9]).digits(), &[0, 9, 9, 9]);
+    }
+
+    #[test]
+    fn digits_compare_by_value_and_leave_in_a_wiped_holder() {
+        assert_eq!(PinDigits::new([1, 2, 3, 4]), PinDigits::new([1, 2, 3, 4]));
+        for other in [[1, 2, 3, 5], [0, 2, 3, 4], [4, 3, 2, 1], [1, 2, 4, 3]] {
+            assert_ne!(PinDigits::new([1, 2, 3, 4]), PinDigits::new(other));
+        }
+        let wiped = PinDigits::new([5, 6, 7, 8]).into_zeroizing();
+        assert_eq!(*wiped, [5, 6, 7, 8]);
+        // A single digit is kept as a digit and prints none.
+        assert_eq!(Digit::new(200).value(), 9);
+        assert_eq!(format!("{:?}", Digit::new(4)), "Digit(*)");
     }
 }

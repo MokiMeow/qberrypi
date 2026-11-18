@@ -9,6 +9,9 @@ pub mod nav;
 pub mod screens;
 pub mod world;
 
-pub use intent::{GateMove, Intent, PinDigits, Verdict};
-pub use nav::{Change, IDLE_MS, Nav, Screen, Section, Tap, Whole, decide, idle, refresh, tap};
+pub use intent::{Digit, GateMove, Intent, PinDigits, Verdict};
+pub use nav::{
+    Arrivals, Change, IDLE_MS, Nav, PinGoal, PinPad, Screen, Section, Tap, UPDATE_DONE_MS,
+    Verified, Whole, age_update, arrive, decide, idle, refresh, tap, verified,
+};
 pub use world::World;

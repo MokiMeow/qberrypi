@@ -10,14 +10,21 @@
 //!
 //! The slot holds the watchdog's alert store the same way: the same service fills it, and until
 //! then the panel has no alert to show. The store is read through its own lock and no other. The
-//! device inventory is held the same way ([`LiveDevices`]): its own lock, never the resolver's.
+//! device inventory is held the same way ([`LiveDevices`]): its own lock, never the resolver's. The
+//! owner's names are held the same way ([`LiveNames`]): the list's own lock, and the resolver's only for
+//! a swap of the names or a copy of the top of the day.
+//!
+//! The board itself (the update machinery, the Wi-Fi's rejoin, the readings of SYSTEM) is the panel's through
+//! [`LiveSystem`], which init puts in the slot as soon as it is made: it needs no resolver.
 
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicI16, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::Duration;
 
-use qb_dns::{LogEntry, Now, Resolver};
-use tokio::sync::watch;
+use qb_dns::{ListClass, LogEntry, Now, OwnerSide, Resolver, TopName};
+use tokio::sync::{Notify, watch};
+use zeroize::Zeroizing;
 
 use crate::alerts::AlertSink;
 use crate::dns::Dns;
@@ -25,8 +32,15 @@ use crate::dns::clients::MAX_CLIENTS;
 use crate::lane::LaneFeed;
 use crate::lists::Lists;
 use crate::live::{self, BlockingControl, Snapshot, Source};
+use crate::names::{DenyList, NamesError, OwnerEntry, OwnerHold, OwnerList};
 use crate::panel::alerts::{PanelAlert, PendingAlerts};
 use crate::panel::devices::{DeviceControl, Mac as PanelMac};
+use crate::panel::lock::{Check, LockControl, LockView};
+use crate::panel::names::{NameClass, NamesControl};
+use crate::panel::system::{REJOIN_EVERY_SECS, RejoinWait, RestartRefused, SystemControl};
+use crate::sys;
+use crate::update::{self, UpdateCtl};
+use crate::usage::Readings;
 use crate::watch::devices::{Devices, EditError, WallCopy, with_devices};
 use crate::watch::frames::Mac;
 use crate::wifi;
@@ -59,7 +73,7 @@ impl SharedResolver {
 
     /// The resolver, locked, whether or not a holder panicked: it keeps its bounds whatever a
     /// call left half done. Never hold the guard across an `.await`.
-    fn lock(&self) -> crate::stall::Held<'_, Resolver> {
+    pub(crate) fn lock(&self) -> crate::stall::Held<'_, Resolver> {
         crate::stall::lock_resolver(&self.resolver)
     }
 }
@@ -210,6 +224,156 @@ impl DeviceControl for LiveDevices {
     }
 }
 
+/// The owner's names as the panel uses them: the owner's list, which the API edits too, and the
+/// resolver the list is swapped into.
+///
+/// Reads copy out and let go; `top_today` and `class` take the resolver's lock for one copy or one
+/// lookup, and the rest is the list's own lock. An edit builds the new names off the resolver's lock and
+/// swaps them in under it (`OwnerList`), and moves the list's revision, as the API's edit does.
+pub struct LiveNames {
+    /// The owner's list.
+    pub list: Arc<OwnerList>,
+    /// The resolver, for the top of the day and for the block set.
+    pub resolver: SharedResolver,
+    /// The configuration's `dns.deny`, which the block set cannot tell from an ads list.
+    pub deny: DenyList,
+    /// Whether the clock has been set to the real time: an entry keeps the day it was set on only
+    /// then.
+    pub clock_set: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl NamesControl for LiveNames {
+    fn top_today(&self) -> Vec<TopName> {
+        self.list.top_today()
+    }
+
+    fn owner_len(&self) -> usize {
+        self.list.len()
+    }
+
+    fn owner_newest(&self, n: usize) -> Vec<OwnerEntry> {
+        self.list.newest(n)
+    }
+
+    fn owner_hold(&self, name: &str) -> Option<OwnerHold> {
+        self.list.hold(name)
+    }
+
+    fn class(&self, name: &str) -> NameClass {
+        // The guard is gone at the end of the statement.
+        let class = self.resolver.lock().list_class(name);
+        match class {
+            Some(ListClass::Threat) => NameClass::Threat,
+            // The block set holds a `deny` entry as an ad; the configuration says which it is.
+            Some(ListClass::Ads) if self.deny.covers(name) => NameClass::Deny,
+            Some(ListClass::Ads) => NameClass::Ads,
+            None => NameClass::None,
+        }
+    }
+
+    fn set(&self, name: &str, verdict: OwnerSide) -> Result<(), NamesError> {
+        // The resolver would not let such a name through, so the list does not pretend it does.
+        if verdict == OwnerSide::Allow && self.class(name) == NameClass::Threat {
+            return Err(NamesError::Threat);
+        }
+        let day = (self.clock_set)().then(|| (self.resolver.now)().unix_secs);
+        self.list.set(name, verdict, day)
+    }
+
+    fn forget(&self, name: &str) -> Result<bool, NamesError> {
+        self.list.forget(name)
+    }
+}
+
+/// The board itself as the panel uses it: the update machinery, which a restart and the update screens ask,
+/// and the Wi-Fi's rejoin, with its refusal of a second within a minute.
+///
+/// Nothing here takes the resolver's lock or any lock of the answer path: the update machinery's own small
+/// lock is taken for a copy or a look, and a rejoin is a notify.
+pub struct LiveSystem {
+    /// The update machinery: its view, and the owner's restart.
+    update: Arc<UpdateCtl>,
+    /// What `wifi::run` is given: notified (`notify_waiters`, which stores no permit) to end the link that is
+    /// held and join again.
+    rejoin: Arc<Notify>,
+    /// When the last rejoin that was let through was asked for, on `clock`.
+    last_rejoin: Mutex<Option<Duration>>,
+    /// A clock that does not jump, from any starting point: the kernel's, or a test's own.
+    clock: Box<dyn Fn() -> Duration + Send + Sync>,
+}
+
+impl LiveSystem {
+    /// The control of the board over `update` and the notify `rejoin` that the Wi-Fi component listens to, on
+    /// the kernel's monotonic clock.
+    pub fn new(update: Arc<UpdateCtl>, rejoin: Arc<Notify>) -> Self {
+        Self::with_clock(update, rejoin, sys::uptime)
+    }
+
+    /// As `new`, with the time of `clock`, so that a test moves it.
+    pub fn with_clock(
+        update: Arc<UpdateCtl>,
+        rejoin: Arc<Notify>,
+        clock: impl Fn() -> Duration + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            update,
+            rejoin,
+            last_rejoin: Mutex::new(None),
+            clock: Box::new(clock),
+        }
+    }
+}
+
+impl LiveSystem {
+    /// The rejoin of [`SystemControl::rejoin`] that the update machinery has let through: the limit of
+    /// one a minute, the second it was asked at, and the Wi-Fi's wake.
+    fn rejoin_now(&self) -> Result<(), RejoinWait> {
+        let now = (self.clock)();
+        let mut last = self
+            .last_rejoin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(at) = *last {
+            let wait = Duration::from_secs(u64::from(REJOIN_EVERY_SECS))
+                .saturating_sub(now.saturating_sub(at));
+            if !wait.is_zero() {
+                // At most the minute, so a `u16` holds it; counted up, so that 0 is never what is left.
+                let left = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+                return Err(RejoinWait(u16::try_from(left).unwrap_or(REJOIN_EVERY_SECS)));
+            }
+        }
+        *last = Some(now);
+        drop(last);
+        // Only a loop that is holding a link hears it: a join that is under way is not repeated.
+        self.rejoin.notify_waiters();
+        Ok(())
+    }
+}
+
+impl SystemControl for LiveSystem {
+    /// Refused as a wait of the whole minute, and charged to nobody, while an update is received or staged
+    /// or this boot is on trial, as a restart is: the link that carries the update is not let go of. The
+    /// look at the update machinery and the wake are one step. (The panel's key is inert then, but the
+    /// refusal is here, in the one place that knows.)
+    fn rejoin(&self) -> Result<(), RejoinWait> {
+        self.update
+            .when_idle(|| self.rejoin_now())
+            .unwrap_or(Err(RejoinWait(REJOIN_EVERY_SECS)))
+    }
+
+    fn restart(&self) -> Result<(), RestartRefused> {
+        self.update.request_owner_restart().map_err(Into::into)
+    }
+
+    fn update_view(&self) -> update::View {
+        self.update.view()
+    }
+
+    fn readings(&self) -> Readings {
+        Readings::read()
+    }
+}
+
 /// What the panel is given, in the place of the [`Live`] that is made beside it.
 ///
 /// Until it is filled it answers as [`live::Nothing`] does, and the switch does nothing, with a
@@ -219,13 +383,28 @@ impl DeviceControl for LiveDevices {
 /// [`Slot::fill_alerts`] puts the watchdog's store in, and an acknowledgement before that is
 /// dropped without a line, since it names an alert that cannot have been shown. And it is the
 /// panel's control of the devices ([`DeviceControl`]): no inventory until [`Slot::fill_devices`], but
-/// the watch of one device's names is the lane feed's, which the slot holds from the start.
+/// the watch of one device's names is the lane feed's, which the slot holds from the start. And it is
+/// the panel's control of the owner's names ([`NamesControl`]): none is on any list, the top of the day is
+/// empty and an edit is refused until [`Slot::fill_names`]. And it is the panel's control of the board itself
+/// ([`SystemControl`]): the Wi-Fi's rejoin notify is the slot's own, from the start; until
+/// [`Slot::fill_system`] a restart is refused, a rejoin must wait, and the update machinery looks idle.
+/// And the panel's lock and night hours ([`LockControl`]): no night, and until [`Slot::fill_lock`] a lock that
+/// fails closed (the strong keys ask for a PIN that nothing accepts).
 pub struct Slot {
     live: OnceLock<Live>,
     /// The watchdog's alerts, as the panel reads them; filled by the same service as `live`.
     alerts: OnceLock<Arc<dyn PendingAlerts>>,
     /// The device inventory, as the panel reads and edits it; filled by the same service.
     devices: OnceLock<Arc<dyn DeviceControl>>,
+    /// The owner's names, as the panel reads and edits them; filled by the same service.
+    names: OnceLock<Arc<dyn NamesControl>>,
+    /// The board itself, as the panel reads and acts on it; filled by init.
+    system: OnceLock<Arc<dyn SystemControl>>,
+    /// What the Wi-Fi component waits on for the owner's rejoin. It is the slot's, not the control's: the
+    /// component holds it from its start, before the control is made.
+    rejoin: Arc<Notify>,
+    /// The lock and the night hours, as the panel reads and edits them; filled by the same service.
+    lock: OnceLock<Arc<dyn LockControl>>,
     /// The names that the DNS service offers the panel. It is the slot's, not the live source's:
     /// the panel holds it from the start, before the resolver that fills it exists.
     lane: Arc<LaneFeed>,
@@ -238,6 +417,10 @@ impl Slot {
             live: OnceLock::new(),
             alerts: OnceLock::new(),
             devices: OnceLock::new(),
+            names: OnceLock::new(),
+            system: OnceLock::new(),
+            rejoin: Arc::new(Notify::new()),
+            lock: OnceLock::new(),
             lane: LaneFeed::new(),
         })
     }
@@ -264,6 +447,29 @@ impl Slot {
     pub fn fill_devices(&self, devices: Arc<dyn DeviceControl>) {
         // As in `fill`: the first stays.
         let _ = self.devices.set(devices);
+    }
+
+    /// Puts the panel's control of the owner's names in the slot; a slot that has one keeps it.
+    pub fn fill_names(&self, names: Arc<dyn NamesControl>) {
+        // As in `fill`: the first stays.
+        let _ = self.names.set(names);
+    }
+
+    /// Puts the panel's control of the board itself in the slot; a slot that has one keeps it.
+    pub fn fill_system(&self, system: Arc<dyn SystemControl>) {
+        // As in `fill`: the first stays.
+        let _ = self.system.set(system);
+    }
+
+    /// What the Wi-Fi component gives `wifi::run`, and the panel's rejoin notifies.
+    pub fn rejoin_notify(&self) -> Arc<Notify> {
+        self.rejoin.clone()
+    }
+
+    /// Puts the panel's control of the lock and the night hours in the slot; a slot that has one keeps it.
+    pub fn fill_lock(&self, lock: Arc<dyn LockControl>) {
+        // As in `fill`: the first stays.
+        let _ = self.lock.set(lock);
     }
 }
 
@@ -317,12 +523,141 @@ impl PendingAlerts for Slot {
         self.alerts.get().map_or(0, |alerts| alerts.waiting_count())
     }
 
+    fn waiting(&self, n: usize) -> Vec<PanelAlert> {
+        self.alerts
+            .get()
+            .map_or_else(Vec::new, |alerts| alerts.waiting(n))
+    }
+
+    fn last_alert_unix(&self) -> Option<u64> {
+        self.alerts.get()?.last_alert_unix()
+    }
+
     fn ack(&self, id: u64) {
         if let Some(alerts) = self.alerts.get() {
             alerts.ack(id);
         }
     }
 }
+
+impl NamesControl for Slot {
+    fn top_today(&self) -> Vec<TopName> {
+        self.names
+            .get()
+            .map_or_else(Vec::new, |names| names.top_today())
+    }
+
+    fn owner_len(&self) -> usize {
+        self.names.get().map_or(0, |names| names.owner_len())
+    }
+
+    fn owner_newest(&self, n: usize) -> Vec<OwnerEntry> {
+        self.names
+            .get()
+            .map_or_else(Vec::new, |names| names.owner_newest(n))
+    }
+
+    fn owner_hold(&self, name: &str) -> Option<OwnerHold> {
+        self.names.get()?.owner_hold(name)
+    }
+
+    fn class(&self, name: &str) -> NameClass {
+        self.names
+            .get()
+            .map_or(NameClass::None, |names| names.class(name))
+    }
+
+    fn set(&self, name: &str, verdict: OwnerSide) -> Result<(), NamesError> {
+        self.names
+            .get()
+            .map_or(Err(NamesError::Unavailable), |names| {
+                names.set(name, verdict)
+            })
+    }
+
+    fn forget(&self, name: &str) -> Result<bool, NamesError> {
+        self.names
+            .get()
+            .map_or(Err(NamesError::Unavailable), |names| names.forget(name))
+    }
+}
+
+impl SystemControl for Slot {
+    fn rejoin(&self) -> Result<(), RejoinWait> {
+        self.system
+            .get()
+            .map_or(Err(RejoinWait(1)), |system| system.rejoin())
+    }
+
+    fn restart(&self) -> Result<(), RestartRefused> {
+        self.system
+            .get()
+            .map_or(Err(RestartRefused::NotReady), |system| system.restart())
+    }
+
+    fn update_view(&self) -> update::View {
+        self.system
+            .get()
+            .map_or_else(|| UpdateCtl::off().view(), |system| system.update_view())
+    }
+
+    fn readings(&self) -> Readings {
+        self.system
+            .get()
+            .map_or_else(Readings::read, |system| system.readings())
+    }
+}
+
+// Until the lock is filled the slot fails closed: whether a PIN guards the strong keys is not known, so they
+// ask as if one did, and nothing passes (`verify` makes the pad wait, counting nothing). The services fill
+// the lock as they make the resolver's half of the slot, before DNS answers and so before STARTING ends; the
+// state in between is only a board whose services never came up. No night is set.
+impl LockControl for Slot {
+    fn verify(&self, digits: Zeroizing<[u8; 4]>) -> Check {
+        self.lock
+            .get()
+            .map_or(Check::Wait(UNFILLED_WAIT_SECS), |lock| lock.verify(digits))
+    }
+
+    fn wait_left(&self) -> u32 {
+        self.lock
+            .get()
+            .map_or(UNFILLED_WAIT_SECS, |lock| lock.wait_left())
+    }
+
+    fn set_pin(&self, digits: Zeroizing<[u8; 4]>) -> bool {
+        self.lock.get().is_some_and(|lock| lock.set_pin(digits))
+    }
+
+    fn clear_pin(&self) {
+        if let Some(lock) = self.lock.get() {
+            lock.clear_pin();
+        }
+    }
+
+    fn lock_view(&self) -> LockView {
+        self.lock.get().map_or(
+            LockView {
+                on: true,
+                source: None,
+            },
+            |lock| lock.lock_view(),
+        )
+    }
+
+    fn night(&self) -> Option<(u8, u8)> {
+        self.lock.get()?.night()
+    }
+
+    fn set_night(&self, night: Option<(u8, u8)>) {
+        if let Some(lock) = self.lock.get() {
+            lock.set_night(night);
+        }
+    }
+}
+
+/// The seconds that the pad waits while the lock is not filled yet: a check that is refused for a second, again
+const UNFILLED_WAIT_SECS: u32 = 1;
 
 impl Source for Slot {
     fn snapshot(&self) -> Snapshot {
@@ -408,7 +743,8 @@ impl SignalCache {
 /// Only a joined link has a signal, an access point and a channel. The signal is the live one, which
 /// `signal` reads, and when that is unknown it is the one the join measured. `signal` is called
 /// only when joined. The access point is its address in the form the log shows. The channel's frequency
-/// is the one the join found, copied out of the status: nothing is asked of the radio for it.
+/// is the one the join found, copied out of the status: nothing is asked of the radio for it. So is the
+/// monotonic second the link came up on, which a link that is down has none of.
 pub fn link_status(
     status: &wifi::WifiStatus,
     signal: impl FnOnce() -> Option<i8>,
@@ -418,11 +754,13 @@ pub fn link_status(
             bssid,
             freq_mhz,
             signal_mbm,
+            since_secs,
         } => live::WifiStatus {
             associated: true,
             signal_dbm: signal().or_else(|| Some(held(wifi::dbm(*signal_mbm)))),
             ap: Some(wifi::mac(bssid)),
             freq_mhz: Some(*freq_mhz),
+            joined_secs: Some(*since_secs),
         },
         _ => live::WifiStatus::default(),
     }
@@ -505,6 +843,7 @@ mod tests {
             signal_dbm,
             ap: None,
             freq_mhz: None,
+            joined_secs: None,
         }
     }
 
@@ -660,6 +999,8 @@ mod tests {
         assert!(slot.top().is_none());
         slot.ack(1);
         assert!(slot.top().is_none());
+        assert!(slot.waiting(3).is_empty());
+        assert_eq!(slot.last_alert_unix(), None);
 
         // The store was raised into before it was put in the slot, and after: both are shown.
         let store = alert_store();
@@ -671,6 +1012,15 @@ mod tests {
 
         // An ack through the slot is the store's: the desktop's list shows it acknowledged.
         assert_eq!(slot.waiting_count(), 2);
+        let waiting = slot.waiting(5);
+        assert_eq!(
+            waiting
+                .iter()
+                .map(|a| a.subject.as_str())
+                .collect::<Vec<_>>(),
+            ["after.example", "before.example"]
+        );
+        assert_eq!(slot.last_alert_unix(), Some(1_800_000_000));
         slot.ack(2);
         assert_eq!(slot.top().unwrap().subject, "before.example");
         assert_eq!(slot.waiting_count(), 1);
@@ -803,6 +1153,234 @@ mod tests {
         assert!(wall_row(&*slot).0);
     }
 
+    /// The names the tests of the owner's names use: a resolver that blocks `ads.example.com`, the
+    /// configuration's `denied.example.org` and the threat `evil.example.net`, on a clock that stands
+    /// still at second 100 of the wall time 1,800,000,100.
+    fn names_resolver() -> SharedResolver {
+        let mut builder = BlockSetBuilder::new();
+        builder.add_list(b"0.0.0.0 ads.example.com\n");
+        builder.deny("denied.example.org").unwrap();
+        builder.add_list_as(b"0.0.0.0 evil.example.net\n", qb_dns::ListClass::Threat);
+        SharedResolver {
+            resolver: Arc::new(Mutex::new(Resolver::new(builder.build()))),
+            now: Arc::new(|| Now {
+                mono_secs: 100,
+                unix_secs: 1_800_000_100,
+            }),
+        }
+    }
+
+    /// The panel's control of the owner's names over `resolver`, with the clock set or not.
+    fn live_names(resolver: &SharedResolver, clock_set: bool) -> LiveNames {
+        LiveNames {
+            list: Arc::new(OwnerList::new(resolver.clone()).starting_at(0)),
+            resolver: resolver.clone(),
+            deny: DenyList::new(&["Denied.Example.org".to_owned()]),
+            clock_set: Arc::new(move || clock_set),
+        }
+    }
+
+    #[test]
+    fn the_panel_tells_which_list_blocks_a_name_and_a_deny_entry_from_an_ad() {
+        let resolver = names_resolver();
+        let names = live_names(&resolver, true);
+        for (name, class) in [
+            ("ads.example.com", NameClass::Ads),
+            ("sub.ads.example.com", NameClass::None),
+            ("denied.example.org", NameClass::Deny),
+            ("deep.Denied.Example.org.", NameClass::Deny),
+            ("evil.example.net", NameClass::Threat),
+            ("clean.example.org", NameClass::None),
+            ("not a name", NameClass::None),
+        ] {
+            assert_eq!(names.class(name), class, "{name:?}");
+        }
+        // The owner's entries are no class: what the lists say is what they say.
+        names.set("ads.example.com", OwnerSide::Allow).unwrap();
+        names.set("clean.example.org", OwnerSide::Refuse).unwrap();
+        assert_eq!(names.class("ads.example.com"), NameClass::Ads);
+        assert_eq!(names.class("clean.example.org"), NameClass::None);
+    }
+
+    #[test]
+    fn the_panel_edits_the_list_the_resolver_decides_from_and_keeps_the_day_of_the_tap() {
+        let resolver = names_resolver();
+        let names = live_names(&resolver, true);
+        assert_eq!(
+            (names.owner_len(), names.owner_hold("a.example.org")),
+            (0, None)
+        );
+
+        names.set("New.Example.org", OwnerSide::Refuse).unwrap();
+        names.set("ads.example.com", OwnerSide::Allow).unwrap();
+        assert_eq!(names.owner_len(), 2);
+        assert_eq!(names.list.rev(), 2);
+        // In force at once, in the resolver the DNS task answers from.
+        assert!(matches!(
+            ask(&resolver, "new.example.org"),
+            Action::Reply(_)
+        ));
+        assert!(matches!(
+            ask(&resolver, "ads.example.com"),
+            Action::Forward(_)
+        ));
+        let newest = names.owner_newest(3);
+        assert_eq!(
+            newest
+                .iter()
+                .map(|entry| (&*entry.name, entry.side, entry.set_unix))
+                .collect::<Vec<_>>(),
+            [
+                ("ads.example.com", OwnerSide::Allow, Some(1_800_000_100)),
+                ("new.example.org", OwnerSide::Refuse, Some(1_800_000_100)),
+            ]
+        );
+        let hold = names.owner_hold("sub.new.example.org").unwrap();
+        assert_eq!((hold.side, hold.exact), (OwnerSide::Refuse, false));
+        let hold = names.owner_hold("new.example.org").unwrap();
+        assert_eq!((hold.side, hold.exact), (OwnerSide::Refuse, true));
+
+        // `ANSWER AGAIN` and `REFUSE AGAIN` take the entry back.
+        assert_eq!(names.forget("new.example.org"), Ok(true));
+        assert_eq!(names.forget("new.example.org"), Ok(false));
+        assert_eq!(names.forget("ads.example.com"), Ok(true));
+        assert!(matches!(
+            ask(&resolver, "new.example.org"),
+            Action::Forward(_)
+        ));
+        assert!(matches!(
+            ask(&resolver, "ads.example.com"),
+            Action::Reply(_)
+        ));
+        assert_eq!(names.owner_len(), 0);
+        assert_eq!(
+            names.set("not a name", OwnerSide::Refuse),
+            Err(NamesError::Invalid)
+        );
+    }
+
+    #[test]
+    fn the_panel_never_allows_a_threat_and_keeps_no_day_before_the_clock_is_set() {
+        let resolver = names_resolver();
+        let names = live_names(&resolver, false);
+        assert_eq!(
+            names.set("evil.example.net", OwnerSide::Allow),
+            Err(NamesError::Threat)
+        );
+        assert_eq!((names.owner_len(), names.list.rev()), (0, 0));
+        assert!(matches!(
+            ask(&resolver, "evil.example.net"),
+            Action::Reply(_)
+        ));
+        // Refusing a threat is no harm, and an entry set before the clock was has no day.
+        names.set("evil.example.net", OwnerSide::Refuse).unwrap();
+        names.set("ads.example.com", OwnerSide::Allow).unwrap();
+        assert!(
+            names
+                .owner_newest(2)
+                .iter()
+                .all(|entry| entry.set_unix.is_none())
+        );
+    }
+
+    #[test]
+    fn the_top_of_the_day_is_the_resolvers_and_a_copy() {
+        let resolver = names_resolver();
+        let names = live_names(&resolver, true);
+        assert!(names.top_today().is_empty());
+        for name in ["ads.example.com", "denied.example.org", "ads.example.com"] {
+            assert!(matches!(ask(&resolver, name), Action::Reply(_)));
+        }
+        let top = names.top_today();
+        assert_eq!(
+            top.iter().map(|t| (&*t.name, t.count)).collect::<Vec<_>>(),
+            [("ads.example.com", 2), ("denied.example.org", 1)]
+        );
+    }
+
+    #[test]
+    fn the_slot_has_no_names_until_they_are_in_it_and_keeps_the_first() {
+        let slot = Slot::new();
+        assert!(slot.top_today().is_empty());
+        assert_eq!(
+            (slot.owner_len(), slot.owner_hold("a.example.org")),
+            (0, None)
+        );
+        assert!(slot.owner_newest(3).is_empty());
+        assert_eq!(slot.class("ads.example.com"), NameClass::None);
+        assert_eq!(
+            slot.set("a.example.org", OwnerSide::Refuse),
+            Err(NamesError::Unavailable)
+        );
+        assert_eq!(slot.forget("a.example.org"), Err(NamesError::Unavailable));
+
+        let resolver = names_resolver();
+        slot.fill_names(Arc::new(live_names(&resolver, true)));
+        slot.set("a.example.org", OwnerSide::Refuse).unwrap();
+        assert_eq!(slot.owner_len(), 1);
+        assert_eq!(slot.class("ads.example.com"), NameClass::Ads);
+        assert!(matches!(ask(&resolver, "a.example.org"), Action::Reply(_)));
+
+        // A second control does not replace the slot's.
+        slot.fill_names(Arc::new(live_names(&names_resolver(), true)));
+        assert_eq!(slot.owner_len(), 1);
+        assert_eq!(slot.forget("a.example.org"), Ok(true));
+    }
+
+    #[test]
+    fn the_slot_fails_closed_and_has_no_night_until_the_state_is_in_it_and_keeps_the_first() {
+        use crate::panel::lock::{PanelState, Source as PinSource};
+
+        let pin = |digits: &[u8; 4]| {
+            crate::api::password::PasswordHash::with_rounds(
+                digits,
+                [2; 16],
+                crate::api::password::PIN_ROUNDS,
+            )
+        };
+        let slot = Slot::new();
+        // Nothing is filled: the lock fails closed. The strong keys ask (the lock reads as on), no PIN passes and
+        // none is counted wrong, no night is on, and an edit goes nowhere.
+        assert_eq!(slot.verify(Zeroizing::new([1, 2, 3, 4])), Check::Wait(1));
+        assert_eq!(slot.verify(Zeroizing::new([4, 3, 2, 1])), Check::Wait(1));
+        assert_eq!(
+            slot.lock_view(),
+            LockView {
+                on: true,
+                source: None
+            }
+        );
+        assert_eq!((slot.night(), slot.wait_left()), (None, 1));
+        assert!(!slot.set_pin(Zeroizing::new([1, 2, 3, 4])));
+        slot.set_night(Some((22, 6)));
+        slot.clear_pin();
+        assert_eq!(slot.night(), None);
+
+        let state = Arc::new(PanelState::new(
+            Some(pin(b"1234")),
+            Some((23, 7)),
+            Arc::new(|| 0),
+        ));
+        slot.fill_lock(state.clone());
+        assert_eq!(slot.night(), Some((23, 7)));
+        assert_eq!(slot.lock_view().source, Some(PinSource::Config));
+        assert_eq!(slot.verify(Zeroizing::new([1, 2, 3, 4])), Check::Right);
+        assert_eq!(slot.verify(Zeroizing::new([4, 3, 2, 1])), Check::Wrong);
+        // The edits of the panel and of the API are the one state's.
+        slot.set_night(Some((22, 6)));
+        assert_eq!(state.night(), Some((22, 6)));
+        state.lock().set_hash(None, PinSource::Api);
+        assert!(!slot.lock_view().on);
+        assert!(slot.set_pin(Zeroizing::new([5, 6, 7, 8])));
+        assert_eq!(slot.lock_view().source, Some(PinSource::Panel));
+        assert_eq!(state.verify(Zeroizing::new([5, 6, 7, 8])), Check::Right);
+
+        // A second state does not replace the slot's.
+        slot.fill_lock(Arc::new(PanelState::new(None, None, Arc::new(|| 0))));
+        assert!(slot.lock_view().on);
+        assert_eq!(slot.night(), Some((22, 6)));
+    }
+
     #[test]
     fn a_second_store_does_not_replace_the_slots_and_the_alerts_do_not_touch_the_resolver_slot() {
         let slot = Slot::new();
@@ -895,6 +1473,7 @@ mod tests {
             bssid: [0x00, 0x00, 0x5e, 0x00, 0x53, 0x01],
             freq_mhz: 5180,
             signal_mbm: -5600,
+            since_secs: 4_000,
         };
         assert_eq!(
             link_status(&joined, || Some(-55)),
@@ -903,8 +1482,14 @@ mod tests {
                 signal_dbm: Some(-55),
                 ap: Some("00:00:5e:00:53:01".to_owned()),
                 freq_mhz: Some(5180),
+                joined_secs: Some(4_000),
             }
         );
+        // How long it has held is counted from the second it came up on, and never below nothing.
+        let shown = link_status(&joined, || None);
+        assert_eq!(shown.linked_secs(4_000 + 12 * 86_400), Some(12 * 86_400));
+        assert_eq!(shown.linked_secs(3_999), Some(0));
+        assert_eq!(live::WifiStatus::default().linked_secs(5_000), None);
         // Without a live figure, the join's own is shown.
         assert_eq!(link_status(&joined, || None).signal_dbm, Some(-56));
         for not_joined in [
@@ -921,5 +1506,206 @@ mod tests {
             });
             assert_eq!(shown, live::WifiStatus::default(), "{not_joined:?}");
         }
+    }
+    /// A control of the board whose clock is `ms` milliseconds on a counter that the test moves, over
+    /// `ctl`, with the Wi-Fi's notify.
+    fn system_on(ctl: &Arc<UpdateCtl>, ms: &Arc<AtomicU64>) -> (LiveSystem, Arc<Notify>) {
+        let notify = Arc::new(Notify::new());
+        let clock = {
+            let ms = ms.clone();
+            move || Duration::from_millis(ms.load(Ordering::SeqCst))
+        };
+        (
+            LiveSystem::with_clock(ctl.clone(), notify.clone(), clock),
+            notify,
+        )
+    }
+
+    /// Whether `notify` is notified within a moment: a waiter made before the call under test hears it.
+    async fn heard(waiting: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), waiting)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_wakes_the_wifi_and_a_second_within_a_minute_is_refused_with_the_time_left() {
+        let ms = Arc::new(AtomicU64::new(1_000_000));
+        let (system, notify) = system_on(&UpdateCtl::off(), &ms);
+
+        let waiting = notify.notified();
+        tokio::pin!(waiting);
+        assert_eq!(system.rejoin(), Ok(()));
+        assert!(heard(waiting).await, "the Wi-Fi did not hear the rejoin");
+
+        // At once, the whole minute is left; the refusal wakes nobody.
+        let waiting = notify.notified();
+        tokio::pin!(waiting);
+        assert_eq!(system.rejoin(), Err(RejoinWait(60)));
+        // 1.5 s later 58.5 s are left, counted up; the last second of the minute says 1.
+        ms.fetch_add(1_500, Ordering::SeqCst);
+        assert_eq!(system.rejoin(), Err(RejoinWait(59)));
+        ms.fetch_add(58_499, Ordering::SeqCst);
+        assert_eq!(system.rejoin(), Err(RejoinWait(1)));
+        assert!(!heard(waiting).await, "a refused rejoin woke the Wi-Fi");
+
+        // A minute after the one that was let through, the next is.
+        ms.fetch_add(1, Ordering::SeqCst);
+        let waiting = notify.notified();
+        tokio::pin!(waiting);
+        assert_eq!(system.rejoin(), Ok(()));
+        assert!(heard(waiting).await);
+        // And the minute counts from that one.
+        assert_eq!(system.rejoin(), Err(RejoinWait(60)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_is_refused_while_an_update_is_received_or_on_trial_and_is_not_charged() {
+        let ms = Arc::new(AtomicU64::new(1_000_000));
+        let ctl = UpdateCtl::new(Some(crate::slots::Slot::A), None, Arc::new(update::NoCard));
+        let (system, notify) = system_on(&ctl, &ms);
+
+        // While an update is received the whole minute is the answer, and the Wi-Fi hears nothing.
+        let waiting = notify.notified();
+        tokio::pin!(waiting);
+        let receiving = ctl.begin_receive().unwrap();
+        assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
+        ms.fetch_add(120_000, Ordering::SeqCst);
+        assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
+        assert!(!heard(waiting).await, "a refused rejoin woke the Wi-Fi");
+        // A staged update still waits for its restart.
+        receiving.staged();
+        assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
+
+        // The refusals charged no minute: the first rejoin after the update is let through at once.
+        let idle = UpdateCtl::new(Some(crate::slots::Slot::A), None, Arc::new(update::NoCard));
+        let (system, notify) = system_on(&idle, &ms);
+        let receiving = idle.begin_receive().unwrap();
+        assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
+        drop(receiving);
+        let waiting = notify.notified();
+        tokio::pin!(waiting);
+        assert_eq!(system.rejoin(), Ok(()));
+        assert!(heard(waiting).await);
+
+        // A boot on trial refuses too.
+        let trial = UpdateCtl::new(
+            Some(crate::slots::Slot::B),
+            None,
+            Arc::new(crate::update::NoCard),
+        );
+        trial.begin_trial(
+            crate::slots::Marker {
+                slot: crate::slots::Slot::B,
+                from: crate::slots::Slot::A,
+                build: 1,
+                mode: crate::slots::Mode::Tryboot,
+                started: true,
+                failed: None,
+            },
+            tokio::time::Instant::now(),
+        );
+        let (system, notify) = system_on(&trial, &ms);
+        let waiting = notify.notified();
+        tokio::pin!(waiting);
+        assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
+        assert!(!heard(waiting).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_nobody_is_there_to_hear_leaves_nothing_for_a_later_join() {
+        let ms = Arc::new(AtomicU64::new(0));
+        let (system, notify) = system_on(&UpdateCtl::off(), &ms);
+        // No link is held, so no loop waits: the notify keeps no permit (`notify_waiters`).
+        assert_eq!(system.rejoin(), Ok(()));
+        let waiting = notify.notified();
+        tokio::pin!(waiting);
+        assert!(!heard(waiting).await);
+    }
+
+    #[test]
+    fn the_owner_restarts_the_board_unless_an_update_is_received_or_on_trial() {
+        use crate::update::Cause;
+        let ms = Arc::new(AtomicU64::new(0));
+        let slot_a = crate::slots::Slot::A;
+        let ctl = UpdateCtl::new(Some(slot_a), None, Arc::new(crate::update::NoCard));
+        let (system, _) = system_on(&ctl, &ms);
+        let mut asked = ctl.restart_receiver();
+
+        // While an update is received: refused, nothing asked.
+        let receiving = ctl.begin_receive().unwrap();
+        assert_eq!(system.restart(), Err(RestartRefused::Updating));
+        assert_eq!(*asked.borrow_and_update(), None);
+        drop(receiving);
+        // Otherwise it is asked for with the owner's cause.
+        assert_eq!(system.restart(), Ok(()));
+        assert_eq!(
+            *asked.borrow_and_update(),
+            Some(update::Restart::Plain(Cause::Owner))
+        );
+
+        // A boot on trial refuses.
+        let trial = UpdateCtl::new(
+            Some(crate::slots::Slot::B),
+            None,
+            Arc::new(crate::update::NoCard),
+        );
+        trial.begin_trial(
+            crate::slots::Marker {
+                slot: crate::slots::Slot::B,
+                from: crate::slots::Slot::A,
+                build: 1,
+                mode: crate::slots::Mode::Tryboot,
+                started: true,
+                failed: None,
+            },
+            tokio::time::Instant::now(),
+        );
+        let (system, _) = system_on(&trial, &ms);
+        assert_eq!(system.restart(), Err(RestartRefused::Updating));
+        assert_eq!(*trial.restart_receiver().borrow(), None);
+    }
+
+    #[test]
+    fn the_control_shows_the_update_machinerys_view_and_the_boards_readings() {
+        let ctl = UpdateCtl::new(Some(crate::slots::Slot::A), None, Arc::new(update::NoCard));
+        let (system, _) = system_on(&ctl, &Arc::new(AtomicU64::new(0)));
+        assert_eq!(system.update_view().state, "idle");
+        let receiving = ctl.begin_receive().unwrap();
+        receiving.length_is(200);
+        receiving.arrived(50);
+        let view = system.update_view();
+        assert_eq!(
+            (view.state, view.received, view.length),
+            ("receiving", 50, 200)
+        );
+        // The readings are the running board's, read on this thread.
+        assert!(system.readings().uptime_secs.is_some_and(|secs| secs > 0));
+    }
+
+    #[test]
+    fn a_slot_with_no_control_yet_refuses_and_shows_an_idle_machinery_and_the_first_control_stays()
+    {
+        let slot = Slot::new();
+        assert_eq!(slot.rejoin(), Err(RejoinWait(1)));
+        assert_eq!(slot.restart(), Err(RestartRefused::NotReady));
+        let view = slot.update_view();
+        assert_eq!((view.state, view.slot, view.received), ("idle", None, 0));
+        // The readings are the board's all the same: they need nothing filled.
+        assert!(slot.readings().uptime_secs.is_some());
+
+        let ms = Arc::new(AtomicU64::new(0));
+        let ctl = UpdateCtl::new(Some(crate::slots::Slot::A), None, Arc::new(update::NoCard));
+        let (system, _) = system_on(&ctl, &ms);
+        slot.fill_system(Arc::new(system));
+        assert_eq!(slot.rejoin(), Ok(()));
+        assert_eq!(slot.rejoin(), Err(RejoinWait(60)));
+        assert_eq!(slot.update_view().slot, Some(crate::slots::Slot::A));
+        assert_eq!(slot.restart(), Ok(()));
+        // A second control is not taken: the first stays.
+        slot.fill_system(Arc::new(crate::panel::system::NoSystem));
+        assert_eq!(slot.rejoin(), Err(RejoinWait(60)));
+        // The notify the Wi-Fi component is given is the slot's own, the same on every call.
+        assert!(Arc::ptr_eq(&slot.rejoin_notify(), &slot.rejoin_notify()));
     }
 }

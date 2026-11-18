@@ -9,8 +9,11 @@
 //! the snapshot in the initramfs was loaded before the service listened.
 //!
 //! The API's step is the panel OS's (spec 9): it logs in over loopback, as qnet does, and asks
-//! `GET /api/qbp/devices`, which must answer with a `rev`. The self-test's last line says this
-//! process's resident memory.
+//! `GET /api/qbp/devices`, which must answer with a `rev`. P2's step does the same to `PUT
+//! /api/qbp/names`: it has the owner refuse a made-up `.invalid` name, asks for it over loopback and
+//! expects the blocked answer, clears the names, and asks again. P3's step reads `GET /api/qbp/panel`,
+//! which must answer with the night hours and the lock's state (and never a hash). The self-test's last
+//! line says this process's resident memory.
 //!
 //! The names asked for are fixed and made up for this, so the card's log holds none of the
 //! household's.
@@ -218,6 +221,14 @@ const LOGIN_PATH: &str = "/api/auth";
 /// The path that the API step asks for after the login: the device inventory, which says its
 /// revision (`rev`).
 const DEVICES_PATH: &str = "/api/qbp/devices";
+/// The path of the owner's names, which the names step puts to.
+const NAMES_PATH: &str = "/api/qbp/names";
+/// The path of the panel's night hours and lock, which the panel step reads.
+const PANEL_PATH: &str = "/api/qbp/panel";
+/// The name that the names step has the owner refuse: made up, and no one's.
+pub const REFUSED: &str = "qbp-selftest.invalid";
+/// What the resolver answers a name that it blocks, as [`Answer::summary`] says it.
+const BLOCKED: &str = "NOERROR 0.0.0.0";
 /// How long a connection to the API may take to be made, once tried.
 const API_CONNECT: Duration = Duration::from_secs(2);
 /// How long the step waits before it tries to connect again.
@@ -326,17 +337,22 @@ pub async fn api(server: SocketAddr, pem: Option<&[u8]>, password: &str, wait: D
 
 /// [`api`]'s outcome, the words after the path.
 fn api_exchange(server: SocketAddr, pin: [u8; 32], password: &str, deadline: Instant) -> String {
-    api_outcome(server, pin, password, deadline).unwrap_or_else(str::to_owned)
+    match api_outcome(server, pin, password, deadline) {
+        Ok(words) | Err(words) => words,
+    }
 }
 
-/// The steps of the exchange: connect, handshake, login, devices. An `Err` is the words that say
-/// where it ended.
-fn api_outcome(
+/// An open, logged-in connection to the API: the TLS stream, and the session it is logged in as.
+type Session = (StreamOwned<ClientConnection, StdTcpStream>, String);
+
+/// The first steps of the exchange: connect, handshake, login. An `Err` is the words that say where
+/// it ended (`login 401`, `no answer`, ...), which are the step's outcome all the same.
+fn open(
     server: SocketAddr,
     pin: [u8; 32],
     password: &str,
     deadline: Instant,
-) -> Result<String, &'static str> {
+) -> Result<Session, String> {
     let config = pinned_client(pin).ok_or(NO_ANSWER)?;
     let tcp = connect(server, deadline)?;
     limit(&tcp, deadline)?;
@@ -358,27 +374,213 @@ fn api_outcome(
         &request_text("POST", LOGIN_PATH, None, Some(&login), false),
     )?;
     if code != 200 {
-        return Ok(format!("login {code}"));
+        return Err(format!("login {code}"));
     }
     let sid = serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|reply| reply["session"]["sid"].as_str().map(str::to_owned))
         .ok_or("login without a session")?;
+    Ok((stream, sid))
+}
 
+/// The steps of the exchange: connect, handshake, login, devices. Whether it ended well or not, the
+/// words that say where.
+fn api_outcome(
+    server: SocketAddr,
+    pin: [u8; 32],
+    password: &str,
+    deadline: Instant,
+) -> Result<String, String> {
+    let (mut stream, sid) = open(server, pin, password, deadline)?;
     let (code, body) = exchange(
         &mut stream,
         deadline,
         &request_text("GET", DEVICES_PATH, Some(&sid), None, true),
     )?;
     let has_rev = serde_json::from_slice::<Value>(&body).is_ok_and(|reply| reply["rev"].is_u64());
-    // Say goodbye as a client does; whether the server has it by now is of no matter.
-    stream.conn.send_close_notify();
-    let _ = stream.flush();
+    goodbye(&mut stream);
     Ok(match (code, has_rev) {
         (200, true) => "200 rev".to_owned(),
         (200, false) => "200 no rev".to_owned(),
         (code, _) => code.to_string(),
     })
+}
+
+/// Logs in to the API at `server` with `password` and asks it for the panel's night hours and lock, as qnet
+/// does, and says what came back, as the one line
+///
+/// ```text
+/// selftest: api: /api/qbp/panel: 200 night lock
+/// ```
+///
+/// where `200 night lock` is an answer with `night` (the hours as text, or null), `lock.on` true or false
+/// and `lock.source` (a word, or null) and with no hash in it; `200 no lock` is a reply that lacks any of
+/// those or carries a hash, `login <code>` a login that was refused, any other number the code of the
+/// panel's reply, `no certificate` a card with no `tls.pem` and `no answer` a step that could not be done
+/// within `wait`. The API may not have bound yet, so the connection is tried again until `wait` is over.
+/// The line names no session, password, hash or hour. The panel OS's P3 step.
+///
+/// The whole exchange is blocking work of the pool, the handshake included.
+pub async fn panel(
+    server: SocketAddr,
+    pem: Option<&[u8]>,
+    password: &str,
+    wait: Duration,
+) -> String {
+    let outcome = match pem.and_then(crate::api::tls::leaf_sha256) {
+        None => "no certificate".to_owned(),
+        Some(pin) => {
+            let password = password.to_owned();
+            let deadline = Instant::now() + wait;
+            blocking("selftest panel", move || {
+                match panel_outcome(server, pin, &password, deadline) {
+                    Ok(words) | Err(words) => words,
+                }
+            })
+            .await
+            .unwrap_or_else(|_| NO_ANSWER.to_owned())
+        }
+    };
+    format!("selftest: api: {PANEL_PATH}: {outcome}")
+}
+
+/// The steps of [`panel`]: connect, handshake, login, read. The words that say where it ended.
+fn panel_outcome(
+    server: SocketAddr,
+    pin: [u8; 32],
+    password: &str,
+    deadline: Instant,
+) -> Result<String, String> {
+    let (mut stream, sid) = open(server, pin, password, deadline)?;
+    let (code, body) = exchange(
+        &mut stream,
+        deadline,
+        &request_text("GET", PANEL_PATH, Some(&sid), None, true),
+    )?;
+    let shaped = serde_json::from_slice::<Value>(&body).is_ok_and(|reply| {
+        (reply["night"].is_string() || reply["night"].is_null())
+            && reply["lock"]["on"].is_boolean()
+            && (reply["lock"]["source"].is_string() || reply["lock"]["source"].is_null())
+    });
+    // A hash in the answer would be a leak, whatever else it says.
+    let leaks = String::from_utf8_lossy(&body).contains("pbkdf2");
+    goodbye(&mut stream);
+    Ok(match (code, shaped && !leaks) {
+        (200, true) => "200 night lock".to_owned(),
+        (200, false) => "200 no lock".to_owned(),
+        (code, _) => code.to_string(),
+    })
+}
+
+/// Says goodbye as a client does; whether the server has it by now is of no matter.
+fn goodbye(stream: &mut StreamOwned<ClientConnection, StdTcpStream>) {
+    stream.conn.send_close_notify();
+    let _ = stream.flush();
+}
+
+/// Logs in to the API at `api_server`, has it refuse [`REFUSED`] with `PUT /api/qbp/names`, asks the
+/// DNS server at `dns_server` for that name over UDP, which must give the blocked answer, clears the
+/// owner's names with another `PUT`, and asks again, which must not. It says what happened as the
+/// one line
+///
+/// ```text
+/// selftest: api: /api/qbp/names: 200 refused cleared
+/// ```
+///
+/// where the words after the path are, instead, `login <code>` for a login that was refused, `put
+/// <code>` for a refusal that the API did not take, `not refused <answer>` for a name that the
+/// resolver did not block after it (`<answer>` is its answer: `SERVFAIL` or the like, `no answer`),
+/// `clear <code>` for a clearing that was not taken, `still refused` for a name that is blocked
+/// after it, `cleared and no answer` for a resolver that said nothing then, `no certificate` for a
+/// card with no `tls.pem`, and `no answer` for a step that could not be done within `wait`. The name
+/// is made up and is no one's, and the line holds no session or password. The panel OS's P2 step.
+///
+/// The whole exchange is blocking work of the pool, the handshake included.
+pub async fn names(
+    api_server: SocketAddr,
+    dns_server: SocketAddr,
+    pem: Option<&[u8]>,
+    password: &str,
+    wait: Duration,
+) -> String {
+    let outcome = match pem.and_then(crate::api::tls::leaf_sha256) {
+        None => "no certificate".to_owned(),
+        Some(pin) => {
+            let password = password.to_owned();
+            let deadline = Instant::now() + wait;
+            blocking("selftest names", move || {
+                match names_outcome(api_server, dns_server, pin, &password, deadline) {
+                    Ok(words) | Err(words) => words,
+                }
+            })
+            .await
+            .unwrap_or_else(|_| NO_ANSWER.to_owned())
+        }
+    };
+    format!("selftest: api: {NAMES_PATH}: {outcome}")
+}
+
+/// The steps of [`names`]: connect, handshake, login, refuse, ask, clear, ask. The words that say
+/// where it ended, or that it went well.
+fn names_outcome(
+    api_server: SocketAddr,
+    dns_server: SocketAddr,
+    pin: [u8; 32],
+    password: &str,
+    deadline: Instant,
+) -> Result<String, String> {
+    let (mut stream, sid) = open(api_server, pin, password, deadline)?;
+    let mut put = |refuse: &[&str], last: bool| -> Result<u16, &'static str> {
+        let body = json!({ "allow": [], "refuse": refuse }).to_string();
+        let request = request_text("PUT", NAMES_PATH, Some(&sid), Some(&body), last);
+        exchange(&mut stream, deadline, &request).map(|(code, _)| code)
+    };
+
+    let code = put(&[REFUSED], false)?;
+    if code != 200 {
+        return Ok(format!("put {code}"));
+    }
+    let asked = ask_udp(dns_server, REFUSED, deadline);
+    let said = asked.map_or_else(|| NO_ANSWER.to_owned(), |answer| answer.summary());
+    if said != BLOCKED {
+        return Ok(format!("not refused {said}"));
+    }
+
+    let code = put(&[], true)?;
+    if code != 200 {
+        return Ok(format!("clear {code}"));
+    }
+    let Some(answer) = ask_udp(dns_server, REFUSED, deadline) else {
+        return Ok("cleared and no answer".to_owned());
+    };
+    if answer.summary() == BLOCKED {
+        return Ok("still refused".to_owned());
+    }
+    goodbye(&mut stream);
+    Ok("200 refused cleared".to_owned())
+}
+
+/// What `server` answers over UDP to the question `name` A, as [`udp`] asks it but in blocking work:
+/// for the exchanges that hold a connection open meanwhile. Given [`ANSWER_WAIT`], or what is left
+/// to `deadline` if that is less.
+fn ask_udp(server: SocketAddr, name: &str, deadline: Instant) -> Option<Answer> {
+    let packet = query(QUERY_ID, name, TYPE_A).ok()?;
+    let until = deadline.min(Instant::now() + ANSWER_WAIT);
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+    socket.connect(server).ok()?;
+    socket.send(&packet).ok()?;
+    let mut buf = vec![0u8; UDP_BUFFER];
+    loop {
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        socket.set_read_timeout(Some(left)).ok()?;
+        let len = socket.recv(&mut buf).ok()?;
+        if let Some(answer) = read_answer(&buf[..len], QUERY_ID) {
+            return Some(answer);
+        }
+    }
 }
 
 /// A connection to `server`, tried again every [`API_RETRY`] until `deadline`.
@@ -515,12 +717,21 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::watch;
 
+    use crate::api::live::LiveFacts;
+    use crate::api::password::PasswordHash;
+    use crate::api::qbp::QbpWatch;
+    use crate::api::routes::Api;
     use crate::dns::Dns;
     use crate::dns::testutil::{FakeUpstream, FixedOffset, Reply, closed_port, listen, ms};
     use crate::dns::upstream::Upstreams;
     use crate::lists::{self, ListState, Lists, Source};
     use crate::logbuf::LogBuf;
+    use crate::names::OwnerList;
+    use crate::panel::lock::PanelState;
     use crate::status::Status;
+    use crate::watch::devices::Devices;
+    use crate::watch::store::AlertStore;
+    use crate::wiring::{Extras, SharedResolver};
 
     /// A DNS service that denies [`DENIED`] and whose only upstream is a port where nothing
     /// listens, and a status server over it; both on `127.0.0.1` ports, with room for two clients
@@ -638,6 +849,152 @@ mod tests {
         assert_eq!(line, "selftest: api: /api/qbp/devices: no answer");
         let took = started.elapsed();
         assert!(took >= ms(500) && took < ms(4000), "{took:?}");
+    }
+
+    /// A DNS service with the given `denied` names whose only upstream is a port where nothing listens,
+    /// and the API of its own over a resolver of its own, with the owner's names of that: the
+    /// DNS service's address, the API's, the card's `tls.pem` and the owner's list. Both are on `127.0.0.1`.
+    async fn names_service(
+        denied: &[String],
+    ) -> (
+        SocketAddr,
+        SocketAddr,
+        &'static [u8],
+        Arc<OwnerList>,
+        Arc<Dns>,
+    ) {
+        let dns = Dns::new(
+            lists::from_config(denied, &[]).build(),
+            Upstreams::with(vec![closed_port()], ms(300), ms(600)),
+            Box::new(FixedOffset(0)),
+        );
+        let dns_addr = listen(dns.clone()).await;
+        let list = Arc::new(OwnerList::new(SharedResolver::of(&dns)).starting_at(0));
+        let clock: Arc<dyn Fn() -> (u64, u64) + Send + Sync> = Arc::new(|| (100, 1_800_000_000));
+        let watch = Arc::new(QbpWatch {
+            alerts: Arc::new(AlertStore::new(clock.clone())),
+            devices: Arc::new(Mutex::new(Devices::new(
+                None,
+                Ipv4Addr::new(192, 0, 2, 1),
+                clock,
+            ))),
+            names: list.clone(),
+            panel: Arc::new(PanelState::new(None, Some((23, 7)), Arc::new(|| 1_000))),
+        });
+        let facts = LiveFacts {
+            dns: dns.clone(),
+            extras: Arc::new(Extras::default),
+        };
+        let api = Arc::new(
+            Api::new(
+                PasswordHash::new(b"right", [0; 16]),
+                Arc::new(facts),
+                Arc::new(|| 1_000),
+                Arc::new(|| Some([7; 16])),
+            )
+            .with_watch(watch),
+        );
+        let pem: &'static [u8] =
+            Box::leak(crate::api::testutil::pem().into_bytes().into_boxed_slice());
+        let tls = crate::api::tls::server_config(pem).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let api_addr = listener.local_addr().unwrap();
+        tokio::spawn(crate::api::serve(
+            listener,
+            tls,
+            api,
+            crate::api::Limits::DEFAULT,
+            crate::api::places(),
+        ));
+        (dns_addr, api_addr, pem, list, dns)
+    }
+
+    #[tokio::test]
+    async fn the_names_step_refuses_a_made_up_name_sees_it_blocked_clears_it_and_sees_it_asked() {
+        let (dns_addr, api_addr, pem, list, dns) = names_service(&[]).await;
+        let wait = Duration::from_secs(30);
+
+        let line = names(api_addr, dns_addr, Some(pem), "right", wait).await;
+
+        assert_eq!(line, "selftest: api: /api/qbp/names: 200 refused cleared");
+        // Two edits, the refusal and the clearing, and nothing is left in the resolver.
+        assert_eq!(list.rev(), 2);
+        assert!(list.is_empty());
+        assert!(dns.resolver().owner_names().is_empty());
+        // The line names no name, session or password.
+        assert!(!line.contains(REFUSED) && !line.contains("right"));
+    }
+
+    #[tokio::test]
+    async fn the_names_step_says_where_it_ended_and_never_the_name() {
+        let (dns_addr, api_addr, pem, list, _dns) = names_service(&[]).await;
+        let wait = Duration::from_secs(30);
+        let words = |line: String| -> String {
+            line.strip_prefix("selftest: api: /api/qbp/names: ")
+                .unwrap_or_else(|| panic!("{line}"))
+                .to_owned()
+        };
+
+        // A password that is not the API's, a card with no certificate.
+        let line = names(api_addr, dns_addr, Some(pem), "wrong", wait).await;
+        assert_eq!(words(line), "login 401");
+        let line = names(api_addr, dns_addr, None, "right", wait).await;
+        assert_eq!(words(line), "no certificate");
+        assert_eq!(list.rev(), 0);
+
+        // A DNS service that the API's names do not reach does not block the name.
+        let (other_dns, ..) = names_service(&[]).await;
+        let line = names(api_addr, other_dns, Some(pem), "right", wait).await;
+        assert_eq!(words(line), "not refused SERVFAIL");
+        // One that says nothing at all.
+        let line = names(api_addr, closed_port(), Some(pem), "right", wait).await;
+        assert_eq!(words(line), "not refused no answer");
+        // It gave up with the refusal still in force.
+        assert_eq!(list.view().refuse, [REFUSED]);
+
+        // A name that the DNS service blocks for its own reasons is blocked still when it is cleared.
+        let (denying, ..) = names_service(&[REFUSED.to_owned()]).await;
+        let line = names(api_addr, denying, Some(pem), "right", wait).await;
+        assert_eq!(words(line), "still refused");
+        assert!(list.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_names_step_is_given_the_wait_and_no_more() {
+        let pem = crate::api::testutil::pem();
+        let started = Instant::now();
+        let line = names(
+            closed_port(),
+            closed_port(),
+            Some(pem.as_bytes()),
+            "right",
+            ms(700),
+        )
+        .await;
+
+        assert_eq!(line, "selftest: api: /api/qbp/names: no answer");
+        let took = started.elapsed();
+        assert!(took >= ms(600) && took < ms(4000), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn the_panel_step_reads_the_hours_and_the_lock_and_says_so_without_naming_them() {
+        let (_dns_addr, api_addr, pem, _list, _dns) = names_service(&[]).await;
+        let wait = Duration::from_secs(30);
+
+        let line = panel(api_addr, Some(pem), "right", wait).await;
+
+        assert_eq!(line, "selftest: api: /api/qbp/panel: 200 night lock");
+        // A login that is refused, a card with no certificate and a server that is not there each say so.
+        let line = panel(api_addr, Some(pem), "wrong", wait).await;
+        assert_eq!(line, "selftest: api: /api/qbp/panel: login 401");
+        let line = panel(api_addr, None, "right", wait).await;
+        assert_eq!(line, "selftest: api: /api/qbp/panel: no certificate");
+        let started = Instant::now();
+        let line = panel(closed_port(), Some(pem), "right", ms(700)).await;
+        assert_eq!(line, "selftest: api: /api/qbp/panel: no answer");
+        let took = started.elapsed();
+        assert!(took >= ms(600) && took < ms(4000), "{took:?}");
     }
 
     #[test]

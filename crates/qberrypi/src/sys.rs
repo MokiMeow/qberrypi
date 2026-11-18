@@ -404,6 +404,18 @@ pub fn random_u64() -> u64 {
     }
 }
 
+/// Where a revision counter starts this boot: a number from 1 to `u32::MAX` that the kernel's
+/// random source gives, never 0.
+///
+/// A counter that is held in memory and starts from 0 on every boot gives a client that kept a
+/// revision from the last boot the chance to match the one now. A fresh start point makes that a
+/// chance of one in four billion, and the counter still only goes up from there, by one for
+/// each change. Far below 2^53, so that a client that reads JSON numbers as doubles keeps them
+/// whole.
+pub fn rev_seed() -> u64 {
+    random_u64() % u64::from(u32::MAX) + 1
+}
+
 /// A number from the clock, mixed so that nearby readings are far apart. Not a secret.
 fn clock_noise() -> u64 {
     let now = rustix::time::clock_gettime(ClockId::Monotonic);
@@ -1031,6 +1043,21 @@ mod tests {
         assert_ne!(message.flags & NLM_F_CAPPED, 0);
         // The header of the request, not all of it: an error code and 16 bytes.
         assert_eq!(message.payload.len(), 4 + 16);
+    }
+
+    #[test]
+    fn a_revision_seed_is_never_zero_and_differs_from_boot_to_boot() {
+        let seeds: Vec<u64> = (0..64).map(|_| rev_seed()).collect();
+        assert!(
+            seeds
+                .iter()
+                .all(|&seed| (1..=u64::from(u32::MAX)).contains(&seed))
+        );
+        let mut sorted = seeds.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        // 64 draws out of four billion: a repeat would be a broken source.
+        assert_eq!(sorted.len(), seeds.len());
     }
 
     #[test]

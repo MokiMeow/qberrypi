@@ -15,6 +15,7 @@ use toml::{Table, Value};
 use tz::{TimeZone, TimeZoneSettings};
 
 use crate::api::password::PasswordHash;
+use crate::panel::lock::{self, DEFAULT_NIGHT};
 use crate::panel::touch::RAW_MAX;
 use crate::watch::devices::{MAX_BLOCK, MAX_EXEMPT};
 use crate::watch::frames::Mac;
@@ -50,6 +51,8 @@ pub struct Config {
     pub speed: SpeedCfg,
     /// How the touch screen's readings lie on the screen.
     pub panel: PanelCfg,
+    /// The night hours and the PIN that the panel starts the boot with: the same `[panel]` table.
+    pub panel_boot: PanelBoot,
     /// Switches used while bringing the system up.
     pub debug: DebugCfg,
     /// What the watchdog is told to leave alone.
@@ -310,6 +313,27 @@ impl PanelCfg {
     }
 }
 
+/// What the panel starts a boot with besides its touch calibration: the optional `night` and `pin_hash` of
+/// the `[panel]` table. Both are the boot's to change afterwards (the panel's screens and
+/// `PUT /api/qbp/panel`), for this boot only.
+#[derive(Debug)]
+pub struct PanelBoot {
+    /// The night hours `(from, to)` as hours of the day, `HH-HH` in the file; `None` for no night
+    /// (`"off"`). `23-07` when the file does not say.
+    pub night: Option<(u8, u8)>,
+    /// The PIN's hash, the line that `cargo xtask hash-pin` prints; `None` leaves the lock off until a
+    /// PIN is set. `Debug` shows `<redacted>`.
+    pub pin_hash: Option<PasswordHash>,
+}
+
+impl PanelBoot {
+    /// What a file without those keys says: the night from 23:00 to 07:00, and no PIN.
+    pub const DEFAULT: PanelBoot = PanelBoot {
+        night: Some(DEFAULT_NIGHT),
+        pin_hash: None,
+    };
+}
+
 /// Bring-up switches; all off in normal use.
 #[derive(Debug)]
 pub struct DebugCfg {
@@ -454,7 +478,7 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             runtime_cpu: None,
         },
     };
-    let panel = match root.section(
+    let (panel, panel_boot) = match root.section(
         "panel",
         &[
             "touch_left",
@@ -462,10 +486,12 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             "touch_top",
             "touch_bottom",
             "touch_swap_xy",
+            "night",
+            "pin_hash",
         ],
     )? {
-        Some(section) => panel(&section)?,
-        None => PanelCfg::DEFAULT,
+        Some(section) => (panel(&section)?, panel_boot(&section)?),
+        None => (PanelCfg::DEFAULT, PanelBoot::DEFAULT),
     };
     let debug = match root.section(
         "debug",
@@ -510,6 +536,7 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
         upstream,
         speed,
         panel,
+        panel_boot,
         debug,
         watch,
         api,
@@ -765,6 +792,32 @@ fn panel(section: &Section) -> Result<PanelCfg, ConfigError> {
         return Err(section.error("touch_bottom", "must differ from touch_top"));
     }
     Ok(panel)
+}
+
+/// The `night` and `pin_hash` of the `[panel]` table. A hash that is no line of a PIN is refused by key,
+/// as a bad `password_hash` is, without a piece of it in the error.
+fn panel_boot(section: &Section) -> Result<PanelBoot, ConfigError> {
+    let night = match section.string("night")? {
+        None => PanelBoot::DEFAULT.night,
+        Some(text) => lock::parse_night(text).ok_or_else(|| {
+            section.error(
+                "night",
+                "must be \"HH-HH\" (two different hours, 00 to 23, as in \"23-07\") or \"off\"",
+            )
+        })?,
+    };
+    let pin_hash = section
+        .string("pin_hash")?
+        .map(|text| {
+            lock::parse_pin_hash(text).ok_or_else(|| {
+                section.error(
+                    "pin_hash",
+                    "must be the hash in the line that cargo xtask hash-pin prints (10,000 rounds)",
+                )
+            })
+        })
+        .transpose()?;
+    Ok(PanelBoot { night, pin_hash })
 }
 
 fn debug(section: &Section) -> Result<DebugCfg, ConfigError> {
@@ -2017,6 +2070,127 @@ upstreams = ["9.9.9.9"]
     fn the_defaults_of_the_panel_table_are_the_nominal_calibration() {
         assert_eq!(PanelCfg::DEFAULT.calibration(), Calibration::NOMINAL);
         assert_eq!(parse(MINIMAL).unwrap().panel, PanelCfg::DEFAULT);
+    }
+
+    /// A well-formed `pin_hash` line that no PIN was derived from (10,000 rounds).
+    const PIN_LINE: &str = "$pbkdf2-sha256$i=10000$0123456789abcdef0123456789abcdef$fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn without_those_keys_the_night_is_23_to_07_and_there_is_no_pin() {
+        for text in [
+            EXAMPLE.to_owned(),
+            MINIMAL.to_owned(),
+            format!("{EXAMPLE}\n[panel]\ntouch_left = 3890\n"),
+        ] {
+            let boot = parse(&text).unwrap().panel_boot;
+            assert_eq!(boot.night, Some((23, 7)));
+            assert!(boot.pin_hash.is_none());
+        }
+    }
+
+    #[test]
+    fn the_night_hours_are_hh_hh_or_off() {
+        for (value, hours) in [
+            ("23-07", Some((23, 7))),
+            ("00-23", Some((0, 23))),
+            ("07-23", Some((7, 23))),
+            ("off", None),
+        ] {
+            let text = format!("{EXAMPLE}\n[panel]\nnight = \"{value}\"\n");
+            assert_eq!(parse(&text).unwrap().panel_boot.night, hours, "{value}");
+        }
+    }
+
+    #[test]
+    fn night_hours_that_are_no_hours_are_refused_by_key_without_echoing_them() {
+        for bad in [
+            "07-07", "24-07", "07-24", "7-23", "23-7", "", "23-07-08", "later-on", "OFF", "none",
+        ] {
+            let text = format!("{EXAMPLE}\n[panel]\nnight = \"{bad}\"\n");
+            let e = parse(&text).unwrap_err();
+            assert_eq!(e.key, "panel.night", "{bad:?}");
+            assert!(e.reason.starts_with("must be \"HH-HH\""), "{}", e.reason);
+            if bad.len() > 2 {
+                assert!(!e.to_string().contains(bad), "{e}");
+            }
+        }
+        // Not a string at all.
+        let e = parse(&format!("{EXAMPLE}\n[panel]\nnight = 23\n")).unwrap_err();
+        assert_eq!(
+            (e.key.as_str(), e.reason.as_str()),
+            ("panel.night", "must be a string")
+        );
+    }
+
+    #[test]
+    fn a_pin_hash_is_read_and_shows_nothing_of_itself() {
+        let text = format!("{EXAMPLE}\n[panel]\npin_hash = \"{PIN_LINE}\"\n");
+        let cfg = parse(&text).unwrap();
+        let hash = cfg.panel_boot.pin_hash.as_ref().expect("a pin hash");
+        assert_eq!(hash.to_text(), PIN_LINE);
+        assert_eq!(hash.rounds(), 10_000);
+        // The calibration and the night beside it are as ever.
+        assert_eq!(cfg.panel, PanelCfg::DEFAULT);
+        assert_eq!(cfg.panel_boot.night, Some((23, 7)));
+        for shown in [format!("{cfg:?}"), format!("{cfg:#?}")] {
+            assert!(
+                !shown.contains("fedcba98")
+                    && !shown.contains("01234567")
+                    && !shown.contains("pbkdf2"),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pin_hash_that_is_no_pin_line_refuses_the_config_by_key_without_echoing_it() {
+        let salt = "0123456789abcdef0123456789abcdef";
+        let hash = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        for bad in [
+            "nope".to_owned(),
+            String::new(),
+            "1234".to_owned(),
+            format!("$pbkdf2-sha256$i=10000${salt}${}", hash.to_uppercase()),
+            format!("$pbkdf2-sha256$i=9999${salt}${hash}"),
+            // Exactly the rounds of a PIN: more would hold the panel's thread, and the password's own are more.
+            format!("$pbkdf2-sha256$i=10001${salt}${hash}"),
+            format!("$pbkdf2-sha256$i=100000${salt}${hash}"),
+            format!("$pbkdf2-sha256$i=100001${salt}${hash}"),
+            format!("$pbkdf2-sha256$i=10000000${salt}${hash}"),
+            format!("{PIN_LINE} "),
+        ] {
+            let text = format!("{EXAMPLE}\n[panel]\npin_hash = \"{bad}\"\n");
+            let e = parse(&text).unwrap_err();
+            assert_eq!(e.key, "panel.pin_hash", "{bad:?}");
+            assert_eq!(
+                e.reason,
+                "must be the hash in the line that cargo xtask hash-pin prints (10,000 rounds)"
+            );
+            for shown in [e.to_string(), format!("{e:?}")] {
+                assert!(!shown.contains(hash) && !shown.contains(salt), "{shown}");
+                assert!(
+                    bad.is_empty() || bad == "nope" || !shown.contains(&bad),
+                    "{shown}"
+                );
+            }
+        }
+        let e = parse(&format!("{EXAMPLE}\n[panel]\npin_hash = 1234\n")).unwrap_err();
+        assert_eq!(
+            (e.key.as_str(), e.reason.as_str()),
+            ("panel.pin_hash", "must be a string")
+        );
+    }
+
+    #[test]
+    fn the_commented_examples_of_the_example_file_are_valid_ones() {
+        let text = EXAMPLE
+            .replace("# [panel]", "[panel]")
+            .replace("# night = \"23-07\"", "night = \"23-07\"");
+        assert_eq!(parse(&text).unwrap().panel_boot.night, Some((23, 7)));
+        // The pin line is a pattern to fill in, not a PIN that anyone could use.
+        assert!(EXAMPLE.contains("# pin_hash = \"$pbkdf2-sha256$i=10000$"));
+        let text = text.replace("# pin_hash = ", "pin_hash = ");
+        assert_eq!(parse(&text).unwrap_err().key, "panel.pin_hash");
     }
 
     #[test]

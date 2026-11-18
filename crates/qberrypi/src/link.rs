@@ -200,6 +200,7 @@ mod tests {
             bssid: [0; 6],
             freq_mhz: 5180,
             signal_mbm: -5600,
+            since_secs: 0,
         };
         assert!(is_associated(&joined));
         for status in [

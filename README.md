@@ -108,8 +108,8 @@ The home screen has six tiles:
 - **NAMES**: what's being blocked most.
 - **SYSTEM**: version, Wi-Fi and uptime.
 
-Everything works by tap, and it returns to the home screen after a minute idle. Alerts, Names and
-System are still being finished.
+Everything works by tap, and it returns to the home screen after a minute idle. SYSTEM also has night
+hours and an optional PIN for the strong actions ([details](docs/reference.md#the-front-panel)).
 
 ## Privacy
 

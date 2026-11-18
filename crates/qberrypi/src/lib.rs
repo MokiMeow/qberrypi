@@ -18,6 +18,7 @@ pub mod live;
 pub mod logbuf;
 pub mod modhelper;
 pub mod modules;
+pub mod names;
 pub mod net;
 pub mod netlink;
 pub mod panel;

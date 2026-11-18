@@ -199,6 +199,16 @@ pub fn mockup_dir() -> Option<PathBuf> {
     dir
 }
 
+/// Round 9's mockup directory, if `QBP_MOCKUP9_DIR` names it: the stills of the screens drawn as its concepts
+/// (spec §12), `r9-<A|C>-<screen>@2x.png`.
+pub fn mockup9_dir() -> Option<PathBuf> {
+    let dir = env::var_os("QBP_MOCKUP9_DIR").map(PathBuf::from);
+    if dir.is_none() {
+        eprintln!("QBP_MOCKUP9_DIR is not set: nothing to compare the round 9 screens with");
+    }
+    dir
+}
+
 /// A still of the mockup, a 2x copy of a 480 x 320 frame, as that frame: every second pixel.
 pub fn mockup_frame(path: &Path) -> Vec<u8> {
     let (width, height, big) = read_png_any(path);

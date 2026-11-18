@@ -168,6 +168,28 @@ impl Canvas {
         self.fill((x, y, x + i32::from(r.w), y + i32::from(r.h)), color);
     }
 
+    /// A rectangle whose edges may fall between pixels, as a browser's `fillRect` draws one at a fractional
+    /// position: each pixel takes the share of it the rectangle covers, so a pipe 13 px thick centred on a
+    /// pixel corner has a half-covered row at each edge. A rectangle on whole pixels is `rect`'s.
+    pub fn rect_f(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgb) {
+        if !(w > 0.0 && h > 0.0 && [x, y, w, h].iter().all(|v| v.is_finite())) {
+            return;
+        }
+        // The share of the pixel `i` (the span `i..i + 1`) that the span `from..to` covers.
+        let share =
+            |i: i32, from: f32, to: f32| (to.min(i as f32 + 1.0) - from.max(i as f32)).max(0.0);
+        let (x0, y0) = (x.floor() as i32, y.floor() as i32);
+        let (x1, y1) = ((x + w).ceil() as i32, (y + h).ceil() as i32);
+        for py in y0.max(0)..y1.min(HEIGHT as i32) {
+            let vertical = share(py, y, y + h);
+            for px in x0.max(0)..x1.min(WIDTH as i32) {
+                let covered = share(px, x, x + w) * vertical;
+                // The nearest of 255, so that a whole pixel is 255.
+                self.blend(px, py, color, (covered * 255.0 + 0.5) as u8);
+            }
+        }
+    }
+
     /// A hollow box as the mockup draws it: a block of `color`, then the ground `inside` it, `t` pixels in.
     pub fn hollow(&mut self, r: Rect, color: Rgb, t: u16, inside: Rgb) {
         self.rect(r, color);
@@ -385,6 +407,41 @@ mod tests {
         );
         assert_eq!(canvas.pixel(WIDTH, 0), None);
         assert_eq!(canvas.pixel(0, HEIGHT), None);
+    }
+
+    #[test]
+    fn a_fractional_rect_covers_each_pixel_by_its_share() {
+        // 13 px thick, centred on a pixel corner (y 100): from 93.5 to 106.5, so a half row at each edge.
+        let mut canvas = Canvas::new();
+        canvas.rect_f(8.0, 93.5, 384.0, 13.0, WHITE);
+        assert_eq!(white_at(&canvas, 8, 92), 0);
+        assert_eq!(white_at(&canvas, 8, 93), 128, "half of the first row");
+        assert_eq!(white_at(&canvas, 8, 94), 255);
+        assert_eq!(white_at(&canvas, 200, 106), 128, "half of the last row");
+        assert_eq!(white_at(&canvas, 200, 107), 0);
+        assert_eq!(white_at(&canvas, 7, 100), 0);
+        assert_eq!(white_at(&canvas, 391, 100), 255);
+        assert_eq!(white_at(&canvas, 392, 100), 0);
+        // A cursor at x 294.4 is 4 tenths of a column short on the left, and 6 on the right.
+        let mut cursor = Canvas::new();
+        cursor.rect_f(294.4, 287.0, 10.0, 18.0, WHITE);
+        assert_eq!(white_at(&cursor, 294, 290), 153, "0.6 of the column");
+        assert_eq!(white_at(&cursor, 295, 290), 255);
+        assert_eq!(white_at(&cursor, 304, 290), 102, "0.4 of the column");
+        assert_eq!(white_at(&cursor, 305, 290), 0);
+        // On whole pixels it is `rect`.
+        let mut whole = Canvas::new();
+        whole.rect_f(10.0, 20.0, 3.0, 2.0, BLUE);
+        let mut plain = Canvas::new();
+        plain.rect(Rect::new(10, 20, 3, 2), BLUE);
+        assert_eq!(whole.rgba(), plain.rgba());
+        // Nothing to draw, or nowhere to draw it, leaves the frame alone.
+        let mut none = Canvas::new();
+        none.rect_f(10.0, 10.0, 0.0, 5.0, WHITE);
+        none.rect_f(f32::NAN, 10.0, 5.0, 5.0, WHITE);
+        none.rect_f(-20.0, -20.0, 5.0, 5.0, WHITE);
+        none.rect_f(470.0, 310.0, 100.0, 100.0, WHITE);
+        assert_eq!(inked(&none, GROUND).len(), 10 * 10);
     }
 
     #[test]

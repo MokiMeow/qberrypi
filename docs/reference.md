@@ -139,24 +139,60 @@ few lines of a trial boot's bookkeeping; a boot with no update under way writes 
 
 The 3.5-inch touchscreen is a small OS of its own, built in three milestones from
 [`superpowers/specs/2026-11-12-qberrypi-panel-os-design.md`](superpowers/specs/2026-11-12-qberrypi-panel-os-design.md)
-and [its plan](superpowers/plans/2026-11-12-panel-os.md). **Phase 1** is what this section
-describes: the status lane, HOME, LIVE, DEVICES, the gate and the top alert. NAMES (P2) is a tile on
-HOME that does nothing yet, and SYSTEM opens only the ABOUT reading until P3 brings its other
-readings and the PIN lock. It is all taps, every target is at least 48 x 48 pixels, and the panel
-boots on HOME and returns to it after 60 s without a touch.
+and [its plan](superpowers/plans/2026-11-12-panel-os.md). This section describes all three phases: the
+status lane, HOME, LIVE, DEVICES, the gate, ALERTS, NAMES, SYSTEM with its readings, the states of the whole
+system (starting, updating, night, the PIN) and the lock. It is all taps, every target is at least 48 x 48
+pixels, the panel comes up on STARTING and then HOME, and returns to HOME after 60 s without a touch.
 
 | Screen | What it shows | Taps |
 |---|---|---|
-| **Lane** (every screen but LIVE) | `HOME`, the section's name (on HOME: `ALL WELL`, `n ALERT(S)` or `GATE OPEN`), a white tile with the count of waiting alerts, the clock | `HOME` goes HOME; the middle goes to the section's root (on HOME: `ALL WELL` opens LIVE, `n ALERTS` opens ALERT, `GATE OPEN` shuts the gate); the clock opens ABOUT |
-| **HOME** | Six tiles: LIVE (refused today, its share), DEVICES (how many, how many blocked, a miniature wall), ALERTS (how many wait, the newest's time), the gate (`SHUT` or the time left), NAMES, SYSTEM (version, days up) | A tile opens its screen. The gate tile opens GATE when shut and shuts the gate at once when open. NAMES does nothing in P1 |
-| **LIVE** | The old Drain: each name crossing the gate, the day's count and share | The key unfolds `5 MIN`, `30 MIN` and `1 HOUR` over the field when the gate is shut (a tap anywhere else, or 8 s, folds them) and shuts the gate when open; the clock column opens ABOUT |
+| **Lane** (every screen but LIVE) | `HOME`, the section's name (on HOME: `ALL WELL`, `n ALERT(S)` or `GATE OPEN`), a white tile with the count of waiting alerts, the clock | `HOME` goes HOME; the middle goes to the section's root (on HOME: `ALL WELL` opens LIVE, `n ALERTS` opens ALERTS, `GATE OPEN` shuts the gate); the clock opens SYSTEM |
+| **HOME** | Six tiles: LIVE (refused today, its share), DEVICES (how many, how many blocked, a miniature wall), ALERTS (how many wait, the newest's time), the gate (`SHUT` or the time left), NAMES, SYSTEM (version, days up) | A tile opens its screen. The gate tile opens GATE when shut and shuts the gate at once when open |
+| **LIVE** | The old Drain: each name crossing the gate, the day's count and share | The key unfolds `5 MIN`, `30 MIN` and `1 HOUR` over the field when the gate is shut (a tap anywhere else, or 8 s, folds them) and shuts the gate when open; the clock column opens SYSTEM |
 | **GATE** | `OPEN THE GATE`: ads pass on every device, threats stay blocked | `5 MIN`, `30 MIN`, `1 HOUR` open it and go back; `KEEP` goes back |
 | **DEVICES** | A wall of up to 12 places, each a device with its name and `BLOCKED`, `ADS PASS`, `OPEN m:ss` or `ALWAYS`, and a lamp that lights while it asks. Labelled devices come first, then the others by first sighting, then the router and the Pi; with more than 12 devices the twelfth place is `MORE` and turns the page. The first empty place says what a newcomer gets | A place opens DEVICE |
 | **DEVICE** | Its name, the last two names it asked and what became of them (`REFUSED`, `PASSED`, `ANSWERED`), the state key and the key of its own gate | The state key opens CONFIRM; the gate key opens ITS GATE, or shuts that device's gate when it is open. Both keys are inert on the router and the Pi, and on a device the configuration decides (`SET IN CONFIG`; its gate key says `NEVER OPENS` or `ALREADY OPEN`) |
 | **CONFIRM** | `LET ADS PASS?` or `BLOCK ADS?` for that device | `ALLOW ADS` / `BLOCK ADS` does it; `KEEP ...` goes back |
 | **ITS GATE** | `OPEN ITS GATE`: ads pass on that one device for a while | `5 MIN`, `30 MIN`, `1 HOUR`; `KEEP` goes back |
-| **ALERT** | The newest waiting alert, as a slab (white for high severity, blue otherwise): its title and up to three lines | `DISMISS` acknowledges it and goes HOME |
-| **ABOUT** | `QBERRYPI` and the running version. It is SYSTEM's only reading in P1 | `BACK` or the lane goes HOME |
+| **ALERTS** | The watch log, on tractor-feed paper: the newest three waiting alerts, the newest at the bottom, each as `hh:mm  URGENT` or `ROUTINE` (the weekday for one from before today), the device it is about and its title, with a white flag for `URGENT` and a blue one for the rest. Under them `hh:mm  WATCH CONTINUES`, a blinking cursor and `n ON THE LOG`. With none waiting: `NOTHING TO REPORT`, `LAST ENTRY FILED <day> hh:mm` (when the watchdog last filed an alert since the board started; left out when it never has) and `WATCH OPENED <day> hh:mm` (when the board started; left out while the clock is not set) | An entry opens its ALERT |
+| **ALERT** | The entry as its slip, torn off and stamped with what the Pi did: `REFUSED` for a `threat` or a `rebind` (the answer was blocked), `ADMITTED` for a `new_device` (it joined and got the newcomer's default), `OBSERVED` for anything else (nothing was blocked because of it). `URGENT` (white) for a high alert, `ROUTINE` (blue) otherwise, and up to three lines made from the alert: for a `threat` the name, `<device> asked n times by hh:mm` and `on the threat lists, never answered`; for a `new_device` `<device> joined at hh:mm` and `no name yet, <default> by default`; for an `arp_spoof` `<device> answers as router` and `n times since hh:mm`; for the rest the subject and `n times since hh:mm` | `DISMISS` acknowledges the alert (the call `POST /api/qbp/alerts/{id}/ack` makes, so qnet sees it) and goes back to the log; `SEE DEVICE` opens that device's DEVICE (dimmed and inert when the wall does not hold it); the name line of a `threat` or `rebind` opens its NAME |
+| **NAMES** | The day's three most refused names with their counts, each a pipe that is thicker the more it was refused, with a blue valve when it is refused and a white one when you let it through. `YOUR OWN n` is the door to your list | A pipe opens its NAME; `YOUR OWN` opens YOUR LIST |
+| **YOUR LIST** | The newest three of the names you set, as valves: refused blue, allowed white, with the day you set it on the panel at the right (`TODAY`, or the weekday), and none for an entry pushed from qnet. Nothing yet says `nothing of your own yet` | A pipe opens its NAME; the door goes back |
+| **NAME** | One name as a pipe from `THE HOUSE` through its valve to the answer, and a line saying what became of it and which list holds it: `Refused 1,204 times today` (counted only for the day's eight most refused; the Pi does not count answers), `Answered today`, `Refused by you since Mon` or `Allowed by you today`, then `on the ads list`, `on the deny list` (the configuration's `dns.deny`), `on a threat list` or `on no list` | `KEEP REFUSED`, `KEEP ANSWERED` or `KEEP ALLOWED` goes back; `ALLOW NAME` (on a refused name) or `REFUSE NAME` (on an answered one) puts it on your list; on a name you set, `REFUSE AGAIN` or `ANSWER AGAIN` takes your entry back. A name on a threat list has `BACK` and a `NEVER ALLOWED` key that does nothing |
+| **SYSTEM** | The board as one line, drawn as a small mimic: the router with the Wi-Fi band under it (`5 GHZ`), the link as five dashes lit by the signal with its word (`GOOD`, `FAIR`, `WEAK`, `DOWN` or `JOINING`), and the box that is the Pi with its two slots (the one that runs, with the version, and `KEPT`), and what it feels: load, memory in use, heat, days up, and how the last update ended. `NIGHT`, `LOCK` and `ABOUT` are keys under it. A figure the Pi does not know is a dash | The link opens WI-FI, the box's slots VERSION, its readings UP; the keys open NIGHT HOURS, LOCK and ABOUT |
+| **WI-FI** | The link drawn large: ten dashes lit by the signal (`(dBm + 100) / 5`, rounded, 0 to 10), its word, `5 GHz · signal -54 dBm · linked 12 days` and `upstream answers in 9 ms` (the time the Pi's own resolver measures to its upstream, not the router's). While a rejoin is under way every dash is dark and it says `JOINING` | `BACK`; `REJOIN` lets the link go and joins again (the house is without DNS for the few seconds of the join). It never asks for the PIN, is refused for a minute after the last one (the key says `WAIT`), and is inert while an update is received or on trial |
+| **VERSION** | The running version, `built 2026-11-12 · slot A`, and `last update: confirmed`, `rolled back` or `none since start` (the board keeps the outcome in memory only; there is no `CHECK NOW`, since the Pi cannot fetch a build) | `BACK` |
+| **UP** | `12 D 4 H` since the board started, `load 0.21 · memory 38% · 47 °C` (the minute's load, the memory in use by what is not `MemAvailable`, the processor's heat) and `last restart:` the cause as far as this boot knows (`an update`, or `an update that rolled back`; the Pi writes nothing for an ordinary restart, so it shows a dash) | `BACK`; `RESTART` restarts the board (the log is saved and the cause is logged as the owner's). It is strong, and inert while an update is received or on trial |
+| **NIGHT HOURS** | `DARK FROM 23:00` and `UNTIL 07:00`, each with a `-` and a `+` key. The two hours equal are no night | `-` and `+` change the draft; `DONE` sets the hours for this boot (and goes back); `SLEEP NOW` shows the night screen at once, until a touch |
+| **LOCK** | `ON` or `OFF`, the actions a PIN guards, and where the PIN lives (below) | `KEEP ON` / `KEEP OFF` goes back; `SET A PIN` (lock off) opens the pad to choose four digits; `TURN OFF` (lock on, strong) turns the lock off |
+| **ABOUT** | `QBERRYPI`, `a DNS gate and watchdog for the house` and `version ... on a Pi 3B+ · panel 480x320` | `BACK` or the lane goes HOME |
+
+**A new alert opens its slip by itself**, from whatever screen the panel is on (not over a state of
+the whole system, below). If several come in the same second the newest urgent one opens
+and the others wait on the log. It opens once: going back, or the minute without a touch, leaves it
+waiting, with the white ALERTS tile and the count in the lane. An alert acknowledged from qnet leaves
+the panel within a second, and the slip with it. The panel reads the newest three waiting alerts
+every second, and the device inventory every two seconds while ALERTS or an ALERT is up, to name
+their devices.
+
+**Your names** are the names you allow or refuse from the panel (or that qnet pushes): at most 128
+a side, kept in memory only, so qnet pushes them again after a restart. A refused name is blocked,
+with its subdomains, for every device, ADS PASS ones and devices with their own gate open too, and
+is counted as blocked but never raises an alert. An allowed name is answered although an ads list or
+`dns.deny` blocks it; a name on a threat list can never be allowed (the panel offers no key for it,
+and the Pi refuses it). The panel reads the day's most refused names and your list only while NAMES,
+YOUR LIST or NAME shows, every five seconds and at once when one opens or after you edit it, and the
+lock the read takes on the resolver is for a copy of eight names or one lookup. NAME shows no device:
+the Pi keeps no record of which device asked which name.
+
+`GET /api/qbp/names` answers `{"rev", "allow": [...], "refuse": [...], "top_today": [{"name",
+"count"}, ...]}`, each side sorted. `PUT /api/qbp/names` takes `{"allow": [...], "refuse": [...]}`
+(both keys, 4 KiB at most, names validated as `dns.deny` entries are, at most 128 a side) with the
+optional `"append"` and `"complete"` to send a long list in chunks as `known` is, and `"if_rev"`:
+a stale one is a 409 with `{"rev": current}`. A bad body is a 400 and changes nothing. `rev` moves
+whenever the list changes, whether qnet or the panel changed it; a push that leaves it as it is
+leaves `rev` alone, and a push keeps the entries it names as the panel set them, with their day.
+qnet adopts the Pi's list when `rev` moved and the lists differ, as it does the devices'.
 
 **ADS PASS** is the word, on the panel and in qnet, for a device that is let off the ads lists. The
 threat lists and every alert still apply to it. (The API's JSON keeps its field names, `exempt` and
@@ -168,9 +204,11 @@ no gate opens on it (the Pi refuses it, so the panel does not offer it); the rou
 
 **Gates** (the main one and each device's) are `5 MIN`, `30 MIN` or `1 HOUR`, and they shut by
 themselves: the main gate is a pause of blocking, a device's is an exemption that expires (at most 64
-open at once, none longer than an hour). They are not PIN-locked, now or later. Nothing is locked in P1:
-the lock (P3) will ask for a PIN before `ALLOW ADS` and the other strong actions, never before a
-gate. The gate's bar refills against the length that was chosen; a gate opened from elsewhere (qnet,
+open at once, none longer than an hour). They are never PIN-locked: opening a gate is not a strong
+action, and no gate stays open past the hour. During the main gate the threat lists and the names you
+refused yourself (NAMES) stay blocked: a pause lets only the ads lists and `dns.deny` through, and
+qnet's own pause (`POST /api/dns/blocking`) is the same one. The gate's bar refills against the
+length that was chosen; a gate opened from elsewhere (qnet,
 the API) is drawn against the smallest of the three lengths that holds what is left of it.
 
 **Labels** are the owner's names for devices, pushed by qnet (`PUT /api/qbp/devices/labels`: at most
@@ -193,23 +231,106 @@ that. To draw the same wall as the panel, `GET devices` also gives `own_mac` (th
 or `null`) and, per device, `label_rank` (the place of its label, or `null`) and `always` (the router
 and whatever claims its address or the Pi's).
 
+**The states of the whole system** cover every screen and offer no `HOME`; they answer only their own
+keys.
+
+- **STARTING** from the panel's first frame: `PANEL ON`, `WI-FI JOINED`, `CLOCK SET`, `LISTS 212K NAMES`
+  and `DNS ANSWERING` tick off as the board reports them (a line that is true is done whatever the ones
+  before it say), and HOME comes 3 s after the last, or after 90 s at the longest. The lists line is done
+  once the lists are loaded, though they hold no name (none may be configured), and DNS answering is the
+  resolver being there and having answered a query today or an upstream having answered one, so that a quiet
+  house does not hold the screen for the 90 s. A trial boot shows the trial after it.
+- **UPDATE**, drawn as a changeover of the two slots with `DNS ANSWERING` drawn unbroken under both:
+  `RECEIVING UPDATE` with the share of the build that has arrived (the old build answers all the while),
+  `TRIAL CONFIRMS IN m:ss` counting to the trial's minimum time, and then, if the trial still waits, the word
+  for what it waits for (`WI-FI`, `CLOCK` or `UPSTREAM`); `UPDATE CONFIRMED` or `UPDATE ROLLED BACK` when it
+  ends, shown once, until a tap or 30 s. The boxes carry the slots' real letters, and the version is written
+  only for the build that runs. It covers neither a PIN pad (that is the owner's for its minute) nor a night
+  screen (it stays dark, as for an alert): an update that is received or on trial, or an outcome that has not
+  been shown, waits, and shows when the pad closes or the panel wakes.
+- **NIGHT**, in the night hours: the hour in the darkest blue on the paper's margins. A minute without a
+  touch in the hours puts the panel to sleep; a touch wakes it to HOME and the next minute alone sleeps it
+  again; in the morning it lifts by itself. `SLEEP NOW` sleeps at once, outside the hours too, until a touch
+  (and it is not put to sleep again outside the hours). A waiting alert turns the caption into `n ON THE LOG`
+  in white; **an arriving alert does not light the screen**, and its slip opens when a touch wakes it. This is
+  drawing only: the screen's backlight is not switched.
+- **PIN**, the authorisation slip beside a pad of twelve keys: `ENTER THE PIN`, `CHOOSE A PIN`, `WRONG PIN`
+  or `WAIT m:ss`, four boxes and what it is signed for. `CANCEL`, or a minute without a touch, goes back to
+  the screen it came from with the action not done.
+
+**The lock.** It is built and off until a PIN is set. With a PIN set, the **strong actions** ask for it
+first, and their keys wear a padlock: `ALLOW ADS` on a device (letting ads pass for good), `ALLOW NAME` and
+`ANSWER AGAIN` on a name you refused, `RESTART`, and turning the lock off or setting a new PIN while one is
+set. Nothing that only makes the house stricter ever asks (`BLOCK ADS`, `REFUSE NAME`, `REFUSE AGAIN`,
+shutting a gate), nor does reading a screen, dismissing an alert, opening a gate, the night hours, `SLEEP NOW`
+or `REJOIN`. The four digits go from the pad to the check in a buffer that is wiped, and the check runs on
+the panel's own thread (10,000 rounds of PBKDF2, constant-time compare; the screen is not drawn for that
+moment). Three wrong PINs in a row make the pad wait 30 s, each wrong one after that doubles the wait, up to
+15 minutes, and a right PIN starts the count again; the pad shows `WAIT m:ss` and takes no digit. The log
+says `panel: wrong PIN (n in a row)` at WARN, the count only: no digit and no hash is ever logged or sent.
+The counter is in memory, so a power cut resets it (about three guesses a boot: a household's lock, not a
+vault). Until the services have started the lock fails closed: the strong keys ask, and no PIN is accepted.
+
+**Where the PIN lives.** A PIN is four digits and the Pi writes nothing to its card, so the durable one is a
+line in your configuration, in `[panel]`:
+
+```
+[panel]
+night = "23-07"        # the night hours, or "off"; the default is 23-07
+pin_hash = "$pbkdf2-sha256$i=10000$<salt>$<hash>"
+```
+
+Make the `pin_hash` line by piping four digits into `cargo xtask hash-pin` (never typed as an argument, and it
+refuses a terminal); it prints the line to paste. It survives a power cut, and changing it rides the next
+`cargo xtask update`. The desktop can put a hash in force for the running boot with `PUT /api/qbp/panel`
+(qnet keeps the hash and pushes it again after each start), and `SET A PIN` on the panel's LOCK screen works at
+once, for this boot only: the LOCK screen's second line says where the PIN lives (`kept in the config: it
+outlasts a restart`, `from the desktop: until the next restart`, `set here: until the next restart`). The
+latest set wins for the boot; at a start it is the configuration's hash, or none. `TURN OFF` on the panel
+lasts until the next restart when the configuration has a hash.
+
+`GET /api/qbp/panel` (behind the login) answers `{"night": "23-07" or null, "lock": {"on": true,
+"source": "config" | "api" | "panel" | null}}`: the hash is never in an answer. `PUT /api/qbp/panel` takes
+`{"night": "HH-HH" or null, "pin_hash": "<line>" or null}`, either key or both: `night` is two different hours
+of the day, `00` to `23`, from the first to the second (past midnight when the first is the later); `pin_hash`
+is what `hash-pin` prints, of exactly 10,000 rounds: either the hash alone (`$pbkdf2-sha256$i=10000$<salt>$<hash>`,
+taken as it is, with no white space around it) or the whole line `pin_hash = "<hash>"`, with its quotes and one
+space either side of the `=` (a line ending or other white space around the line is dropped), and `null` turns
+the lock off, or the night. (The configuration's `pin_hash` value is the hash alone.) It answers the state after the
+change, as `GET` does. A body with neither key, a bad night, a hash of another number of rounds, a line that is
+not exactly as `hash-pin` prints it or a value that is no PIN's hash is a 400 and changes nothing, and no answer
+repeats a piece of the body. Pushing the hash that is in force already (qnet pushes its own again after every start)
+changes nothing, and in particular keeps a wait that the lock is running. The night hours the panel's
+NIGHT HOURS sets are this same state: the panel and the desktop edit one value, kept in memory for the boot.
+
+**Reads of the board.** The panel reads the board's load, memory and heat (four small files of `/proc` and
+`/sys`, on its own thread, never the runtime's) every five seconds and only while SYSTEM, UP or WI-FI is up;
+where the update machinery stands once a second, whatever shows; and the link's figures with its usual
+snapshot. None of it is on the answer path.
+
 **Preview without the Pi:** `cargo xtask panel-preview --screen <name>` writes one screen to a PNG
 (`out/panel-preview.png`, or `--out`), drawn by the same code as the panel and pixel-for-pixel the
 reference of the same name in `crates/qb-panel/tests/reference/os-<name>.png`. The names are `home`,
 `home-alert`, `home-open`, `gate`, `live`, `live-gate`, `devices`, `device`, `confirm`, `pause`,
-`alert` and `about`. `--state` still draws the Drain's own states, and `--push <ssh-alias>` puts
-either on the screen of a Pi that runs Raspberry Pi OS.
+`alerts`, `alerts-none`, `alert`, `names`, `yours`, `name`, `name-locked`, `name-threat`, `about`, SYSTEM's
+`system`, `wifi`, `version`, `uptime`, `nighthours` and `lock`, and the states `boot` (STARTING), `night`, `pin`,
+`update-receiving`, `update-trial`, `update-confirmed` and `update-rolledback`.
+`--state` still draws the Drain's own states, and `--push <ssh-alias>` puts either on the screen of a
+Pi that runs Raspberry Pi OS.
 
 **Memory.** A unit test adds up the panel's buffers (the two painters, the glass's kept frame, the
 glyph caches and the world: about 3 MB, against a ceiling of 5 MB) and prints the total; the QEMU
 self-test logs the process's resident memory in its last line (`selftest: vmrss`), and
 `/api/v1/stats` reports it on the Pi as `memory.rss_kib`.
 
-Where P1 differs from the design mockups on purpose: `ADS PASS` where the mockup says `AD-FREE`; no
-`CHECK NOW` (the Pi cannot fetch a build, so an update is pushed from the desktop); a device's names
-only while its screen is open (above); `SEE DEVICE` on ALERT, the alert list, the arrival rule that
-opens a new alert by itself, and NAMES wait for P2; a new alert in P1 only lights the tile and the
-lane's count.
+Where the panel differs from the design mockups on purpose: `ADS PASS` where the mockup says
+`AD-FREE`; no `CHECK NOW` (the Pi cannot fetch a build, so an update is pushed from the desktop); a
+device's names only while its screen is open (above); no device on a name, so NAME starts its pipe
+at `THE HOUSE` and NAMES' rows show a name and its count only; the alert's stamp is what the Pi did,
+decided from its kind; YOUR LIST shows the newest three (the rest are in qnet) and the weekday an
+entry was set on the panel; the log's cursor is the only thing that moves on a screen at rest. In SYSTEM, the
+box says `KEPT` for the spare slot (the Pi does not know its version) and has no dates, and the last restart is
+only what this boot can know.
 
 ## Development on a card with Raspberry Pi OS
 
@@ -293,6 +414,7 @@ address. The board's firmware runs before the kernel and is not in that figure;
 | `cargo xtask return-to-pios --boot <mount>` | With the Pi's card in this computer's reader, makes it start Raspberry Pi OS again: the way back from a permanent qberrypi on a card that still has Raspberry Pi OS. |
 | `cargo xtask make-cert` | Makes qberrypi's own TLS certificate for the API, once, as `qberrypi-tls.pem` (private, git-ignored), and prints the pin a client checks. `image` and `update` use it too. |
 | `cargo xtask hash-password` | Prints the `password_hash` line for the API's login from a password piped in on standard input. |
+| `cargo xtask hash-pin` | Prints the `pin_hash` line for `[panel]` from four digits piped in on standard input (10,000 rounds of PBKDF2; it refuses a terminal, anything but four digits, and never takes the digits as an argument). See The front panel. |
 | `cargo xtask boot-time` | Measures power-on to the Pi's first DNS answer, from this computer. |
 | `cargo xtask panel-preview [--state <drain state> \| --screen <screen>] [--out <file>] [--push <ssh-alias>]` | Draws the front panel into a PNG, one of the Drain's states (`--state`, the default `normal`) or one screen of the panel's OS (`--screen home`, `devices`, `alert` and so on; see The front panel), and with `--push` onto the 3.5-inch screen of a Pi running Raspberry Pi OS. |
 | `cargo xtask probe --stage {resolver,blocker} [--server <ipv4>] [--listed <name>]` | While a one-shot boot is running, asks the Pi's DNS and status servers what a client would and prints which of the milestone's checks hold. `resolver` runs eight checks: forwarding, the cache, TCP, single-label names, the clock and the upstream latency. `blocker` runs those and seven more: the snapshot blocks before any refresh, the lists are then refreshed over HTTPS (it waits up to 150 s for that), and the name given with `--listed`, which must be on the lists, stays blocked. Start `blocker` together with the deploy, before the Pi has refreshed its lists. Run either stage once per boot: a second run finds `example.org` already in the Pi's cache. |

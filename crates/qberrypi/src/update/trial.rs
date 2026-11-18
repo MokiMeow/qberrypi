@@ -335,6 +335,8 @@ pub async fn run(ctl: Arc<UpdateCtl>, health: Arc<dyn Health>, settings: Setting
     };
     let (me, from, build) = (trial.marker.slot, trial.marker.from, trial.marker.build);
     let began = trial.began;
+    // The panel counts down to the same minimum time that this loop confirms by.
+    ctl.set_trial_minimum(settings.confirm_after);
     log::info!(
         "update: trial of build {build} on slot {me}: confirms {} s after init started{}",
         settings.confirm_after.as_secs(),
@@ -1251,6 +1253,7 @@ mod tests {
             bssid: [2, 0, 0, 0, 0, 1],
             freq_mhz: 5180,
             signal_mbm: -5600,
+            since_secs: 0,
         });
         assert!(health.wifi_associated());
     }

@@ -572,7 +572,8 @@ pub struct Devices {
     /// The fully blocked addresses that were published last, sorted, each once.
     blocked_published: Vec<Ipv4Addr>,
     /// The revision of the pushed lists, the mode, the labels and the gates; it moves with every
-    /// change of them.
+    /// change of them. It starts from a number of its own on every boot ([`crate::sys::rev_seed`],
+    /// never 0), so that a revision a desktop kept from the boot before is not the one now.
     rev: u64,
     /// The devices whose gate is open, by MAC, with the monotonic second at which it shuts, at
     /// most [`MAX_GATES`].
@@ -621,7 +622,7 @@ impl Devices {
             exemption: Arc::default(),
             exempt_published: Vec::new(),
             blocked_published: Vec::new(),
-            rev: 0,
+            rev: crate::sys::rev_seed(),
             gates: HashMap::new(),
             gate_wake: Arc::new(Notify::new()),
             labels: Vec::new(),
@@ -750,9 +751,19 @@ impl Devices {
 
     /// The revision of the pushed lists, the mode, the labels and the gates: it moves with every
     /// change of them, from the API, the panel or a gate that expires, and with nothing else. A
-    /// push that would change nothing does not move it.
+    /// push that would change nothing does not move it. It goes up by one for a change, from a
+    /// number that is different on every boot, so what the desktop kept from the last boot is not
+    /// the revision now.
     pub fn rev(&self) -> u64 {
         self.rev
+    }
+
+    /// Makes the revision start from `rev` in place of this boot's own number, so that a test can
+    /// say what each change makes it.
+    #[cfg(test)]
+    pub(crate) fn starting_at(mut self, rev: u64) -> Self {
+        self.rev = rev;
+        self
     }
 
     /// Whether a push that was made on the revision `if_rev` may go ahead: with `None` it always
@@ -3429,7 +3440,9 @@ mod tests {
     #[test]
     fn the_revision_moves_with_every_change_of_a_pushed_list_the_mode_the_labels_or_a_gate() {
         let (mut devices, clock, _) = exempt_setup();
-        assert_eq!(devices.rev(), 0);
+        // Each boot starts the count from a number of its own, which is never 0.
+        let start = devices.rev();
+        assert_ne!(start, 0);
         // What the watch hears, the known list, the configuration and the learning are no part.
         hear_all(&mut devices, &[5, 6]);
         devices.set_known(macs(&[5]));
@@ -3438,8 +3451,8 @@ mod tests {
         devices.set_exempt_default_config(false);
         clock.advance(1000);
         devices.tick();
-        assert_eq!(devices.rev(), 0);
-        let expect = std::cell::Cell::new(0);
+        assert_eq!(devices.rev(), start);
+        let expect = std::cell::Cell::new(start);
         let moved = |devices: &Rig, what: &str| {
             expect.set(expect.get() + 1);
             assert_eq!(devices.rev(), expect.get(), "{what}");
@@ -3491,13 +3504,30 @@ mod tests {
     #[test]
     fn a_check_of_the_revision_lets_a_push_through_only_on_the_revision_there_is() {
         let (mut devices, _, _) = exempt_setup();
+        let start = devices.rev();
         assert_eq!(devices.check_rev(None), Ok(()));
-        assert_eq!(devices.check_rev(Some(0)), Ok(()));
+        assert_eq!(devices.check_rev(Some(start)), Ok(()));
         devices.set_exempt(macs(&[5]));
-        assert_eq!(devices.check_rev(Some(0)), Err(1));
-        assert_eq!(devices.check_rev(Some(2)), Err(1));
-        assert_eq!(devices.check_rev(Some(1)), Ok(()));
+        assert_eq!(devices.check_rev(Some(start)), Err(start + 1));
+        assert_eq!(devices.check_rev(Some(start + 2)), Err(start + 1));
+        assert_eq!(devices.check_rev(Some(start + 1)), Ok(()));
         assert_eq!(devices.check_rev(None), Ok(()));
+    }
+
+    #[test]
+    fn the_revision_starts_from_a_number_of_each_boot_and_a_stale_one_from_the_last_does_not_match()
+    {
+        // Two inventories stand for two boots. Each starts its count somewhere else and never at
+        // 0, so a desktop's `if_rev` from the boot before, which it took from the count after a
+        // few changes, is not the revision of a boot that has made none.
+        let (mut before, _, _) = exempt_setup();
+        before.set_exempt(macs(&[5]));
+        before.set_exempt(macs(&[6]));
+        let kept = before.rev();
+        let (after, _, _) = exempt_setup();
+        assert_ne!(after.rev(), 0);
+        assert_ne!(after.rev(), before.rev());
+        assert_eq!(after.check_rev(Some(kept)), Err(after.rev()));
     }
 
     #[test]

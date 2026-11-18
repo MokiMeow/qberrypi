@@ -13,12 +13,20 @@ use qb_panel::drain::Stills;
 use qb_panel::format::{self, fit_site, fit_text, gate_fill};
 use qb_panel::os::screens::parts::GATE_CHOICES;
 use qb_panel::os::world::{
-    ALERT_LINE_CELLS, AlertRow, DeviceRow, DeviceState, MAX_DEVICES, Newcomer, display_name,
+    ALERT_LINE_CELLS, AlertRow, AlertStamp, Band, DEVICE_NAME_CELLS, DayWord, DeviceRow,
+    DeviceState, LastUpdate, Link, MAX_DEVICES, MAX_OWNER_ROWS, MAX_TOP_NAMES, Moment,
+    NameClass as WorldNameClass, NameFacts, NameRow, Newcomer, OwnerEntry as WorldOwnerEntry,
+    OwnerRow, OwnerVerdict, Slot as WorldSlot, UpdatePhase, UpdateRead, Waiting as WorldWaiting,
+    Weekday, When, display_name,
 };
 use qb_panel::{Blocking, LaneWords, Share, TimeOfDay};
 
-use crate::live::Snapshot;
+use crate::live::{Snapshot, WifiStatus};
+use crate::names::{OwnerEntry, OwnerHold};
 use crate::panel::alerts::{PanelAlert, Severity};
+use crate::panel::names::{NameClass, OwnerSide, TopName};
+use crate::slots::Slot;
+use crate::update::{OutcomeKind, View as UpdateView, Waiting};
 use crate::watch::devices::{WallCopy, WallDevice};
 use crate::watch::frames::Mac as HardwareAddress;
 
@@ -367,22 +375,6 @@ pub fn newcomer_of(inventory: &WallCopy) -> Newcomer {
     }
 }
 
-/// The title of an alert's slab, in capitals, for its kind; a kind that is not known is spelt out of
-/// itself.
-fn alert_title(kind: &str) -> String {
-    match kind {
-        "threat" => "THREAT BLOCKED".to_owned(),
-        "rebind" => "REBINDING BLOCKED".to_owned(),
-        "dga" => "SUSPICIOUS LOOKUPS".to_owned(),
-        "tunnel" => "TUNNEL SUSPECTED".to_owned(),
-        "beacon" => "REGULAR CALLS".to_owned(),
-        "burst" => "LOOKUP BURST".to_owned(),
-        "new_device" => "NEW DEVICE".to_owned(),
-        "arp_spoof" => "ARP SPOOF".to_owned(),
-        other => other.replace('_', " ").to_uppercase(),
-    }
-}
-
 /// `n times`, or `once`.
 fn times(count: u64) -> String {
     match count {
@@ -403,85 +395,420 @@ fn since_line(count: u64, since: Option<TimeOfDay>) -> String {
     }
 }
 
-/// What the panel calls the device an alert is about: for a `new_device` and an `arp_spoof` the alert's
-/// subject is the device's hardware address; for any other kind the alert's client is its address. The
-/// label, the hostname or `·octet` as the wall has it; `·octet` of the client's address when the wall does
-/// not hold the device; `a device` when it is not known at all.
-fn device_of(alert: &PanelAlert, wall: &[WallEntry]) -> String {
+/// The device an alert is about, as the wall has it: for a `new_device` and an `arp_spoof` the alert's subject is
+/// the device's hardware address; for any other kind the alert's client is its address. The wall's place for it,
+/// if the wall holds it.
+fn device_entry<'a>(alert: &PanelAlert, wall: &'a [WallEntry]) -> Option<&'a WallEntry> {
     if matches!(alert.kind.as_str(), "new_device" | "arp_spoof") {
-        let found = alert
-            .subject
-            .parse::<HardwareAddress>()
-            .ok()
-            .and_then(|mac| wall.iter().find(|entry| entry.row.mac == mac.0));
-        return found.map_or_else(|| "a device".to_owned(), |entry| entry.row.name.clone());
+        let mac = alert.subject.parse::<HardwareAddress>().ok()?;
+        return wall.iter().find(|entry| entry.row.mac == mac.0);
     }
     match alert.client {
-        Some(IpAddr::V4(ip)) => wall
-            .iter()
-            .find(|entry| entry.ipv4.contains(&ip))
-            .map_or_else(
-                || format!("\u{b7}{}", ip.octets()[3]),
-                |entry| entry.row.name.clone(),
-            ),
-        _ => "a device".to_owned(),
+        Some(IpAddr::V4(ip)) => wall.iter().find(|entry| entry.ipv4.contains(&ip)),
+        _ => None,
     }
 }
 
-/// The alert the panel opens, as the slab shows it (spec §5.3, ruling R11): the title for its kind, up to
-/// three lines, white for a high alert. The lines are made from what the store carries: the subject, how
-/// many times and since when, and the device as the wall names it (`wall` is the panel's last copy of it).
+/// What the panel calls the device an alert is about: the label, the hostname or `·octet` as the wall has it;
+/// `·octet` of the client's address when the wall does not hold the device; `None` when it is not known at all
+/// (a device alert whose hardware address the wall does not hold, or an alert with no client).
+fn device_word(alert: &PanelAlert, wall: &[WallEntry]) -> Option<String> {
+    if let Some(entry) = device_entry(alert, wall) {
+        return Some(entry.row.name.clone());
+    }
+    match alert.client {
+        Some(IpAddr::V4(ip)) if !matches!(alert.kind.as_str(), "new_device" | "arp_spoof") => {
+            Some(format!("\u{b7}{}", ip.octets()[3]))
+        }
+        _ => None,
+    }
+}
+
+/// A name as the lists and the owner's entries hold it: lower case, no trailing dot.
+fn plain_name(text: &str) -> String {
+    text.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// The weekday of `unix_secs` in a zone `utc_offset_secs` from UTC. The epoch's day, 1 January 1970, was a Thursday.
+pub fn weekday_of(unix_secs: u64, utc_offset_secs: i32) -> Weekday {
+    match (local_day(unix_secs, utc_offset_secs) + 3).rem_euclid(7) {
+        0 => Weekday::Mon,
+        1 => Weekday::Tue,
+        2 => Weekday::Wed,
+        3 => Weekday::Thu,
+        4 => Weekday::Fri,
+        5 => Weekday::Sat,
+        _ => Weekday::Sun,
+    }
+}
+
+/// The weekday and the time of day of `unix_secs`, or `None` for a time from before the clock was set.
+pub fn moment_of(unix_secs: u64, utc_offset_secs: i32) -> Option<Moment> {
+    clock_of(unix_secs, utc_offset_secs).map(|time| Moment {
+        day: weekday_of(unix_secs, utc_offset_secs),
+        time,
+    })
+}
+
+/// When an alert last happened, as the log says it: the time of day for today's, the weekday for an older one;
+/// `None` for a time from before the clock was set. With the clock not set now (`now_unix` before it), nothing can
+/// be told from today, and the time of day is given.
+pub fn when_of(unix_secs: u64, now_unix: u64, utc_offset_secs: i32) -> Option<When> {
+    let time = clock_of(unix_secs, utc_offset_secs)?;
+    let older = now_unix >= CLOCK_SANE_UNIX
+        && local_day(unix_secs, utc_offset_secs) != local_day(now_unix, utc_offset_secs);
+    Some(if older {
+        When::Day(weekday_of(unix_secs, utc_offset_secs))
+    } else {
+        When::Time(time)
+    })
+}
+
+/// The day an entry of the owner's list was set on the panel, as YOUR LIST says it (spec §12.8): `TODAY`, or the
+/// weekday; `None` for an entry the desktop pushed, or one set before the clock was.
+pub fn day_word(set_unix: Option<u64>, now_unix: u64, utc_offset_secs: i32) -> Option<DayWord> {
+    let set = set_unix.filter(|&unix| unix >= CLOCK_SANE_UNIX)?;
+    Some(
+        if now_unix >= CLOCK_SANE_UNIX
+            && local_day(set, utc_offset_secs) != local_day(now_unix, utc_offset_secs)
+        {
+            DayWord::On(weekday_of(set, utc_offset_secs))
+        } else {
+            DayWord::Today
+        },
+    )
+}
+
+/// The alert the panel shows, as the log's line and the slip it opens (spec §5.3, §12.2, ruling R11, R8): the title
+/// for its kind, up to three lines, `URGENT` (white) for a high alert, the stamp of what the Pi did, the device
+/// as the wall names it and its address for `SEE DEVICE`, and, for an alert about a name, the name the slip's name
+/// line opens. `wall` is the panel's last copy of the wall, `now_unix` the clock.
 ///
-/// `threat`: the name; `<device> asked n times by hh:mm`; `on the threat lists · never answered`.
-/// `new_device`: `<device> joined at hh:mm`; `no name yet · <default word> by default`. `arp_spoof`:
-/// `<device> answers as router`; `n times since hh:mm`. Others: the subject and `n times since hh:mm`.
+/// One `match` on the kind decides all of it:
+///
+/// - `threat`: the name; `<device> asked n times by hh:mm`; `on the threat lists · never answered`. Stamp
+///   `REFUSED`; the name is a door to NAME.
+/// - `rebind`: the subject and `n times since hh:mm`. Stamp `REFUSED`; the name is a door.
+/// - `new_device`: `<device> joined at hh:mm`; `no name yet · <default word> by default`. Stamp `ADMITTED`.
+/// - `arp_spoof`: `<device> answers as router`; `n times since hh:mm`. Stamp `OBSERVED`.
+/// - `dga`, `tunnel`, `beacon`, `burst` and any other kind: the subject and `n times since hh:mm`. `OBSERVED`.
+///
 /// A time is left out while the clock was not set when it was taken. Nothing here is kept, or logged.
 pub fn alert_row(
     alert: &PanelAlert,
     wall: &[WallEntry],
     newcomer: Newcomer,
     utc_offset_secs: i32,
+    now_unix: u64,
 ) -> AlertRow {
     let at = |unix| clock_of(unix, utc_offset_secs).map(|time| format::clock(Some(time)));
     let (first, last) = (at(alert.first_unix), at(alert.last_unix));
-    let who = device_of(alert, wall);
-    let site = fit_site(&alert.subject, ALERT_LINE_CELLS[0]);
-    let text = fit_text(&alert.subject, ALERT_LINE_CELLS[0]);
-    let lines: Vec<String> = match alert.kind.as_str() {
-        "threat" => vec![
-            site,
-            match last {
-                Some(last) => format!("{who} asked {} by {last}", times(alert.count)),
-                None => format!("{who} asked {}", times(alert.count)),
-            },
-            "on the threat lists \u{b7} never answered".to_owned(),
-        ],
-        "new_device" => vec![
-            match first {
-                Some(first) => format!("{who} joined at {first}"),
-                None => format!("{who} joined"),
-            },
-            format!(
-                "no name yet \u{b7} {} by default",
-                newcomer.word().to_lowercase()
+    let who = device_word(alert, wall);
+    let device = who.as_deref().unwrap_or("a device");
+    let subject = || fit_text(&alert.subject, ALERT_LINE_CELLS[0]);
+    let since = || since_line(alert.count, clock_of(alert.first_unix, utc_offset_secs));
+    // The title, the stamp, the lines, and whether the subject is a name the slip opens.
+    let (title, stamp, lines, door): (String, AlertStamp, Vec<String>, bool) =
+        match alert.kind.as_str() {
+            "threat" => (
+                "THREAT BLOCKED".to_owned(),
+                AlertStamp::Refused,
+                vec![
+                    fit_site(&alert.subject, ALERT_LINE_CELLS[0]),
+                    match last {
+                        Some(last) => format!("{device} asked {} by {last}", times(alert.count)),
+                        None => format!("{device} asked {}", times(alert.count)),
+                    },
+                    "on the threat lists \u{b7} never answered".to_owned(),
+                ],
+                true,
             ),
-        ],
-        "arp_spoof" => vec![
-            format!("{who} answers as router"),
-            since_line(alert.count, clock_of(alert.first_unix, utc_offset_secs)),
-        ],
-        _ => vec![
-            text,
-            since_line(alert.count, clock_of(alert.first_unix, utc_offset_secs)),
-        ],
-    };
+            "rebind" => (
+                "REBINDING BLOCKED".to_owned(),
+                AlertStamp::Refused,
+                vec![subject(), since()],
+                true,
+            ),
+            "new_device" => (
+                "NEW DEVICE".to_owned(),
+                AlertStamp::Admitted,
+                vec![
+                    match first {
+                        Some(first) => format!("{device} joined at {first}"),
+                        None => format!("{device} joined"),
+                    },
+                    format!(
+                        "no name yet \u{b7} {} by default",
+                        newcomer.word().to_lowercase()
+                    ),
+                ],
+                false,
+            ),
+            "arp_spoof" => (
+                "ARP SPOOF".to_owned(),
+                AlertStamp::Observed,
+                vec![format!("{device} answers as router"), since()],
+                false,
+            ),
+            "dga" => observed("SUSPICIOUS LOOKUPS", subject(), since()),
+            "tunnel" => observed("TUNNEL SUSPECTED", subject(), since()),
+            "beacon" => observed("REGULAR CALLS", subject(), since()),
+            "burst" => observed("LOOKUP BURST", subject(), since()),
+            // A kind that is not known is spelt out of itself.
+            other => observed(&other.replace('_', " ").to_uppercase(), subject(), since()),
+        };
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    AlertRow::new(
-        alert.id,
-        alert.severity == Severity::High,
-        &alert_title(&alert.kind),
-        &lines,
+    let mut row = AlertRow::new(alert.id, alert.severity == Severity::High, &title, &lines);
+    row.at = when_of(alert.last_unix, now_unix, utc_offset_secs);
+    row.who = fit_text(who.as_deref().unwrap_or(""), DEVICE_NAME_CELLS);
+    row.stamp = stamp;
+    row.name = door.then(|| plain_name(&alert.subject));
+    row.device = device_entry(alert, wall).map(|entry| entry.row.mac);
+    row
+}
+
+/// The slip of a kind that blocked nothing because of it: its subject and how often, stamped `OBSERVED`, with no
+/// name to open.
+fn observed(
+    title: &str,
+    subject: String,
+    since: String,
+) -> (String, AlertStamp, Vec<String>, bool) {
+    (
+        title.to_owned(),
+        AlertStamp::Observed,
+        vec![subject, since],
+        false,
     )
+}
+
+/// The world's word for which list holds a name.
+fn world_class(class: NameClass) -> WorldNameClass {
+    match class {
+        NameClass::None => WorldNameClass::None,
+        NameClass::Ads => WorldNameClass::Ads,
+        NameClass::Deny => WorldNameClass::Deny,
+        NameClass::Threat => WorldNameClass::Threat,
+    }
+}
+
+/// What the owner decided, as the world says it.
+fn world_verdict(side: OwnerSide) -> OwnerVerdict {
+    match side {
+        OwnerSide::Allow => OwnerVerdict::Allow,
+        OwnerSide::Refuse => OwnerVerdict::Refuse,
+    }
+}
+
+/// The pipes of NAMES from the day's most refused names, most refused first (`top` is as the resolver counted
+/// them, at most eight): the first `MAX_TOP_NAMES`, each with its count and whether the owner has let it through
+/// (`holds` says what the owner's list holds of a name). Names are whole; the screen fits them.
+pub fn top_rows(top: &[TopName], holds: &dyn Fn(&str) -> Option<OwnerHold>) -> Vec<NameRow> {
+    top.iter()
+        .take(MAX_TOP_NAMES)
+        .map(|row| NameRow {
+            name: row.name.to_string(),
+            count: row.count,
+            open: holds(&row.name).is_some_and(|hold| hold.side == OwnerSide::Allow),
+        })
+        .collect()
+}
+
+/// The valves of YOUR LIST from the newest entries of the owner's list, the newest first: the name, the side and
+/// the day it was set on the panel (none for an entry the desktop pushed, spec §12.8).
+pub fn owner_rows(newest: &[OwnerEntry], now_unix: u64, utc_offset_secs: i32) -> Vec<OwnerRow> {
+    newest
+        .iter()
+        .take(MAX_OWNER_ROWS)
+        .map(|entry| OwnerRow {
+            name: entry.name.to_string(),
+            verdict: world_verdict(entry.side),
+            day: day_word(entry.set_unix, now_unix, utc_offset_secs),
+        })
+        .collect()
+}
+
+/// The facts NAME shows of `name` (spec §3.7, §12.7): which list holds it, the owner's entry on it with the day,
+/// and how many times it was refused today when the Pi counts that (the day's most refused only, in `top`) and
+/// the name is refused now. An answered name is not counted: the Pi counts only what it blocks (spec §11.3).
+///
+/// An owner's entry that covers the name through a parent counts as the owner's word on it, as the resolver
+/// decides it; only an entry of the name itself can be taken back (`NamesControl::forget`).
+pub fn name_facts(
+    name: &str,
+    class: NameClass,
+    hold: Option<OwnerHold>,
+    top: &[TopName],
+    now_unix: u64,
+    utc_offset_secs: i32,
+) -> NameFacts {
+    let mut facts = NameFacts {
+        name: name.to_owned(),
+        class: world_class(class),
+        owner: hold.map(|hold| WorldOwnerEntry {
+            verdict: world_verdict(hold.side),
+            day: day_word(hold.set_unix, now_unix, utc_offset_secs),
+        }),
+        count: None,
+    };
+    if facts.shut() {
+        facts.count = top
+            .iter()
+            .find(|row| row.name.eq_ignore_ascii_case(name))
+            .map(|row| row.count);
+    }
+    facts
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// SYSTEM, the states of the whole system and the night (phase 3)
+
+/// Whether `time` is in the night hours `night`, `(from, to)` as hours of the day: from `from` until `to`, past
+/// midnight when `from` is the later (`23-07`). No night, the two hours equal, or a clock that is not set is
+/// never in the hours.
+pub fn in_night(night: Option<(u8, u8)>, time: Option<TimeOfDay>) -> bool {
+    let (Some((from, to)), Some(time)) = (night, time) else {
+        return false;
+    };
+    match from.cmp(&to) {
+        std::cmp::Ordering::Equal => false,
+        std::cmp::Ordering::Less => (from..to).contains(&time.hour),
+        std::cmp::Ordering::Greater => time.hour >= from || time.hour < to,
+    }
+}
+
+/// What WI-FI and SYSTEM's link read of the Wi-Fi: the band from the frequency, the signal, how many whole days the
+/// link has held at the monotonic second `now_secs` (the clock `WifiStatus::joined_secs` is on) and the upstream's
+/// answer time. Nothing is known of a link that is not up: the figures are the dashes.
+pub fn link_of(wifi: Option<&WifiStatus>, upstream_ms: Option<u16>, now_secs: u64) -> Link {
+    let Some(wifi) = wifi.filter(|wifi| wifi.associated) else {
+        return Link::default();
+    };
+    Link {
+        band: wifi.freq_mhz.and_then(Band::from_mhz),
+        signal_dbm: wifi.signal_dbm.map(i16::from),
+        linked_days: wifi.linked_secs(now_secs).map(|secs| held(secs / 86_400)),
+        upstream_ms: upstream_ms.map(u32::from),
+    }
+}
+
+/// The date of a Unix time at UTC as `2026-11-12`: the day a build was made, which VERSION says.
+pub fn date_of(unix_secs: u64) -> String {
+    // Howard Hinnant's `civil_from_days`, counted from 1 March of year 0.
+    let z = unix_secs / 86_400 + 719_468;
+    let era = z / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + u64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// A slot as the screens name it.
+pub fn slot_of(slot: Slot) -> WorldSlot {
+    match slot {
+        Slot::A => WorldSlot::A,
+        Slot::B => WorldSlot::B,
+    }
+}
+
+/// The slot that is not `slot`.
+fn other_slot(slot: WorldSlot) -> WorldSlot {
+    match slot {
+        WorldSlot::A => WorldSlot::B,
+        WorldSlot::B => WorldSlot::A,
+    }
+}
+
+/// The update that is under way, as UPDATE draws it, from what the update machinery says: one being received
+/// (the slot that serves is the left box, the other the right), or this boot's trial (the slot a rollback boots is
+/// the left box, the running one the right, with the seconds to the trial's minimum time and, once they are up,
+/// what it still waits for). `None` while none is going on, and on the old layout, which has no slots.
+pub fn update_read(view: &UpdateView) -> Option<UpdateRead> {
+    let running = slot_of(view.slot?);
+    match (view.state, &view.trial) {
+        ("receiving", _) => Some(UpdateRead {
+            phase: UpdatePhase::Receiving {
+                received: view.received,
+                length: view.length,
+            },
+            before: running,
+            after: other_slot(running),
+        }),
+        ("trial", Some(trial)) => {
+            let waiting = |what: Waiting| trial.waiting_for.contains(&what);
+            let waiting_for = if waiting(Waiting::Wifi) {
+                Some(WorldWaiting::Wifi)
+            } else if waiting(Waiting::Clock) {
+                Some(WorldWaiting::Clock)
+            } else if waiting(Waiting::Upstream) {
+                Some(WorldWaiting::Upstream)
+            } else {
+                None
+            };
+            Some(UpdateRead {
+                phase: UpdatePhase::Trial {
+                    left_secs: u16::try_from(trial.min_left_secs).unwrap_or(u16::MAX),
+                    waiting_for,
+                },
+                before: slot_of(trial.from),
+                after: running,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// How the last trial ended, as UPDATE shows it once: the finished update with its slots (the box that served before
+/// is the old build's, which is the running slot after a rollback and the other after a confirm), and the outcome's
+/// identity, the kind and the build, by which the panel knows it has shown it. `None` while an update is under way
+/// (that screen is the live one), when no trial this boot knows of has ended, and on the old layout.
+pub fn finished_update(view: &UpdateView) -> Option<(UpdateRead, (OutcomeKind, u64))> {
+    if view.state != "idle" {
+        return None;
+    }
+    let outcome = view.last.as_ref()?;
+    let running = slot_of(view.slot?);
+    let (phase, before, after) = match outcome.kind {
+        OutcomeKind::Confirmed => (UpdatePhase::Confirmed, other_slot(running), running),
+        OutcomeKind::RolledBack => (UpdatePhase::RolledBack, running, other_slot(running)),
+    };
+    Some((
+        UpdateRead {
+            phase,
+            before,
+            after,
+        },
+        (outcome.kind, outcome.build),
+    ))
+}
+
+/// How the last update ended, as the box on SYSTEM and VERSION say it.
+pub fn last_update_of(view: &UpdateView) -> LastUpdate {
+    match view.last.as_ref().map(|outcome| outcome.kind) {
+        Some(OutcomeKind::Confirmed) => LastUpdate::Confirmed,
+        Some(OutcomeKind::RolledBack) => LastUpdate::RolledBack,
+        None => LastUpdate::None,
+    }
+}
+
+/// What the board last restarted for, in the words UP says, as far as this boot knows: the board keeps no record
+/// across a restart (the Pi writes nothing to the card for it), so only an update shows, in the trial it began and
+/// the outcome it left. Empty when nothing says; UP then shows a dash.
+pub fn restart_cause(view: &UpdateView) -> &'static str {
+    match (&view.trial, view.last.as_ref().map(|outcome| outcome.kind)) {
+        (Some(_), _) | (None, Some(OutcomeKind::Confirmed)) => "an update",
+        (None, Some(OutcomeKind::RolledBack)) => "an update that rolled back",
+        (None, None) => "",
+    }
 }
 
 #[cfg(test)]
@@ -504,6 +831,7 @@ pub(crate) mod tests {
             signal_dbm: Some(-63),
             ap: None,
             freq_mhz: None,
+            joined_secs: None,
         })
     }
 
@@ -1165,6 +1493,16 @@ pub(crate) mod tests {
         row.lines.iter().map(String::as_str).collect()
     }
 
+    /// The row of an alert with the clock at `NOW`.
+    fn alert_row(
+        alert: &PanelAlert,
+        wall: &[WallEntry],
+        newcomer: Newcomer,
+        utc_offset_secs: i32,
+    ) -> AlertRow {
+        super::alert_row(alert, wall, newcomer, utc_offset_secs, NOW)
+    }
+
     #[test]
     fn a_threat_alert_says_the_name_who_asked_how_often_and_that_it_was_never_answered() {
         let row = alert_row(
@@ -1317,6 +1655,331 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_stamp_is_what_the_pi_did_decided_by_the_kind_alone() {
+        // Spec §12.2: a blocked answer is `REFUSED`, a device that joined `ADMITTED`, and whatever blocked
+        // nothing `OBSERVED`.
+        for (kind, stamp) in [
+            ("threat", AlertStamp::Refused),
+            ("rebind", AlertStamp::Refused),
+            ("new_device", AlertStamp::Admitted),
+            ("arp_spoof", AlertStamp::Observed),
+            ("dga", AlertStamp::Observed),
+            ("tunnel", AlertStamp::Observed),
+            ("beacon", AlertStamp::Observed),
+            ("burst", AlertStamp::Observed),
+            ("some_new_kind", AlertStamp::Observed),
+        ] {
+            let row = alert_row(
+                &alert(kind, Some("192.0.2.23"), "02:00:00:00:00:17"),
+                &house_wall(),
+                Newcomer::AdsPass,
+                0,
+            );
+            assert_eq!(row.stamp, stamp, "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_high_alert_is_urgent_and_the_others_routine() {
+        let high = alert_row(
+            &alert("burst", None, "question rate"),
+            &[],
+            Newcomer::AdsPass,
+            0,
+        );
+        assert_eq!((high.high, high.precedence()), (true, "URGENT"));
+        let low = alert_row(
+            &PanelAlert {
+                severity: Severity::Info,
+                ..alert("burst", None, "question rate")
+            },
+            &[],
+            Newcomer::AdsPass,
+            0,
+        );
+        assert_eq!((low.high, low.precedence()), (false, "ROUTINE"));
+    }
+
+    #[test]
+    fn only_a_threat_and_a_rebind_open_their_name_and_it_is_whole_and_plain() {
+        for kind in ["threat", "rebind"] {
+            let row = alert_row(
+                &alert(kind, Some("192.0.2.23"), "Secure-Login.Example."),
+                &house_wall(),
+                Newcomer::AdsPass,
+                0,
+            );
+            assert_eq!(row.name.as_deref(), Some("secure-login.example"), "{kind}");
+        }
+        // A name too long for its line is still opened whole.
+        let long = format!("{}.example.org", "x".repeat(200));
+        let row = alert_row(&alert("threat", None, &long), &[], Newcomer::AdsPass, 0);
+        assert_eq!(row.name.as_deref(), Some(long.as_str()));
+        for kind in [
+            "new_device",
+            "arp_spoof",
+            "dga",
+            "tunnel",
+            "beacon",
+            "burst",
+            "other",
+        ] {
+            let row = alert_row(
+                &alert(kind, Some("192.0.2.23"), "02:00:00:00:00:17"),
+                &house_wall(),
+                Newcomer::AdsPass,
+                0,
+            );
+            assert_eq!(row.name, None, "{kind}");
+        }
+    }
+
+    #[test]
+    fn see_device_names_the_device_on_the_wall_by_its_address_or_its_hardware_address_and_none_otherwise()
+     {
+        let sam = [2, 0, 0, 0, 0, 23];
+        let wall = house_wall();
+        // The client's address, for the kinds about a name.
+        for kind in ["threat", "rebind", "dga", "beacon"] {
+            let row = alert_row(
+                &alert(kind, Some("192.0.2.23"), "ads.example"),
+                &wall,
+                Newcomer::AdsPass,
+                0,
+            );
+            assert_eq!(row.device, Some(sam), "{kind}");
+            assert_eq!(row.who, "Sam's phone", "{kind}");
+        }
+        // The subject's hardware address, for the kinds about a device.
+        for kind in ["new_device", "arp_spoof"] {
+            let row = alert_row(
+                &alert(kind, Some("192.0.2.1"), "02:00:00:00:00:17"),
+                &wall,
+                Newcomer::AdsPass,
+                0,
+            );
+            assert_eq!(row.device, Some(sam), "{kind}");
+        }
+        // A client the wall does not hold: named by its octet, and no door to open.
+        let stranger = alert_row(
+            &alert("threat", Some("192.0.2.77"), "ads.example"),
+            &wall,
+            Newcomer::AdsPass,
+            0,
+        );
+        assert_eq!((stranger.device, stranger.who.as_str()), (None, "\u{b7}77"));
+        // A hardware address the wall does not hold, and an alert with no client at all: no device.
+        for (kind, client, subject) in [
+            ("new_device", None, "02:00:00:00:00:99"),
+            ("arp_spoof", Some("192.0.2.1"), "02:00:00:00:00:98"),
+            ("threat", None, "ads.example"),
+            ("threat", Some("fe80::1"), "ads.example"),
+        ] {
+            let row = alert_row(&alert(kind, client, subject), &wall, Newcomer::AdsPass, 0);
+            assert_eq!((row.device, row.who.as_str()), (None, ""), "{kind}");
+        }
+        // The first reading of an alert with no wall yet is what the loop makes again once the wall comes.
+        let early = alert_row(
+            &alert("threat", Some("192.0.2.23"), "ads.example"),
+            &[],
+            Newcomer::AdsPass,
+            0,
+        );
+        assert_eq!((early.device, early.who.as_str()), (None, "\u{b7}23"));
+    }
+
+    #[test]
+    fn an_alert_says_when_it_last_happened_as_a_time_today_and_as_a_weekday_before() {
+        let at = |last: u64, offset: i32| when_of(last, NOW, offset).map(When::word);
+        assert_eq!(at(NOW - 60, 0).as_deref(), Some("10:19"));
+        // Yesterday 10:20 was a Thursday; the day before that a Wednesday.
+        assert_eq!(at(NOW - 86_400, 0).as_deref(), Some("THU"));
+        assert_eq!(at(NOW - 2 * 86_400, 0).as_deref(), Some("WED"));
+        // Midnight itself is today; a second before it is not.
+        assert_eq!(at(MIDNIGHT_UTC, 0).as_deref(), Some("00:00"));
+        assert_eq!(at(MIDNIGHT_UTC - 1, 0).as_deref(), Some("THU"));
+        // The day is the local one: at UTC-5 h it is still yesterday for the first five hours.
+        assert_eq!(at(MIDNIGHT_UTC + 3_600, -18_000).as_deref(), Some("THU"));
+        // Before the clock was set there is no time, and with it not set now there is no day to tell.
+        assert_eq!(at(90, 0), None);
+        assert_eq!(
+            when_of(CLOCK_SANE_UNIX + 5, 100, 0)
+                .map(When::word)
+                .as_deref(),
+            Some("00:00")
+        );
+        let row = alert_row(
+            &PanelAlert {
+                last_unix: NOW - 2 * 86_400,
+                ..alert("threat", None, "ads.example")
+            },
+            &[],
+            Newcomer::AdsPass,
+            0,
+        );
+        assert_eq!(row.at.map(When::word).as_deref(), Some("WED"));
+    }
+
+    #[test]
+    fn weekdays_moments_and_the_owners_day_words_are_told_in_the_local_zone() {
+        // 15 January 2027 was a Friday.
+        assert_eq!(weekday_of(MIDNIGHT_UTC, 0), Weekday::Fri);
+        assert_eq!(weekday_of(MIDNIGHT_UTC - 1, 0), Weekday::Thu);
+        assert_eq!(weekday_of(MIDNIGHT_UTC, -3_600), Weekday::Thu);
+        assert_eq!(weekday_of(MIDNIGHT_UTC, 86_399), Weekday::Fri);
+        assert_eq!(weekday_of(MIDNIGHT_UTC + 86_400 * 3, 0), Weekday::Mon);
+        assert_eq!(weekday_of(0, 0), Weekday::Thu);
+        assert_eq!(
+            moment_of(NOW, 0).map(Moment::word).as_deref(),
+            Some("FRI 10:20")
+        );
+        assert_eq!(moment_of(90, 0), None, "before the clock was set");
+        // The owner's day: `TODAY`, a weekday, none for a push from the desktop or one set before the clock.
+        let day = |set: Option<u64>| day_word(set, NOW, 0);
+        assert_eq!(day(Some(NOW - 3_600)), Some(DayWord::Today));
+        assert_eq!(day(Some(NOW - 86_400)), Some(DayWord::On(Weekday::Thu)));
+        assert_eq!(day(Some(NOW - 4 * 86_400)), Some(DayWord::On(Weekday::Mon)));
+        assert_eq!(day(None), None);
+        assert_eq!(day(Some(90)), None);
+    }
+
+    /// What the day's counts of a house look like: three names, most refused first.
+    fn top() -> Vec<TopName> {
+        [
+            ("ads.example.net", 1_204),
+            ("tracker.example.com", 612),
+            ("telemetry.example.org", 31),
+            ("fourth.example.org", 9),
+        ]
+        .map(|(name, count)| TopName {
+            name: name.into(),
+            count,
+        })
+        .to_vec()
+    }
+
+    #[test]
+    fn the_pipes_are_the_first_three_of_the_day_with_the_valve_open_for_an_owners_allow() {
+        let allowed = |name: &str| {
+            (name == "tracker.example.com").then_some(OwnerHold {
+                side: OwnerSide::Allow,
+                exact: true,
+                set_unix: None,
+            })
+        };
+        let rows = top_rows(&top(), &allowed);
+        let seen: Vec<(&str, u32, bool)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.count, row.open))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("ads.example.net", 1_204, false),
+                ("tracker.example.com", 612, true),
+                ("telemetry.example.org", 31, false)
+            ]
+        );
+        assert!(top_rows(&[], &allowed).is_empty());
+        // A refusal by the owner is no open valve.
+        let refused = |_: &str| {
+            Some(OwnerHold {
+                side: OwnerSide::Refuse,
+                exact: true,
+                set_unix: None,
+            })
+        };
+        assert!(top_rows(&top(), &refused).iter().all(|row| !row.open));
+    }
+
+    #[test]
+    fn your_list_shows_the_newest_three_with_their_side_and_the_day_set_on_the_panel() {
+        let entry = |name: &str, side, set_unix| OwnerEntry {
+            name: name.into(),
+            side,
+            set_unix,
+        };
+        let newest = [
+            entry("a.example.org", OwnerSide::Refuse, Some(NOW - 60)),
+            entry("b.example.org", OwnerSide::Allow, Some(NOW - 3 * 86_400)),
+            entry("c.example.org", OwnerSide::Refuse, None),
+            entry("d.example.org", OwnerSide::Allow, None),
+        ];
+        let rows = owner_rows(&newest, NOW, 0);
+        let seen: Vec<(&str, OwnerVerdict, Option<DayWord>)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.verdict, row.day))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("a.example.org", OwnerVerdict::Refuse, Some(DayWord::Today)),
+                (
+                    "b.example.org",
+                    OwnerVerdict::Allow,
+                    Some(DayWord::On(Weekday::Tue))
+                ),
+                ("c.example.org", OwnerVerdict::Refuse, None)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_facts_of_a_name_are_its_list_the_owners_entry_and_the_count_of_a_refused_one() {
+        let hold = |side, set_unix| {
+            Some(OwnerHold {
+                side,
+                exact: true,
+                set_unix,
+            })
+        };
+        let facts = |name: &str, class, hold| name_facts(name, class, hold, &top(), NOW, 0);
+        // A refused name of the day's top: its count.
+        let ads = facts("ads.example.net", NameClass::Ads, None);
+        assert_eq!(
+            (ads.class, ads.owner, ads.count, ads.shut()),
+            (WorldNameClass::Ads, None, Some(1_204), true)
+        );
+        assert_eq!(ads.name, "ads.example.net");
+        // A refused name that is not among the eight: refused, but the Pi has no count for it.
+        let other = facts("other.example.net", NameClass::Deny, None);
+        assert_eq!((other.class, other.count), (WorldNameClass::Deny, None));
+        // An answered name has no count: the Pi counts only what it blocks, whatever the top holds of it.
+        let answered = facts("ads.example.net", NameClass::None, None);
+        assert_eq!((answered.shut(), answered.count), (false, None));
+        // The owner's allow opens an ads name, with the day it was set; the day is none for a push.
+        let allowed = facts(
+            "ads.example.net",
+            NameClass::Ads,
+            hold(OwnerSide::Allow, Some(NOW - 60)),
+        );
+        assert_eq!(
+            allowed.owner.map(|entry| (entry.verdict, entry.day)),
+            Some((OwnerVerdict::Allow, Some(DayWord::Today)))
+        );
+        assert!(!allowed.shut());
+        let pushed = facts(
+            "ads.example.net",
+            NameClass::Ads,
+            hold(OwnerSide::Refuse, None),
+        );
+        assert_eq!(
+            pushed.owner.map(|entry| (entry.verdict, entry.day)),
+            Some((OwnerVerdict::Refuse, None))
+        );
+        // A threat is refused whatever the owner says, and the case of the name does not hide its count.
+        let threat = facts(
+            "ADS.example.net",
+            NameClass::Threat,
+            hold(OwnerSide::Allow, None),
+        );
+        assert_eq!(
+            (threat.class, threat.shut(), threat.count),
+            (WorldNameClass::Threat, true, Some(1_204))
+        );
+    }
+
+    #[test]
     fn a_countdown_does_not_step_back_up_when_the_inventory_is_read_again_but_a_new_gate_is_new() {
         let open = |secs: u16| {
             let mut device = device(2, 10, false);
@@ -1355,5 +2018,249 @@ pub(crate) mod tests {
             "the same device is the same"
         );
         assert_eq!(other[1].gate_ends_ms, None);
+    }
+
+    // -------------------------------------------------------------------------------------------- phase 3
+
+    fn at(hour: u8) -> Option<TimeOfDay> {
+        Some(TimeOfDay { hour, minute: 30 })
+    }
+
+    #[test]
+    fn the_night_hours_run_from_the_first_hour_to_the_second_past_midnight_when_they_must() {
+        // 23-07: dark from 23:00 until 07:00.
+        let night = Some((23, 7));
+        for hour in [23, 0, 3, 6] {
+            assert!(in_night(night, at(hour)), "{hour}");
+        }
+        for hour in [7, 8, 12, 22] {
+            assert!(!in_night(night, at(hour)), "{hour}");
+        }
+        // 10-11: one hour, the first hour in it and the second not.
+        assert!(in_night(Some((10, 11)), at(10)));
+        assert!(!in_night(Some((10, 11)), at(11)));
+        assert!(!in_night(Some((10, 11)), at(9)));
+        // No night, the two hours equal, and a clock that is not set are never in the hours.
+        assert!(!in_night(None, at(3)));
+        assert!(!in_night(Some((5, 5)), at(5)));
+        assert!(!in_night(night, None));
+    }
+
+    #[test]
+    fn the_link_is_the_band_the_signal_the_days_it_held_and_the_upstream_when_it_is_up() {
+        let wifi = WifiStatus {
+            associated: true,
+            signal_dbm: Some(-54),
+            ap: None,
+            freq_mhz: Some(5_180),
+            joined_secs: Some(1_000),
+        };
+        let now = 1_000 + 12 * 86_400 + 5;
+        let link = link_of(Some(&wifi), Some(9), now);
+        assert_eq!(link.band, Some(Band::Ghz5));
+        assert_eq!(
+            (link.signal_dbm, link.linked_days, link.upstream_ms),
+            (Some(-54), Some(12), Some(9))
+        );
+        // The first day is day zero, and 2.4 GHz is its own band; a frequency of neither is none.
+        let young = WifiStatus {
+            freq_mhz: Some(2_437),
+            ..wifi.clone()
+        };
+        let link = link_of(Some(&young), None, 1_000 + 86_399);
+        assert_eq!(
+            (link.band, link.linked_days, link.upstream_ms),
+            (Some(Band::Ghz24), Some(0), None)
+        );
+        let odd = WifiStatus {
+            freq_mhz: Some(60_000),
+            joined_secs: None,
+            ..wifi.clone()
+        };
+        let link = link_of(Some(&odd), None, now);
+        assert_eq!((link.band, link.linked_days), (None, None));
+        // A link that is not up, or not known, has nothing to say.
+        let down = WifiStatus {
+            associated: false,
+            ..wifi
+        };
+        assert_eq!(link_of(Some(&down), Some(9), now), Link::default());
+        assert_eq!(link_of(None, Some(9), now), Link::default());
+    }
+
+    #[test]
+    fn a_builds_date_is_its_day_at_utc_across_leap_days_and_the_years() {
+        for (unix, date) in [
+            (0, "1970-01-01"),
+            (951_782_400, "2000-02-29"),
+            (1_709_164_800, "2024-02-29"),
+            (1_709_164_799, "2024-02-28"),
+            (1_767_225_600, "2026-01-01"),
+            (1_794_480_000, "2026-11-12"),
+            (1_794_441_600, "2026-11-12"),
+            (1_794_441_600 + 86_399, "2026-11-12"),
+            (1_794_441_600 + 86_400, "2026-11-13"),
+            (MIDNIGHT_UTC, "2027-01-15"),
+            (4_102_444_799, "2099-12-31"),
+        ] {
+            assert_eq!(date_of(unix), date, "{unix}");
+        }
+        // The date the build was made fits the cells VERSION gives it.
+        assert!(date_of(crate::BUILD_EPOCH).len() <= qb_panel::os::world::BUILT_CELLS);
+    }
+
+    /// A view of the update machinery for a board on `slot`, in `state`.
+    fn update_view(slot: Option<Slot>, state: &'static str) -> UpdateView {
+        UpdateView {
+            slot,
+            boot_files: None,
+            state,
+            received: 0,
+            length: 0,
+            trial: None,
+            last: None,
+        }
+    }
+
+    /// The trial of slot B that a rollback leaves for slot A.
+    fn trial_of(min_left_secs: u64, waiting_for: Vec<Waiting>) -> UpdateView {
+        UpdateView {
+            trial: Some(crate::update::TrialView {
+                build: 1_794_480_000,
+                from: Slot::A,
+                secs: 3,
+                min_left_secs,
+                waiting_for,
+            }),
+            ..update_view(Some(Slot::B), "trial")
+        }
+    }
+
+    #[test]
+    fn an_update_being_received_has_the_serving_slot_on_the_left_and_the_bytes_that_arrived() {
+        let received = UpdateView {
+            received: 250,
+            length: 1_000,
+            ..update_view(Some(Slot::B), "receiving")
+        };
+        let read = update_read(&received).unwrap();
+        assert_eq!(
+            read.phase,
+            UpdatePhase::Receiving {
+                received: 250,
+                length: 1_000
+            }
+        );
+        assert_eq!((read.before, read.after), (WorldSlot::B, WorldSlot::A));
+        assert_eq!(read.phase.received().0, 25);
+        // Nothing is under way while the machinery is idle, and the old layout has no slots to show.
+        assert_eq!(update_read(&update_view(Some(Slot::A), "idle")), None);
+        assert_eq!(update_read(&update_view(None, "receiving")), None);
+    }
+
+    #[test]
+    fn a_trial_counts_to_its_minimum_time_then_names_what_it_waits_for_in_the_order_of_the_screen()
+    {
+        let counting = update_read(&trial_of(107, vec![Waiting::Wifi, Waiting::Time])).unwrap();
+        assert_eq!(
+            counting.phase,
+            UpdatePhase::Trial {
+                left_secs: 107,
+                waiting_for: Some(WorldWaiting::Wifi)
+            }
+        );
+        // The slot a rollback boots is the left box and the one that runs the right.
+        assert_eq!(
+            (counting.before, counting.after),
+            (WorldSlot::A, WorldSlot::B)
+        );
+        for (waits, word) in [
+            (
+                vec![Waiting::Upstream, Waiting::Clock],
+                Some(WorldWaiting::Clock),
+            ),
+            (vec![Waiting::Upstream], Some(WorldWaiting::Upstream)),
+            (vec![Waiting::Time], None),
+            (vec![], None),
+        ] {
+            let read = update_read(&trial_of(0, waits.clone())).unwrap();
+            assert_eq!(
+                read.phase,
+                UpdatePhase::Trial {
+                    left_secs: 0,
+                    waiting_for: word
+                },
+                "{waits:?}"
+            );
+        }
+        // A minimum time that no screen holds is held at its longest.
+        let long = update_read(&trial_of(1_000_000, vec![])).unwrap();
+        assert!(matches!(
+            long.phase,
+            UpdatePhase::Trial {
+                left_secs: u16::MAX,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_finished_trial_is_shown_with_the_slots_as_they_really_are_and_has_an_identity() {
+        use crate::update::{Outcome, OutcomeKind};
+
+        // Confirmed: the new build runs, on B; the box that served before is A.
+        let confirmed = UpdateView {
+            last: Some(Outcome::confirmed(7)),
+            ..update_view(Some(Slot::B), "idle")
+        };
+        let (read, identity) = finished_update(&confirmed).unwrap();
+        assert_eq!(read.phase, UpdatePhase::Confirmed);
+        assert_eq!((read.before, read.after), (WorldSlot::A, WorldSlot::B));
+        assert_eq!(identity, (OutcomeKind::Confirmed, 7));
+        assert_eq!(last_update_of(&confirmed), LastUpdate::Confirmed);
+        // Rolled back: the old build runs, on A; the one that failed is B.
+        let back = UpdateView {
+            last: Some(Outcome::rolled_back(8, "no clock")),
+            ..update_view(Some(Slot::A), "idle")
+        };
+        let (read, identity) = finished_update(&back).unwrap();
+        assert_eq!(read.phase, UpdatePhase::RolledBack);
+        assert_eq!((read.before, read.after), (WorldSlot::A, WorldSlot::B));
+        assert_eq!(identity, (OutcomeKind::RolledBack, 8));
+        assert_eq!(last_update_of(&back), LastUpdate::RolledBack);
+        // Nothing ended for a board that has had no trial, while one is under way, and on the old layout.
+        let none = update_view(Some(Slot::A), "idle");
+        assert!(finished_update(&none).is_none());
+        assert_eq!(last_update_of(&none), LastUpdate::None);
+        let busy = UpdateView {
+            last: Some(Outcome::confirmed(7)),
+            ..update_view(Some(Slot::A), "receiving")
+        };
+        assert!(finished_update(&busy).is_none());
+        let old = UpdateView {
+            last: Some(Outcome::confirmed(7)),
+            ..update_view(None, "idle")
+        };
+        assert!(finished_update(&old).is_none());
+    }
+
+    #[test]
+    fn the_last_restart_is_only_what_this_boot_can_know_of_it() {
+        use crate::update::Outcome;
+
+        assert_eq!(restart_cause(&trial_of(5, vec![])), "an update");
+        let confirmed = UpdateView {
+            last: Some(Outcome::confirmed(7)),
+            ..update_view(Some(Slot::B), "idle")
+        };
+        assert_eq!(restart_cause(&confirmed), "an update");
+        let back = UpdateView {
+            last: Some(Outcome::rolled_back(8, "no clock")),
+            ..update_view(Some(Slot::A), "idle")
+        };
+        assert_eq!(restart_cause(&back), "an update that rolled back");
+        assert!(restart_cause(&back).chars().count() <= qb_panel::os::world::RESTART_CAUSE_CELLS);
+        // The board writes nothing for a restart, so a plain boot cannot say.
+        assert_eq!(restart_cause(&update_view(Some(Slot::A), "idle")), "");
     }
 }

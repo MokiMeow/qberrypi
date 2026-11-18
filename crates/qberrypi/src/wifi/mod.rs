@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use qb_wpa2::MacAddr;
 use qb_wpa2::pmk::{Pmk, PmkError};
+use tokio::sync::Notify;
 use tokio::time::{Instant, sleep};
 
 use crate::config::{self, WifiKey};
 use backoff::Backoff;
-use join::{JoinCfg, JoinError, hold, join, scan};
+use join::{JoinCfg, JoinError, Lost, hold, join, scan};
 
 pub mod backoff;
 pub mod choose;
@@ -52,6 +53,9 @@ pub enum WifiStatus {
         bssid: MacAddr,
         freq_mhz: u32,
         signal_mbm: i32,
+        /// The monotonic second it came up on, as the kernel counts them (`sys::uptime`): what the front
+        /// panel's `linked n days` counts from.
+        since_secs: u64,
     },
     /// The attempt failed; the next one is this many seconds away.
     Waiting { secs: u64 },
@@ -82,6 +86,9 @@ pub fn join_cfg(wifi: &config::Wifi) -> Result<JoinCfg, PmkError> {
 enum Outcome {
     /// The link came up and went away again, after this long.
     Lost { bssid: MacAddr, held: Duration },
+    /// The owner ended the link to have it made again, however long it had held: no failure of the
+    /// access point's or the link's.
+    Rejoin,
     /// No link was made; `tried` is the access point that was asked, if any was.
     Failed { tried: Option<MacAddr> },
 }
@@ -106,17 +113,32 @@ enum Outcome {
 /// that is wrong costs one short scan, and no join is ever made on another footing than a full scan gives:
 /// the survey, the RSN checks, the order of the candidates (5 GHz first) and the handshake are the same. The
 /// hint is for the 5 GHz channel: a hint that names only 2.4 GHz channels never saves a scan.
+///
+/// # The owner's rejoin
+///
+/// `rejoin` is notified (with `notify_waiters`) when the owner asks on the front panel for the link to be
+/// made again. A link that is held then ends at once ([`join::hold`]: the station leaves of its own accord),
+/// and the pass ends as one whose link held, whatever its age: no access point is marked as failed, the
+/// waits start over, and the pass that follows scans the hinted channels first. A request that comes while
+/// no link is held is forgotten: a join is under way or about to be, and is not repeated. The refusal of a
+/// second request within a minute is the caller's (`wiring::LiveSystem`), not this loop's.
 pub async fn run<R: radio::Radio>(
     radio: &mut R,
     cfg: &JoinCfg,
     report: &mut (dyn FnMut(WifiStatus) + Send),
+    rejoin: &Notify,
 ) -> Infallible {
     let mut backoff = Backoff::default();
     let mut failed: Vec<MacAddr> = Vec::new();
     // Whether the pass that is next may scan the hinted channels first.
     let mut hinted = true;
     loop {
-        match pass(radio, cfg, &mut failed, hinted, report).await {
+        match pass(radio, cfg, &mut failed, hinted, report, rejoin).await {
+            Outcome::Rejoin => {
+                backoff.succeeded();
+                failed.clear();
+                hinted = true;
+            }
             Outcome::Lost { held, .. } if held >= STABLE_LINK => {
                 backoff.succeeded();
                 failed.clear();
@@ -201,6 +223,7 @@ async fn pass<R: radio::Radio>(
     failed: &mut Vec<MacAddr>,
     hinted: bool,
     report: &mut (dyn FnMut(WifiStatus) + Send),
+    rejoin: &Notify,
 ) -> Outcome {
     let began = Instant::now();
     report(WifiStatus::Scanning);
@@ -261,6 +284,7 @@ async fn pass<R: radio::Radio>(
         bssid: link.bssid,
         freq_mhz: link.freq_mhz,
         signal_mbm: link.signal_mbm,
+        since_secs: crate::sys::uptime().as_secs(),
     });
     log::info!(
         "wifi: joined {} on {} MHz at {}, {} ms after the scan began",
@@ -270,7 +294,11 @@ async fn pass<R: radio::Radio>(
         began.elapsed().as_millis()
     );
     let joined = Instant::now();
-    let lost = hold(radio, &mut link).await;
+    let lost = hold(radio, &mut link, rejoin).await;
+    if lost == Lost::Rejoin {
+        log::info!("wifi: link ended: {lost}");
+        return Outcome::Rejoin;
+    }
     log::warn!("wifi: link lost: {lost}");
     Outcome::Lost {
         bssid: link.bssid,
@@ -451,11 +479,32 @@ allow = []
         WifiStatus::Joining { bssid, freq_mhz }
     }
 
+    /// The status of a link that came up, with the second it came up on as 0: `untimed` makes every status
+    /// the tests collect look so, since the real second is the host's own.
     fn joined(bssid: MacAddr, freq_mhz: u32) -> WifiStatus {
         WifiStatus::Joined {
             bssid,
             freq_mhz,
             signal_mbm: -5600,
+            since_secs: 0,
+        }
+    }
+
+    /// `status` with the second a link came up on, if it is a link, taken out.
+    fn untimed(status: WifiStatus) -> WifiStatus {
+        match status {
+            WifiStatus::Joined {
+                bssid,
+                freq_mhz,
+                signal_mbm,
+                ..
+            } => WifiStatus::Joined {
+                bssid,
+                freq_mhz,
+                signal_mbm,
+                since_secs: 0,
+            },
+            other => other,
         }
     }
 
@@ -466,10 +515,11 @@ allow = []
         until: Duration,
     ) -> (FakeRadio, Vec<WifiStatus>) {
         let mut statuses = Vec::new();
+        let rejoin = Notify::new();
         {
-            let mut report = |status: WifiStatus| statuses.push(status);
+            let mut report = |status: WifiStatus| statuses.push(untimed(status));
             tokio::select! {
-                never = run(&mut radio, cfg, &mut report) => match never {},
+                never = run(&mut radio, cfg, &mut report, &rejoin) => match never {},
                 () = tokio::time::sleep(until) => {}
             }
         }
@@ -633,6 +683,140 @@ allow = []
             log.contains("wifi: link lost: the link was ended by the access point, reason 4"),
             "{log}"
         );
+    }
+
+    // The link says when it came up, on the kernel's monotonic clock, as the front panel counts the days from it.
+    #[tokio::test(start_paused = true)]
+    async fn a_joined_link_says_the_monotonic_second_it_came_up_on() {
+        let mut radio = radio_seeing(vec![reference_bss()]);
+        radio.script.extend(join_script());
+        let mut statuses = Vec::new();
+        let (cfg, rejoin) = (cfg(), Notify::new());
+        let before = crate::sys::uptime().as_secs();
+        {
+            let mut report = |status: WifiStatus| statuses.push(status);
+            tokio::select! {
+                never = run(&mut radio, &cfg, &mut report, &rejoin) => match never {},
+                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+        }
+        let after = crate::sys::uptime().as_secs();
+        let Some(WifiStatus::Joined { since_secs, .. }) = statuses.last() else {
+            panic!("the link did not come up: {statuses:?}");
+        };
+        // The clock is the host's and runs on while the test's own is paused, so the second is the host's of
+        // this moment, within what the test took.
+        assert!(
+            (before..=after).contains(since_secs),
+            "{since_secs} {before} {after}"
+        );
+    }
+
+    // The owner's rejoin: a link that has held for only seconds is left at once, with no mark against its
+    // access point and no wait, and a hinted pass follows; the link is joined again. (A link that drops early
+    // is a failure: its access point goes to the back, and the rescan is of every channel.)
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_leaves_a_link_and_joins_again_at_once_without_a_failure() {
+        logging();
+        let mut radio = radio_seeing(vec![
+            reference_bss(),
+            bss(OTHER, 2437, b"ThisIsASSID", &RSNE),
+        ]);
+        radio.script.extend(join_script());
+        // An event at 10 s, which the hold does not live to see (the owner asks at 7 s) and the next scan
+        // waits out; then the second join, as the first.
+        radio.script.push_back(Step::After(
+            Duration::from_secs(10),
+            RadioEvent::Nl(Event::Other(36)),
+        ));
+        radio.script.extend(join_script());
+        let cfg = hinted(&[5180]);
+        let rejoin = Notify::new();
+        let mut statuses = Vec::new();
+        {
+            let mut report = |status: WifiStatus| statuses.push(untimed(status));
+            let asking = async {
+                // Seven seconds into a link that is held for less than the stable time.
+                tokio::time::sleep(Duration::from_secs(7)).await;
+                rejoin.notify_waiters();
+                tokio::time::sleep(Duration::from_secs(20)).await;
+            };
+            tokio::select! {
+                never = run(&mut radio, &cfg, &mut report, &rejoin) => match never {},
+                () = asking => {}
+            }
+        }
+        // The scan at 0 s, and the next at the very second the owner asked: no wait, no backoff, and the
+        // scan of the hinted channels only, as after a link that held.
+        assert_eq!(scan_times(&radio), [0, 7]);
+        assert_eq!(radio.scan_freqs, [vec![5180], vec![5180]]);
+        // The same access point both times, though a link that dropped early would have put it last.
+        assert_eq!(connects(&radio), [AA, AA]);
+        assert_eq!(
+            statuses,
+            [
+                WifiStatus::Scanning,
+                joining(AA, 5180),
+                joined(AA, 5180),
+                WifiStatus::Scanning,
+                joining(AA, 5180),
+                joined(AA, 5180),
+            ]
+        );
+        assert!(
+            !statuses
+                .iter()
+                .any(|s| matches!(s, WifiStatus::Waiting { .. }))
+        );
+        // The station left of its own accord before the rescan, once.
+        let commands = radio.commands();
+        let leaving: Vec<usize> = commands
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| **call == Call::Disconnect(3))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(leaving.len(), 1, "{commands:?}");
+        assert_eq!(commands[leaving[0] + 1], Call::TriggerScan);
+        let log = log_text();
+        assert!(
+            log.contains("wifi: link ended: the owner asked to join again"),
+            "{log}"
+        );
+        assert!(!log.contains("wifi: link lost: the owner"), "{log}");
+    }
+
+    // A rejoin that comes while no link is held is forgotten: the join that is under way is not ended by it
+    // when it is done, and nothing is left for the next link.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_asked_for_while_scanning_does_not_end_the_link_that_follows() {
+        let mut radio = radio_seeing(vec![reference_bss()]);
+        radio.script.extend([
+            Step::After(Duration::from_secs(4), RadioEvent::Nl(Event::ScanDone)),
+            connected(),
+            from_ap(&M1),
+            from_ap(&M3),
+        ]);
+        let (cfg, rejoin) = (cfg(), Notify::new());
+        let mut statuses = Vec::new();
+        {
+            let mut report = |status: WifiStatus| statuses.push(untimed(status));
+            let asking = async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                rejoin.notify_waiters();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            };
+            tokio::select! {
+                never = run(&mut radio, &cfg, &mut report, &rejoin) => match never {},
+                () = asking => {}
+            }
+        }
+        assert_eq!(
+            statuses,
+            [WifiStatus::Scanning, joining(AA, 5180), joined(AA, 5180)]
+        );
+        assert_eq!(scan_times(&radio), [0]);
+        assert!(!radio.commands().contains(&Call::Disconnect(3)));
     }
 
     // A firmware that dies while the link is up says nothing: the probes are what notice, and the loop
@@ -1265,11 +1449,11 @@ allow = []
 
         let mut statuses = Vec::new();
         {
-            let mut report = |status: WifiStatus| statuses.push(status);
+            let mut report = |status: WifiStatus| statuses.push(untimed(status));
             let armed_at = MUTE_AFTER + Duration::from_secs(5);
-            let cfg = cfg();
+            let (cfg, rejoin) = (cfg(), Notify::new());
             tokio::select! {
-                never = run(&mut radio, &cfg, &mut report) => match never {},
+                never = run(&mut radio, &cfg, &mut report, &rejoin) => match never {},
                 ended = arm_after(&mute, armed_at) => panic!("the arming ended: {ended:?}"),
                 () = tokio::time::sleep(Duration::from_secs(195)) => {}
             }

@@ -8,17 +8,38 @@
 //!
 //! The thread reads the touch screen between draws; a tap is decided by `qb_panel::os::nav`, which says
 //! what the panel does next and, for a tap that is an action, what the system must do (an `Intent`):
-//! the gate, one device's ads or its own gate, a dismissed alert. A boot that asks for it first shows
-//! four crosses to tap and measures the touch screen from the taps. A board without the screen is
-//! [`PanelEnd::NoScreen`], which is no reason for the rest of the system to stop. The thread only logs and
-//! reads `/sys` and `/dev`: it never touches the card, the watchdog or the LED, and it never logs a
-//! name, a label or an address; what it logs of an action is what kind it was.
+//! the gate, one device's ads or its own gate, a dismissed alert, the owner's word on a name, the night hours,
+//! sleeping at once, a rejoin of the Wi-Fi, a restart, the PIN. A boot that
+//! asks for it first shows four crosses to tap and measures the touch screen from the taps. A board without
+//! the screen is [`PanelEnd::NoScreen`], which is no reason for the rest of the system to stop. The thread
+//! only logs and reads `/sys` and `/dev`: it never touches the card, the watchdog or the LED, and it never
+//! logs a name, a label or an address; what it logs of an action is what kind it was.
 //!
 //! What the screens read is copied into a `World` on the cadences of spec §5.2: the snapshot every
 //! second; the control of blocking every turn; the lane's names every frame; the device inventory every
 //! two seconds and who asks every second, only while HOME, DEVICES, DEVICE, CONFIRM or ITS GATE shows
-//! (the first, DEVICE, also the watched device's names every frame); the waiting alerts every second.
-//! The resolver's lock is taken only for the copies of the snapshot and of the control, as before.
+//! (the first, DEVICE, also the watched device's names every frame), and the inventory while ALERTS or an
+//! ALERT shows, which name their devices; the newest three waiting alerts every second; the day's most
+//! refused names and the owner's own list every five seconds, only while NAMES, YOUR LIST or NAME shows.
+//! The resolver's lock is taken only for the copies of the snapshot and of the control, as before, and for
+//! the copy of at most eight names and the one lookup of a NAME's list, once in five seconds on those screens.
+//! A new waiting alert opens its slip from any screen but a state of the whole system (`nav::arrive`, spec §5.3).
+//!
+//! **SYSTEM and the states** (phase 3). The board's load, memory and heat are read from `/proc` and `/sys` on this
+//! thread every five seconds, only while SYSTEM, UP or WI-FI shows; where the update machinery stands, once a second,
+//! whatever shows; the link's figures come with the snapshot, and the lock's state and the night hours with it.
+//! The states of the whole system are the loop's to enter and leave (`Panel::drive_states`): STARTING from the first
+//! frame (`Panel::boot`) until the panel is on, the Wi-Fi joined, the clock set, the lists loaded and DNS
+//! answering, and 3 s after the last, or 90 s; then HOME, or UPDATE on a trial boot. UPDATE covers the screen
+//! while an update is received or on trial, and shows once how a trial ended until a tap or 30 s. NIGHT is the dark
+//! clock after a minute alone in the night hours (a touch wakes HOME, the next minute alone sleeps again; an
+//! arriving alert does not light it) and after `SLEEP NOW` until a touch; it is drawing only.
+//!
+//! **The lock.** A strong intent with the lock on is asked for by the nav: the PIN pad opens holding it, and its
+//! fourth digit is an `Intent::Verify`, which this thread checks against the lock (PBKDF2, constant time, on the
+//! panel's thread: the screen is not drawn meanwhile) and answers with `nav::verified`; a right PIN hands the held
+//! action back, and it is carried out as if it had just been tapped. The digits live in a `Zeroizing` from the pad
+//! to the check; nothing here logs one, nor the hash. What the panel logs of any action is its kind.
 //!
 //! **Writes.** The surface takes a whole frame and writes the rows that differ from what the glass shows.
 //! LIVE keeps the Drain's painter and its schedule: a frame's motion, and half a frame later one figure.
@@ -38,10 +59,13 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use qb_panel::drain::{Drain, Stills};
-use qb_panel::os::nav::{self, Nav, Screen as Opened, Section, Tap};
+use qb_panel::os::nav::{self, Arrivals, Nav, Screen as Opened, Section, Tap, Verified};
 use qb_panel::os::screens::{self, View};
-use qb_panel::os::world::{Outcome, Pause, WatchedName, World};
-use qb_panel::os::{GateMove, Intent, Whole};
+use qb_panel::os::world::{
+    AlertRow, BUILT_CELLS, LockSource, MAX_ALERT_ROWS, MAX_OWNER_ROWS, Machine, Moment, Outcome,
+    Pause, RESTART_CAUSE_CELLS, Rejoin, UpdateRead, WatchedName, World,
+};
+use qb_panel::os::{GateMove, Intent, Verdict, Whole};
 use qb_panel::rows::BAND_GAP;
 use qb_panel::ui::ScreenPainter;
 use qb_panel::{Calibration, HEIGHT, Painter, TapTracker, WIDTH};
@@ -50,10 +74,14 @@ use crate::lane::{LaneFeed, LaneName, WatchedName as LaneWatched, WatchedOutcome
 use crate::live::{BlockingControl, Source};
 use crate::modules::{self, Insert, MODULE_LIST, ModuleTable, PANEL_MODULES};
 use crate::sys;
+use crate::update::OutcomeKind;
 use crate::watch::devices::WallCopy;
-use alerts::PendingAlerts;
+use alerts::{PanelAlert, PendingAlerts};
 use devices::DeviceControl;
 use fb::{Framebuffer, SCREEN_DRIVER, SYS_GRAPHICS, SYS_VTCONSOLE, Screen, ScreenError};
+use lock::{Check, LockControl, Source as PinSource};
+use names::{NamesControl, OwnerSide};
+use system::{RejoinWait, RestartRefused, SystemControl};
 use touch::{Decoded, Decoder, RawEvent, SYS_INPUT, find_touch, read_events};
 use view::{WallEntry, blocking, gate_total, refill, wanted_stills};
 
@@ -61,6 +89,9 @@ pub mod alerts;
 pub mod calibrate;
 pub mod devices;
 pub mod fb;
+pub mod lock;
+pub mod names;
+pub mod system;
 pub mod touch;
 pub mod view;
 
@@ -89,6 +120,31 @@ pub const ACTIVITY_MS: u64 = 1_000;
 
 /// How often the panel asks for the waiting alerts, in milliseconds.
 pub const ALERTS_MS: u64 = 1_000;
+
+/// How often the panel asks for the day's most refused names and the owner's own list, in milliseconds, while
+/// NAMES, YOUR LIST or NAME shows.
+pub const NAMES_MS: u64 = 5_000;
+
+/// How often the panel asks where the update machinery stands, in milliseconds, whatever screen shows (spec §5.2):
+/// UPDATE is a state of the whole system, and a trial's countdown steps every second.
+pub const UPDATE_MS: u64 = 1_000;
+
+/// How often the panel reads the board's load, memory and heat, in milliseconds, while SYSTEM, UP or WI-FI shows
+/// (spec §5.2, §6.5).
+pub const SYSTEM_MS: u64 = 5_000;
+
+/// How long STARTING lasts at most, in milliseconds: 90 s from the panel's first frame (spec §5.4).
+pub const STARTING_MAX_MS: u64 = 90_000;
+
+/// How long STARTING stays once its five lines are all done, in milliseconds: 3 s (spec §5.4).
+pub const STARTING_HOLD_MS: u64 = 3_000;
+
+/// How long a REJOIN shows `JOINING` at most, in milliseconds, if the link does not come back by itself (it
+/// should in about 15 s; the control refuses another rejoin for 60 s, and then the key says `WAIT`).
+pub const REJOIN_SHOWN_MS: u64 = 45_000;
+
+/// How many frames the log's cursor is on, and then off: 4 and 4 at 8 frames a second (spec §12.4).
+pub const CURSOR_FRAMES: u8 = 4;
 
 /// How many frames the LIVE tile's lamp stays white after a name went by in the lane.
 pub const BEAT_FRAMES: u8 = 3;
@@ -156,6 +212,14 @@ pub struct Deps {
     pub alerts: Arc<dyn PendingAlerts>,
     /// The devices: what the wall and DEVICE read of them, and the edits a tap makes to them.
     pub devices: Arc<dyn DeviceControl>,
+    /// The owner's names: what NAMES, YOUR LIST and NAME read of them, and the edits a tap makes to them.
+    pub names: Arc<dyn NamesControl>,
+    /// The board itself: the update machinery's view, the readings of SYSTEM, and the two actions on it, a
+    /// rejoin of the Wi-Fi and a restart.
+    pub system: Arc<dyn SystemControl>,
+    /// The lock and the night hours: what the PIN pad checks the digits against (on the panel's thread), the
+    /// PIN the panel sets or clears, and the hours the night screen keeps.
+    pub lock: Arc<dyn LockControl>,
 }
 
 /// How the panel's thread ended; it ends only when the panel cannot go on.
@@ -267,14 +331,23 @@ fn is_live(nav: &Nav) -> bool {
     nav.root() == Section::Live && nav.stack().is_empty() && nav.whole().is_none()
 }
 
+/// Whether ALERTS, the log, is what shows: the root, with nothing opened over it. It is where the cursor blinks.
+fn is_log(nav: &Nav) -> bool {
+    nav.root() == Section::Alerts && nav.stack().is_empty() && nav.whole().is_none()
+}
+
 /// What the screen that shows needs read (spec §5.2): the device inventory while HOME, DEVICES, DEVICE,
-/// CONFIRM or ITS GATE shows; who asked lately only while HOME or DEVICES shows; the watched device's
-/// names only while DEVICE shows.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// CONFIRM or ITS GATE shows, and while ALERTS or an ALERT does, which name their devices; who asked lately
+/// only while HOME or DEVICES shows; the watched device's names only while DEVICE shows; the day's most
+/// refused and the owner's list only while NAMES, YOUR LIST or NAME shows; the board's load, memory and heat
+/// only while SYSTEM, UP or WI-FI shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Reads {
     devices: bool,
     activity: bool,
     watched: bool,
+    names: bool,
+    system: bool,
 }
 
 impl Reads {
@@ -282,23 +355,33 @@ impl Reads {
         if nav.whole().is_some() {
             return Self::default();
         }
+        let wall = Self {
+            devices: true,
+            ..Self::default()
+        };
         match nav.top() {
             None if matches!(nav.root(), Section::Home | Section::Devices) => Self {
-                devices: true,
                 activity: true,
-                watched: false,
+                ..wall
             },
+            None if nav.root() == Section::Alerts => wall,
             Some(Opened::Device(_)) => Self {
-                devices: true,
-                activity: false,
                 watched: true,
+                ..wall
             },
-            Some(Opened::Confirm { .. } | Opened::ItsGate(_)) => Self {
-                devices: true,
-                activity: false,
-                watched: false,
+            Some(Opened::Alert(_) | Opened::Confirm { .. } | Opened::ItsGate(_)) => wall,
+            Some(Opened::Uptime | Opened::Wifi) => Self {
+                system: true,
+                ..Self::default()
             },
-            _ => Self::default(),
+            None if nav.root() == Section::System => Self {
+                system: true,
+                ..Self::default()
+            },
+            _ => Self {
+                names: nav.shows_names(),
+                ..Self::default()
+            },
         }
     }
 }
@@ -402,9 +485,58 @@ pub struct Panel<S: Surface> {
     next_devices_ms: u64,
     next_activity_ms: u64,
     next_alerts_ms: u64,
-    /// Whether an edit asked for the inventory, or a dismissal for the alerts, to be read at once.
+    next_names_ms: u64,
+    /// Whether an edit asked for the inventory, or for the names, to be read at once.
     force_devices: bool,
-    force_alerts: bool,
+    force_names: bool,
+    /// The newest waiting alerts as the store last gave them, newest first: the world's rows are made from them
+    /// and the wall, so that they are made again when the wall is read. They have no `Debug`.
+    alerts_raw: Vec<PanelAlert>,
+    /// How many alerts the store said were waiting, and when it last filed one.
+    alerts_count: u32,
+    alerts_last_unix: Option<u64>,
+    /// The arrival rule's memory (spec §5.3): the alerts the panel has shown or passed over.
+    alert_arrivals: Arrivals,
+    /// Counts the frames of the log's cursor, which is on for the first `CURSOR_FRAMES` of every two times that.
+    cursor_frames: u8,
+    /// How long the board had been up when the panel began, in milliseconds: the panel's own time starts later.
+    boot_ms: u64,
+    /// The Unix second the board started, taken once the clock is set (`WATCH OPENED`, spec §12.3).
+    opened_unix: Option<u64>,
+    /// The panel's own time, in milliseconds since it began, at its last turn: what a tap's effects are dated by.
+    now_ms: u64,
+    /// STARTING, while it shows (spec §5.4): when it began and when its five lines were first all done.
+    starting: Option<Starting>,
+    /// The time from which the update machinery is next asked where it stands.
+    next_update_ms: u64,
+    /// The time from which the board's load, memory and heat are next read.
+    next_system_ms: u64,
+    /// The update that is under way, as UPDATE draws it, as the update machinery last said; `None` while none is.
+    update_live: Option<UpdateRead>,
+    /// The trial this boot knows of that has ended, as the update machinery last said: the finished update UPDATE
+    /// shows once, and which outcome it is.
+    update_ended: Option<(UpdateRead, (OutcomeKind, u64))>,
+    /// The outcome the panel has shown, or passed over, so that it shows each once (spec §12.3).
+    update_seen: Option<(OutcomeKind, u64)>,
+    /// The finished update UPDATE is showing, until a tap or 30 s goes HOME.
+    update_done: Option<UpdateRead>,
+    /// Whether the night screen was asked for by `SLEEP NOW`: it then stays after the night hours, until a touch.
+    sleep_now: bool,
+    /// Where the owner's rejoin of the Wi-Fi stands: the link's join second when it was asked and when (the link is
+    /// back once it has a newer one), and until when the control refuses another.
+    rejoining: Option<(Option<u64>, u64)>,
+    rejoin_wait_until_ms: Option<u64>,
+    /// The monotonic second the link joined on, as the last snapshot said; `None` while it is down.
+    joined_secs: Option<u64>,
+}
+
+/// STARTING's clock (spec §5.4): from the panel's first frame, until every line is done and 3 s have passed, or 90 s.
+#[derive(Clone, Copy, Default)]
+struct Starting {
+    /// The panel's time at its first frame.
+    began_ms: Option<u64>,
+    /// The panel's time at which the five lines were first all done, and have been since.
+    done_ms: Option<u64>,
 }
 
 impl<S: Surface> Panel<S> {
@@ -424,6 +556,13 @@ impl<S: Surface> Panel<S> {
                     crate::VERSION,
                     qb_panel::os::world::VERSION_CELLS,
                 ),
+                machine: Machine {
+                    built: qb_panel::format::fit_text(
+                        &view::date_of(crate::BUILD_EPOCH),
+                        BUILT_CELLS,
+                    ),
+                    ..Machine::default()
+                },
                 ..World::default()
             },
             inventory: WallCopy::new(),
@@ -461,9 +600,38 @@ impl<S: Surface> Panel<S> {
             next_devices_ms: 0,
             next_activity_ms: 0,
             next_alerts_ms: 0,
+            next_names_ms: 0,
             force_devices: false,
-            force_alerts: false,
+            force_names: false,
+            alerts_raw: Vec::new(),
+            alerts_count: 0,
+            alerts_last_unix: None,
+            alert_arrivals: Arrivals::new(),
+            cursor_frames: 0,
+            boot_ms: u64::try_from(sys::uptime().as_millis()).unwrap_or(u64::MAX),
+            opened_unix: None,
+            now_ms: 0,
+            starting: None,
+            next_update_ms: 0,
+            next_system_ms: 0,
+            update_live: None,
+            update_ended: None,
+            update_seen: None,
+            update_done: None,
+            sleep_now: false,
+            rejoining: None,
+            rejoin_wait_until_ms: None,
+            joined_secs: None,
         }
+    }
+
+    /// A panel as it comes up with the board: STARTING first (spec §5.4), then HOME, or the trial's UPDATE on a trial
+    /// boot. [`Panel::new`] is the panel without that beginning, at HOME.
+    pub fn boot(surface: S, deps: Deps) -> Self {
+        let mut panel = Self::new(surface, deps);
+        panel.starting = Some(Starting::default());
+        panel.nav.set_whole(Some(Whole::Starting));
+        panel
     }
 
     /// Takes the events the touch screen reported, in the order they were read.
@@ -500,6 +668,9 @@ impl<S: Surface> Panel<S> {
 
     /// Does a tap at `(x, y)`: the panel moves, and the system does what the tap asked of it.
     fn on_tap(&mut self, x: u16, y: u16) {
+        // The lock may have changed since the last second's read (the desktop pushed a PIN, or took it away): a tap
+        // is decided by what the lock is now.
+        self.read_lock();
         if let Some(intent) = nav::tap(&mut self.nav, &self.world, x, y) {
             self.carry_out(intent);
         }
@@ -507,8 +678,9 @@ impl<S: Surface> Panel<S> {
         self.sync_watch();
     }
 
-    /// Does what an intent asks of the system, and logs which kind it was: never whom it was about. P1's
-    /// strong actions run directly, as there is no lock (ruling R3).
+    /// Does what an intent asks of the system, and logs which kind it was: never whom it was about, and never a
+    /// PIN digit or hash. A strong action reaches here only once the nav has asked for the PIN, when the lock is on:
+    /// the pad's right answer hands it back through `nav::verified` and it is carried out from `Intent::Verify`.
     fn carry_out(&mut self, intent: Intent) {
         match intent {
             Intent::Gate(GateMove::Open(secs)) => {
@@ -544,18 +716,102 @@ impl<S: Surface> Panel<S> {
             Intent::Ack(id) => {
                 self.deps.alerts.ack(id);
                 log::info!("panel: alert dismissed");
-                self.force_alerts = true;
+                // The log the panel goes back to is of what waits now: the next frame is too late to be the
+                // first it draws.
+                self.read_alerts();
             }
-            // The names, the night hours, the lock, the rejoin and the restart are the later phases'.
-            Intent::Name { .. }
-            | Intent::NightHours { .. }
-            | Intent::SleepNow
-            | Intent::Rejoin
-            | Intent::Restart
-            | Intent::SetPin(_)
-            | Intent::ClearPin => {
-                log::warn!("panel: an intent of a later phase was not carried out")
+            Intent::Name { name, verdict } => {
+                self.carry_out_name(&name, verdict);
+                self.force_names = true;
             }
+            Intent::NightHours { from, to } => {
+                // The two hours equal are no night, as the lock keeps them.
+                self.deps.lock.set_night((from != to).then_some((from, to)));
+                let night = self.deps.lock.night();
+                put(&mut self.world.night, night, &mut self.world_changed);
+                log::info!("panel: night hours set");
+            }
+            Intent::SleepNow => {
+                self.sleep_now = true;
+                self.nav.set_whole(Some(Whole::Night));
+                log::info!("panel: sleeping until a touch");
+            }
+            Intent::Rejoin => {
+                match self.deps.system.rejoin() {
+                    Ok(()) => {
+                        // The link says JOINING (and the key WAIT) until it has joined again: until it has a
+                        // newer join second than the one it has now.
+                        self.rejoining = Some((self.joined_secs, self.now_ms));
+                        log::info!("panel: Wi-Fi rejoin asked");
+                    }
+                    Err(RejoinWait(secs)) => {
+                        let until = self.now_ms.saturating_add(u64::from(secs) * 1_000);
+                        self.rejoin_wait_until_ms = Some(until);
+                        log::info!("panel: Wi-Fi rejoin refused for now");
+                    }
+                }
+                self.update_rejoin(self.now_ms);
+            }
+            Intent::Restart => match self.deps.system.restart() {
+                Ok(()) => log::info!("panel: restart asked"),
+                Err(RestartRefused::Updating) => {
+                    log::info!("panel: restart refused: an update is under way");
+                }
+                Err(RestartRefused::NotReady) => log::warn!("panel: restart refused: not ready"),
+            },
+            // The lock logs a PIN that was set or taken away (`panel: the PIN was set on the panel (until the next
+            // restart)`, `panel: the lock was turned off`): there is nothing the panel adds, and nothing it may.
+            Intent::SetPin(digits) => {
+                if !self.deps.lock.set_pin(digits.into_zeroizing()) {
+                    log::warn!("panel: the PIN was not set");
+                }
+                self.read_lock();
+            }
+            Intent::ClearPin => {
+                self.deps.lock.clear_pin();
+                self.read_lock();
+            }
+            // The four digits of the pad go to the lock, on this thread, and the pad is told what it said.
+            Intent::Verify(digits) => {
+                let answer = match self.deps.lock.verify(digits.into_zeroizing()) {
+                    Check::Right => {
+                        log::info!("panel: PIN accepted");
+                        Verified::Right
+                    }
+                    // The lock logs a wrong PIN, with its count.
+                    Check::Wrong => Verified::Wrong,
+                    Check::Wait(secs) => {
+                        log::info!("panel: PIN not checked: the lock is waiting");
+                        Verified::Wait(secs)
+                    }
+                };
+                let wait = self.deps.lock.wait_left();
+                put(&mut self.world.pin_wait_secs, wait, &mut self.world_changed);
+                // A right PIN gives back the action it was asked for, which is done as if it had just been tapped.
+                if let Some(held) = nav::verified(&mut self.nav, answer) {
+                    self.carry_out(held);
+                }
+            }
+        }
+    }
+
+    /// Does what the owner decided for a name: puts it on the owner's list, or takes the entry back. Logs which kind
+    /// of decision it was, never the name.
+    fn carry_out_name(&self, name: &str, verdict: Verdict) {
+        let names = &self.deps.names;
+        let done = match verdict {
+            Verdict::Allow => names.set(name, OwnerSide::Allow).map(|()| true),
+            Verdict::Refuse => names.set(name, OwnerSide::Refuse).map(|()| true),
+            Verdict::ClearAllow | Verdict::ClearRefuse => names.forget(name),
+        };
+        match (done, verdict) {
+            (Ok(true), Verdict::Allow) => log::info!("panel: name allowed"),
+            (Ok(true), Verdict::Refuse) => log::info!("panel: name refused"),
+            (Ok(true), Verdict::ClearAllow) => log::info!("panel: allow taken back"),
+            (Ok(true), Verdict::ClearRefuse) => log::info!("panel: refusal taken back"),
+            // A name that only a parent covers has no entry of its own to take back.
+            (Ok(false), _) => log::info!("panel: no entry of its own to take back"),
+            (Err(error), _) => log::warn!("panel: name edit refused: {}", error.as_str()),
         }
     }
 
@@ -574,6 +830,7 @@ impl<S: Surface> Panel<S> {
     /// frame, and the frames are counted from it. A minute without a touch takes the panel HOME.
     pub fn turn(&mut self, now_ms: u64, now_unix: u64) -> io::Result<u64> {
         self.unix = now_unix;
+        self.now_ms = now_ms;
         if std::mem::take(&mut self.touched) {
             self.last_touch_ms = now_ms;
         }
@@ -607,7 +864,16 @@ impl<S: Surface> Panel<S> {
         // A minute without a touch takes the panel HOME.
         let quiet_ms = now_ms.saturating_sub(self.last_touch_ms);
         if self.begun && quiet_ms >= self.idle_after_ms {
+            let on_the_pad = self.nav.whole() == Some(Whole::Pin);
             nav::idle(&mut self.nav, quiet_ms);
+            if on_the_pad {
+                // The pad timed out, back to the screen it came from with the action not done (spec §4): that screen
+                // has a minute of its own before the panel goes home, as if it had just been touched.
+                self.last_touch_ms = now_ms;
+            } else {
+                // In the night hours the panel that has been left alone for that minute sleeps (spec §12.6).
+                self.sleep_if_night();
+            }
         }
         self.sync_watch();
         self.sync_ask();
@@ -678,9 +944,12 @@ impl<S: Surface> Panel<S> {
         self.begun = true;
         if first {
             // The lane's quiet is counted from the panel's first frame, not from the thread's start; the
-            // minute without a touch too.
+            // minute without a touch too, and STARTING's 90 s.
             self.last_name_ms = now_ms;
             self.last_touch_ms = now_ms;
+            if let Some(starting) = self.starting.as_mut() {
+                starting.began_ms = Some(now_ms);
+            }
         }
         let elapsed_ms = now_ms.saturating_sub(self.last_frame_ms);
         self.last_frame_ms = now_ms;
@@ -707,6 +976,15 @@ impl<S: Surface> Panel<S> {
         let beat = self.beat_left > 0;
         self.beat_left = self.beat_left.saturating_sub(1);
         put(&mut self.world.beat, beat, &mut self.world_changed);
+        // The log's cursor: on for 4 frames and off for 4, only while the log shows (spec §12.4).
+        self.cursor_frames = (self.cursor_frames + 1) % (2 * CURSOR_FRAMES);
+        if is_log(&self.nav) {
+            let on = self.cursor_frames < CURSOR_FRAMES;
+            put(&mut self.world.cursor_on, on, &mut self.world_changed);
+        } else {
+            // No other screen draws it: nothing to repaint.
+            self.world.cursor_on = false;
+        }
 
         if first || now_ms >= self.next_snapshot_ms {
             self.refresh(now_ms, now_unix);
@@ -714,14 +992,47 @@ impl<S: Surface> Panel<S> {
         }
         self.read_cadences(now_ms);
         self.tick_gates(now_ms);
-        let days = u32::try_from(now_ms / 86_400_000).unwrap_or(u32::MAX);
+        // The board's uptime, from the clock the board's readings rebase: whole days, and the hours into the day.
+        let uptime_ms = self.boot_ms.saturating_add(now_ms);
+        let days = u32::try_from(uptime_ms / 86_400_000).unwrap_or(u32::MAX);
+        let hours = u8::try_from(uptime_ms / 3_600_000 % 24).unwrap_or(0);
         put(
             &mut self.world.uptime_days,
             Some(days),
             &mut self.world_changed,
         );
-        if nav::refresh(&mut self.nav, &self.world) {
+        put(
+            &mut self.world.machine.uptime_hours,
+            Some(hours),
+            &mut self.world_changed,
+        );
+        // The pad's wait is the lock's own, set before the nav looks at the world: `refresh` lets go of the figure
+        // the lock's last answer gave the pad, for this one.
+        let wait = if self.nav.pin().is_some() {
+            self.deps.lock.wait_left()
+        } else {
+            0
+        };
+        put(&mut self.world.pin_wait_secs, wait, &mut self.world_changed);
+        // STARTING, then UPDATE and the night, which cover everything else (spec §5.4). A screen that comes up
+        // when one of them lets go is drawn from what it reads, as a screen that a tap opens is.
+        let whole = self.nav.whole();
+        self.drive_states(now_ms);
+        nav::age_update(&mut self.nav, &self.world, elapsed_ms);
+        if self.nav.whole() != whole {
+            self.read_cadences(now_ms);
+        }
+        let popped = nav::refresh(&mut self.nav, &self.world);
+        // A new waiting alert opens its slip, from wherever the panel is but a state of the whole system.
+        let arrived = nav::arrive(&mut self.nav, &mut self.alert_arrivals, &self.world);
+        if popped || arrived {
             self.sync_watch();
+        }
+        if arrived {
+            // The slip is a screen of its own, and its device is named from the wall: read what it needs
+            // before it is drawn. It was not asked for by a touch, but it is a screen to look at for a minute.
+            self.last_touch_ms = now_ms;
+            self.read_cadences(now_ms);
         }
 
         let moving = self.drain.moving();
@@ -771,6 +1082,20 @@ impl<S: Surface> Panel<S> {
 
         self.utc_offset_secs = snapshot.utc_offset_secs;
         self.clock_set = snapshot.clock_set;
+        // The watch opened when the board started: the clock less the uptime, taken once when the clock is
+        // first set, so that the minute it shows cannot flip between two reads that round differently.
+        if self.clock_set && self.opened_unix.is_none() {
+            let uptime_secs = self.boot_ms.saturating_add(now_ms) / 1_000;
+            self.opened_unix = Some(now_unix.saturating_sub(uptime_secs));
+        }
+        let opened: Option<Moment> = self
+            .opened_unix
+            .and_then(|unix| view::moment_of(unix, snapshot.utc_offset_secs));
+        put(
+            &mut self.world.watch_opened,
+            opened,
+            &mut self.world_changed,
+        );
         let joined = view::joined(&snapshot);
         let today = snapshot.today.filter(|_| joined);
         let time = snapshot
@@ -789,6 +1114,109 @@ impl<S: Surface> Panel<S> {
         );
         put(&mut self.world.share, self.wanted.percent, changed);
         put(&mut self.world.list_names, names, changed);
+        // DNS answers once the slot is filled and a query has been answered today, or an upstream has answered one
+        // (spec §5.4): a quiet house asks nothing for minutes, and that is no reason to wait the 90 s out.
+        let answering = snapshot
+            .today
+            .is_some_and(|today| today.queries > 0 || snapshot.upstream_ms.is_some());
+        put(&mut self.world.dns_answering, answering, changed);
+
+        // SYSTEM's and WI-FI's link, from the same snapshot: the monotonic second is the uptime's.
+        self.joined_secs = snapshot.wifi.as_ref().and_then(|wifi| wifi.joined_secs);
+        let now_secs = self.boot_ms.saturating_add(now_ms) / 1_000;
+        let link = view::link_of(snapshot.wifi.as_ref(), snapshot.upstream_ms, now_secs);
+        put(&mut self.world.link, link, &mut self.world_changed);
+        self.update_rejoin(now_ms);
+
+        // The lock and the night hours: small reads, under the lock's own mutex.
+        self.read_lock();
+        let night = self.deps.lock.night();
+        put(&mut self.world.night, night, &mut self.world_changed);
+    }
+
+    /// Where the owner's rejoin of the Wi-Fi stands (spec §6.6, §12.4): `Joining` from the moment it was asked until
+    /// the link has joined again (a newer join second than the one it had), or `REJOIN_SHOWN_MS` have passed;
+    /// `Wait` while the control refuses another; else `Idle`.
+    fn update_rejoin(&mut self, now_ms: u64) {
+        if let Some((from, asked_ms)) = self.rejoining {
+            let back =
+                self.world.wifi_joined && self.joined_secs.is_some() && self.joined_secs != from;
+            if back || now_ms.saturating_sub(asked_ms) >= REJOIN_SHOWN_MS {
+                self.rejoining = None;
+            }
+        }
+        let rejoin = if self.rejoining.is_some() {
+            Rejoin::Joining
+        } else {
+            match self.rejoin_wait_until_ms {
+                Some(until) if now_ms < until => {
+                    let secs = (until - now_ms).div_ceil(1_000);
+                    Rejoin::Wait(u16::try_from(secs).unwrap_or(u16::MAX))
+                }
+                _ => {
+                    self.rejoin_wait_until_ms = None;
+                    Rejoin::Idle
+                }
+            }
+        };
+        put(&mut self.world.rejoin, rejoin, &mut self.world_changed);
+    }
+
+    /// Reads whether the lock is on and where its PIN came from: what makes a strong key ask. A mutex and a copy.
+    fn read_lock(&mut self) {
+        let view = self.deps.lock.lock_view();
+        let source = match view.source {
+            Some(PinSource::Api) => LockSource::Api,
+            Some(PinSource::Panel) => LockSource::Panel,
+            Some(PinSource::Config) | None => LockSource::Config,
+        };
+        let changed = &mut self.world_changed;
+        put(&mut self.world.lock_on, view.on, changed);
+        put(&mut self.world.lock_source, source, changed);
+    }
+
+    /// Asks the update machinery where it stands (every `UPDATE_MS`, whatever shows: UPDATE covers every screen): the
+    /// slot that runs, how the last update ended and what the board last restarted for (SYSTEM, VERSION, UP), whether
+    /// an update is received or on trial (`REJOIN` and `RESTART` are inert then), and the update that is under way,
+    /// or the one that just ended, which UPDATE shows once. One small lock.
+    fn read_update(&mut self, now_ms: u64) {
+        let update = self.deps.system.update_view();
+        self.next_update_ms = now_ms.saturating_add(UPDATE_MS);
+        let cause = qb_panel::format::fit_text(view::restart_cause(&update), RESTART_CAUSE_CELLS);
+        let changed = &mut self.world_changed;
+        put(
+            &mut self.world.machine.slot,
+            update.slot.map(view::slot_of),
+            changed,
+        );
+        put(
+            &mut self.world.machine.last_update,
+            view::last_update_of(&update),
+            changed,
+        );
+        put(&mut self.world.machine.last_restart, cause, changed);
+        put(&mut self.world.update_busy, update.state != "idle", changed);
+        self.update_live = view::update_read(&update);
+        self.update_ended = view::finished_update(&update);
+    }
+
+    /// Reads the board's load, memory and heat, on this thread: `/proc` and `/sys`, four small files. The kernel's
+    /// uptime is the one the days and hours of UP count from, so it sets the panel's base for them.
+    fn read_system(&mut self, now_ms: u64) {
+        let readings = self.deps.system.readings();
+        self.next_system_ms = now_ms.saturating_add(SYSTEM_MS);
+        if let Some(secs) = readings.uptime_secs {
+            self.boot_ms = secs.saturating_mul(1_000).saturating_sub(now_ms);
+        }
+        let changed = &mut self.world_changed;
+        let machine = &mut self.world.machine;
+        put(
+            &mut machine.load_hundredths,
+            readings.load_hundredths,
+            changed,
+        );
+        put(&mut machine.memory_pct, readings.memory_pct, changed);
+        put(&mut machine.temp_c, readings.temp_c.map(i16::from), changed);
     }
 
     /// Does the reads the screen that shows needs, when they are due (spec §5.2): the inventory every
@@ -820,11 +1248,15 @@ impl<S: Surface> Panel<S> {
                 let mut wall = view::wall(&self.inventory, &self.asking, now_ms, unix);
                 view::keep_countdowns(&self.wall, &mut wall, now_ms);
                 self.wall = wall;
+                let before = self.world.newcomer;
                 put(
                     &mut self.world.newcomer,
                     view::newcomer_of(&self.inventory),
                     &mut self.world_changed,
                 );
+                if self.world.newcomer != before {
+                    self.map_alerts();
+                }
             }
             self.force_devices = false;
             self.next_devices_ms = now_ms.saturating_add(DEVICES_MS);
@@ -840,32 +1272,115 @@ impl<S: Surface> Panel<S> {
                 .collect();
             put(&mut self.world.watched, names, &mut self.world_changed);
         }
-        if self.force_alerts || now_ms >= self.next_alerts_ms {
+        if now_ms >= self.next_alerts_ms {
             self.read_alerts();
-            self.force_alerts = false;
             self.next_alerts_ms = now_ms.saturating_add(ALERTS_MS);
+        }
+        if now_ms >= self.next_update_ms {
+            self.read_update(now_ms);
+        }
+        // The board's load, memory and heat: only while SYSTEM, UP or WI-FI shows, every five seconds, and at once
+        // when one of them comes up; what was read goes with them.
+        if reads.system && (!self.reads.system || now_ms >= self.next_system_ms) {
+            self.read_system(now_ms);
+        }
+        if !reads.system && self.reads.system {
+            let changed = &mut self.world_changed;
+            let machine = &mut self.world.machine;
+            put(&mut machine.load_hundredths, None, changed);
+            put(&mut machine.memory_pct, None, changed);
+            put(&mut machine.temp_c, None, changed);
+        }
+        // The names: at once on arriving, after an edit, and when NAME is about another name than the one the
+        // world holds the facts of; else every five seconds.
+        let shown = self.nav.shown_name();
+        let facts_for = self
+            .world
+            .name_facts
+            .as_ref()
+            .map(|facts| facts.name.as_str());
+        if reads.names
+            && (!self.reads.names
+                || self.force_names
+                || now_ms >= self.next_names_ms
+                || facts_for != shown)
+        {
+            self.read_names();
+            self.force_names = false;
+            self.next_names_ms = now_ms.saturating_add(NAMES_MS);
+        }
+        if !reads.names && self.reads.names {
+            // What was read goes with the screens that showed it: the next ones read afresh.
+            let changed = &mut self.world_changed;
+            put(&mut self.world.top_names, Vec::new(), changed);
+            put(&mut self.world.owner_total, 0, changed);
+            put(&mut self.world.owner_newest, Vec::new(), changed);
+            put(&mut self.world.name_facts, None, changed);
         }
         self.reads = reads;
     }
 
-    /// Reads the waiting alerts: how many, when the one that ALERT opens last happened, and that one, with its
-    /// lines made from what the store carries and the names of the wall.
+    /// Reads the waiting alerts: the newest three, how many wait in all, and when the store last filed one. One
+    /// pass over the store each, under its own lock.
     fn read_alerts(&mut self) {
-        let top = self.deps.alerts.top();
-        let waiting = match &top {
-            Some(_) => self.deps.alerts.waiting_count().max(1),
-            None => 0,
-        };
-        let newest = top
-            .as_ref()
-            .and_then(|alert| view::today_clock(alert.last_unix, self.unix, self.utc_offset_secs));
-        let row = top.as_ref().map(|alert| {
-            view::alert_row(alert, &self.wall, self.world.newcomer, self.utc_offset_secs)
-        });
+        self.alerts_raw = self.deps.alerts.waiting(MAX_ALERT_ROWS);
+        self.alerts_count = self.deps.alerts.waiting_count();
+        self.alerts_last_unix = self.deps.alerts.last_alert_unix();
+        self.map_alerts();
+    }
+
+    /// Makes the world's alerts from what was read and the wall: the log's lines and the slips they open, with the
+    /// lines made from what the store carries and the names of the wall. Done again when the wall is read, since
+    /// it names their devices.
+    fn map_alerts(&mut self) {
+        let (offset, now) = (self.utc_offset_secs, self.unix);
+        let rows: Vec<AlertRow> = self
+            .alerts_raw
+            .iter()
+            .map(|alert| view::alert_row(alert, &self.wall, self.world.newcomer, offset, now))
+            .collect();
+        let held = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        let waiting = self.alerts_count.max(held);
+        let newest = self
+            .alerts_raw
+            .first()
+            .and_then(|alert| view::today_clock(alert.last_unix, now, offset));
+        let last = self
+            .alerts_last_unix
+            .and_then(|unix| view::moment_of(unix, offset));
         let changed = &mut self.world_changed;
         put(&mut self.world.alerts_waiting, waiting, changed);
         put(&mut self.world.alert_newest, newest, changed);
-        put(&mut self.world.top_alert, row, changed);
+        put(&mut self.world.last_entry, last, changed);
+        put(&mut self.world.alerts, rows, changed);
+    }
+
+    /// Reads the day's most refused names, the owner's own list and, while NAME shows, what the lists and the
+    /// owner say of its name. Copies, taken one after another: the resolver's lock is held for the copy of at
+    /// most eight names and for one lookup, and let go between them.
+    fn read_names(&mut self) {
+        let (offset, now) = (self.utc_offset_secs, self.unix);
+        let names = &self.deps.names;
+        let top = names.top_today();
+        let newest = names.owner_newest(MAX_OWNER_ROWS);
+        let total = u32::try_from(names.owner_len()).unwrap_or(u32::MAX);
+        let top_names = view::top_rows(&top, &|name| names.owner_hold(name));
+        let owner_newest = view::owner_rows(&newest, now, offset);
+        let facts = self.nav.shown_name().map(|name| {
+            view::name_facts(
+                name,
+                names.class(name),
+                names.owner_hold(name),
+                &top,
+                now,
+                offset,
+            )
+        });
+        let changed = &mut self.world_changed;
+        put(&mut self.world.top_names, top_names, changed);
+        put(&mut self.world.owner_total, total, changed);
+        put(&mut self.world.owner_newest, owner_newest, changed);
+        put(&mut self.world.name_facts, facts, changed);
     }
 
     /// Makes the world's wall what the panel's copy of it is, if it is not.
@@ -880,6 +1395,8 @@ impl<S: Surface> Panel<S> {
         if !same {
             self.world.devices = self.wall.iter().map(|entry| entry.row.clone()).collect();
             self.world_changed = true;
+            // The alerts name their devices from the wall.
+            self.map_alerts();
         }
     }
 
@@ -922,6 +1439,121 @@ impl<S: Surface> Panel<S> {
     /// The gate ask over LIVE is the nav's; the Drain is to be drawn with it.
     fn sync_ask(&mut self) {
         self.wanted.gate_ask = self.nav.gate_ask();
+    }
+
+    /// The states of the whole system (spec §5.4), which cover every screen: STARTING from the first frame, then
+    /// UPDATE for an update that is received or on trial (a trial boot shows it once STARTING is done) and, once, for
+    /// how a trial ended, and the end of the night in the morning. The PIN pad is the nav's own.
+    fn drive_states(&mut self, now_ms: u64) {
+        if self.drive_starting(now_ms) {
+            return;
+        }
+        self.drive_update();
+        self.lift_night();
+    }
+
+    /// STARTING (spec §5.4): from the panel's first frame until the panel is on, the Wi-Fi joined, the clock set, the
+    /// lists loaded (even when they hold no name: none may be configured) and DNS answering (the slot is filled and a
+    /// query or an upstream has answered), and 3 s after the last of them, or 90 s; then HOME. Says whether it still
+    /// shows.
+    fn drive_starting(&mut self, now_ms: u64) -> bool {
+        let Some(mut starting) = self.starting else {
+            return false;
+        };
+        if self.nav.whole() != Some(Whole::Starting) {
+            // The panel was moved from outside the loop: the beginning is over.
+            self.starting = None;
+            return false;
+        }
+        let began_ms = *starting.began_ms.get_or_insert(now_ms);
+        let world = &self.world;
+        let done = world.wifi_joined
+            && world.time.is_some()
+            && world.list_names.is_some()
+            && world.dns_answering;
+        match (done, starting.done_ms) {
+            (true, None) => starting.done_ms = Some(now_ms),
+            (false, Some(_)) => starting.done_ms = None,
+            _ => {}
+        }
+        let held = starting
+            .done_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) >= STARTING_HOLD_MS);
+        let late = now_ms.saturating_sub(began_ms) >= STARTING_MAX_MS;
+        if held || late {
+            self.starting = None;
+            self.nav.set_whole(None);
+            if held {
+                log::info!("panel: started");
+            } else {
+                log::warn!("panel: STARTING ended at its longest with a line not done");
+            }
+            return false;
+        }
+        self.starting = Some(starting);
+        true
+    }
+
+    /// UPDATE (spec §5.4, §12.3): an update that is received or on trial takes the screen for as long as it lasts; how
+    /// a trial ended (confirmed, rolled back) is shown once, until a tap or 30 s (`nav::age_update`); an update that
+    /// came to nothing lets go. A PIN pad is not covered: it times out by itself, and the update is shown after it.
+    /// Neither is the night screen: it stays dark (spec §5.4, as for an alert), and what is waiting, an update that
+    /// is received or on trial or an outcome not yet shown, is held until the screen wakes, and shown then.
+    fn drive_update(&mut self) {
+        let whole = self.nav.whole();
+        if !matches!(whole, None | Some(Whole::Update)) {
+            return;
+        }
+        if let Some(live) = self.update_live {
+            self.update_done = None;
+            put(&mut self.world.update, Some(live), &mut self.world_changed);
+            if whole != Some(Whole::Update) {
+                self.nav.set_whole(Some(Whole::Update));
+            }
+            return;
+        }
+        match self.update_ended {
+            Some((done, outcome)) if self.update_seen != Some(outcome) => {
+                self.update_seen = Some(outcome);
+                self.update_done = Some(done);
+                // Its 30 s start now, whatever the update screen showed before.
+                self.nav.set_whole(Some(Whole::Update));
+            }
+            _ if whole == Some(Whole::Update) && self.update_done.is_none() => {
+                // The update that was under way is no more, and left nothing to show.
+                self.nav.set_whole(None);
+            }
+            _ => {}
+        }
+        let showing = self.nav.whole() == Some(Whole::Update);
+        if !showing {
+            self.update_done = None;
+        }
+        let shown = self.update_done.filter(|_| showing);
+        put(&mut self.world.update, shown, &mut self.world_changed);
+    }
+
+    /// The night screen after a minute alone, in the night hours (spec §5.4, §12.6): the panel that nobody touched
+    /// sleeps; a touch wakes it to HOME, and the next minute alone puts it to sleep again. Called when the idle minute
+    /// is up. Drawing only: the backlight is not switched.
+    fn sleep_if_night(&mut self) {
+        if self.nav.whole().is_none() && view::in_night(self.world.night, self.world.time) {
+            self.nav.set_whole(Some(Whole::Night));
+            self.sleep_now = false;
+        }
+    }
+
+    /// The end of the night (spec §12.6): the dark screen of the night hours lifts to HOME in the morning; one that
+    /// `SLEEP NOW` asked for stays until a touch. A night screen that is gone (a touch woke it) forgets the ask.
+    fn lift_night(&mut self) {
+        if self.nav.whole() != Some(Whole::Night) {
+            self.sleep_now = false;
+            return;
+        }
+        if !self.sleep_now && !view::in_night(self.world.night, self.world.time) {
+            self.nav.set_whole(None);
+            log::info!("panel: the night is over");
+        }
     }
 
     /// Moves to a screen that is not the one on the glass: reads what it needs, lets the nav pop what is
@@ -1193,7 +1825,7 @@ fn run_panel(deps: Deps) -> PanelEnd {
             })
             .ok(),
     };
-    let mut panel = Panel::new(framebuffer, deps);
+    let mut panel = Panel::boot(framebuffer, deps);
     if let Err(end) = measure_touch(&mut panel, device.as_mut()) {
         return end;
     }
@@ -1215,13 +1847,20 @@ mod tests {
     use std::net::IpAddr;
 
     use qb_panel::drain::{QUEUE_MAX, TileStyle};
-    use qb_panel::os::world::{DeviceState, Newcomer};
+    use qb_panel::os::world::{
+        AlertStamp, DeviceState, LastUpdate, Newcomer, Slot as WorldSlot, UpdatePhase,
+        Waiting as WorldWaiting, When,
+    };
     use qb_panel::rows::changed_rows;
     use qb_panel::{Blocking, Calibration, LaneWords, Share, TimeOfDay};
     use tempfile::TempDir;
 
     use crate::live::{BlockingControl, Counts, LogEntry, Nothing, Snapshot, Source, WifiStatus};
     use crate::modules::DEFAULT_TABLE;
+    use crate::names::{NamesError, OwnerEntry as OwnedEntry, OwnerHold};
+    use crate::slots::Slot as CardSlot;
+    use crate::update;
+    use crate::usage::Readings;
     use crate::watch::devices::{DeviceView, DevicesView, EditError, KnownList, Label};
     use crate::watch::frames::Mac;
     use alerts::{NoAlerts, PanelAlert, Severity};
@@ -1229,8 +1868,12 @@ mod tests {
     use calibrate::tests::{assert_close, kernel_press, press, raw_at};
     use devices::NoDevices;
     use fb::tests::{Graphics, HDMI, graphics};
+    use lock::{NoLock, PanelState};
+    use names::{NameClass, NoNames, TopName};
+    use system::NoSystem;
     use touch::tests::{abs_x, abs_y, bytes_of, dropped, key, pressure, syn};
     use view::tests::{TEN_TWENTY_UTC, reference_snapshot};
+    use zeroize::Zeroizing;
 
     /// Every frame a `Recorder` was shown, readable from where the `Recorder` was handed over.
     #[derive(Clone, Default)]
@@ -1341,6 +1984,9 @@ mod tests {
             lane: LaneFeed::new(),
             alerts: Arc::new(NoAlerts),
             devices: Arc::new(NoDevices),
+            names: Arc::new(NoNames),
+            system: Arc::new(NoSystem),
+            lock: Arc::new(NoLock),
         }
     }
 
@@ -1560,8 +2206,7 @@ mod tests {
 
     impl PendingAlerts for FakeAlerts {
         fn top(&self) -> Option<PanelAlert> {
-            let mut state = self.0.lock().unwrap();
-            state.asked += 1;
+            let state = self.0.lock().unwrap();
             state
                 .alerts
                 .iter()
@@ -1573,6 +2218,25 @@ mod tests {
         fn waiting_count(&self) -> u32 {
             let state = self.0.lock().unwrap();
             u32::try_from(state.alerts.iter().filter(|(_, acked)| !acked).count()).unwrap()
+        }
+
+        fn waiting(&self, n: usize) -> Vec<PanelAlert> {
+            let mut state = self.0.lock().unwrap();
+            state.asked += 1;
+            let mut waiting: Vec<PanelAlert> = state
+                .alerts
+                .iter()
+                .filter(|(_, acked)| !acked)
+                .map(|(alert, _)| alert.clone())
+                .collect();
+            waiting.sort_by_key(|alert| std::cmp::Reverse(alert.id));
+            waiting.truncate(n);
+            waiting
+        }
+
+        fn last_alert_unix(&self) -> Option<u64> {
+            let state = self.0.lock().unwrap();
+            state.alerts.iter().map(|(alert, _)| alert.last_unix).max()
         }
 
         fn ack(&self, id: u64) {
@@ -1598,8 +2262,311 @@ mod tests {
         }
     }
 
+    /// What a fake of the owner's names holds and has been asked.
+    #[derive(Default)]
+    struct FakeNamesState {
+        /// The day's most refused, as the resolver counted them.
+        top: Vec<TopName>,
+        /// The owner's entries, the oldest first, with the day each was set.
+        owner: Vec<(String, OwnerSide, Option<u64>)>,
+        /// The names a list of the house blocks, and which.
+        lists: Vec<(String, NameClass)>,
+        /// How many times each read was made: the top, the newest entries, the length, a hold, a class.
+        reads: [usize; 5],
+        /// The edits, as `allow <name>`, `refuse <name>`, `forget <name>`.
+        edits: Vec<String>,
+    }
+
+    /// The owner's names as a test sees them: a list that counts the reads it is made and keeps the edits, and
+    /// applies them as the real one does.
+    #[derive(Clone, Default)]
+    struct FakeNames(Arc<Mutex<FakeNamesState>>);
+
+    impl FakeNames {
+        fn state(&self) -> std::sync::MutexGuard<'_, FakeNamesState> {
+            self.0.lock().unwrap()
+        }
+
+        /// The house's day: three names most refused first, one of which an ads list holds and one a threat.
+        fn with_day() -> Self {
+            let fake = Self::default();
+            {
+                let mut state = fake.state();
+                state.top = [
+                    ("ads.example.net", 1_204),
+                    ("tracker.example.com", 612),
+                    ("metrics.example.org", 31),
+                ]
+                .map(|(name, count)| TopName {
+                    name: name.into(),
+                    count,
+                })
+                .to_vec();
+                state.lists = vec![
+                    ("ads.example.net".to_owned(), NameClass::Ads),
+                    ("tracker.example.com".to_owned(), NameClass::Ads),
+                    ("metrics.example.org".to_owned(), NameClass::Deny),
+                    ("secure-login-verify.example".to_owned(), NameClass::Threat),
+                ];
+            }
+            fake
+        }
+
+        /// How many reads of any kind were made.
+        fn reads(&self) -> usize {
+            self.state().reads.iter().sum()
+        }
+
+        fn edits(&self) -> Vec<String> {
+            self.state().edits.clone()
+        }
+    }
+
+    impl NamesControl for FakeNames {
+        fn top_today(&self) -> Vec<TopName> {
+            let mut state = self.state();
+            state.reads[0] += 1;
+            state.top.clone()
+        }
+
+        fn owner_len(&self) -> usize {
+            let mut state = self.state();
+            state.reads[2] += 1;
+            state.owner.len()
+        }
+
+        fn owner_newest(&self, n: usize) -> Vec<OwnedEntry> {
+            let mut state = self.state();
+            state.reads[1] += 1;
+            state
+                .owner
+                .iter()
+                .rev()
+                .take(n)
+                .map(|(name, side, set_unix)| OwnedEntry {
+                    name: name.as_str().into(),
+                    side: *side,
+                    set_unix: *set_unix,
+                })
+                .collect()
+        }
+
+        fn owner_hold(&self, name: &str) -> Option<OwnerHold> {
+            let mut state = self.state();
+            state.reads[3] += 1;
+            let entry = state.owner.iter().find(|(held, _, _)| held == name)?;
+            Some(OwnerHold {
+                side: entry.1,
+                exact: true,
+                set_unix: entry.2,
+            })
+        }
+
+        fn class(&self, name: &str) -> NameClass {
+            let mut state = self.state();
+            state.reads[4] += 1;
+            state
+                .lists
+                .iter()
+                .find(|(held, _)| held == name)
+                .map_or(NameClass::None, |(_, class)| *class)
+        }
+
+        fn set(&self, name: &str, verdict: OwnerSide) -> Result<(), NamesError> {
+            let on_threat = self
+                .state()
+                .lists
+                .iter()
+                .any(|(held, class)| held == name && *class == NameClass::Threat);
+            if verdict == OwnerSide::Allow && on_threat {
+                return Err(NamesError::Threat);
+            }
+            let mut state = self.state();
+            state.owner.retain(|(held, _, _)| held != name);
+            state.owner.push((name.to_owned(), verdict, Some(UNIX)));
+            let word = if verdict == OwnerSide::Allow {
+                "allow"
+            } else {
+                "refuse"
+            };
+            state.edits.push(format!("{word} {name}"));
+            Ok(())
+        }
+
+        fn forget(&self, name: &str) -> Result<bool, NamesError> {
+            let mut state = self.state();
+            let before = state.owner.len();
+            state.owner.retain(|(held, _, _)| held != name);
+            let gone = state.owner.len() < before;
+            if gone {
+                state.edits.push(format!("forget {name}"));
+            }
+            Ok(gone)
+        }
+    }
+
+    /// What a fake of the board itself holds, says and has been asked.
+    struct FakeSystemState {
+        /// Where the update machinery stands, as it says.
+        update: update::View,
+        /// What the rejoin and the restart answer.
+        rejoin: Result<(), RejoinWait>,
+        restart: Result<(), RestartRefused>,
+        /// What the board's files read.
+        readings: Readings,
+        /// The actions it was asked for, in order: `rejoin`, `restart`.
+        acts: Vec<&'static str>,
+        /// How many times the update view and the readings were read.
+        reads: (usize, usize),
+    }
+
+    /// The board itself as a test sees it: scripted answers and a count of the reads and the actions.
+    #[derive(Clone)]
+    struct FakeSystem(Arc<Mutex<FakeSystemState>>);
+
+    impl Default for FakeSystem {
+        fn default() -> Self {
+            Self(Arc::new(Mutex::new(FakeSystemState {
+                update: idle_update(),
+                rejoin: Ok(()),
+                restart: Ok(()),
+                readings: Readings {
+                    uptime_secs: Some(12 * 86_400 + 4 * 3_600),
+                    load_hundredths: Some(21),
+                    memory_pct: Some(38),
+                    temp_c: Some(47),
+                },
+                acts: Vec::new(),
+                reads: (0, 0),
+            })))
+        }
+    }
+
+    impl FakeSystem {
+        fn state(&self) -> std::sync::MutexGuard<'_, FakeSystemState> {
+            self.0.lock().unwrap()
+        }
+
+        /// Says where the update machinery stands from now on.
+        fn set_update(&self, update: update::View) {
+            self.state().update = update;
+        }
+
+        fn acts(&self) -> Vec<&'static str> {
+            self.state().acts.clone()
+        }
+
+        /// (update views, readings) read so far.
+        fn reads(&self) -> (usize, usize) {
+            self.state().reads
+        }
+    }
+
+    impl SystemControl for FakeSystem {
+        fn rejoin(&self) -> Result<(), RejoinWait> {
+            let mut state = self.state();
+            state.acts.push("rejoin");
+            state.rejoin
+        }
+
+        fn restart(&self) -> Result<(), RestartRefused> {
+            let mut state = self.state();
+            state.acts.push("restart");
+            state.restart
+        }
+
+        fn update_view(&self) -> update::View {
+            let mut state = self.state();
+            state.reads.0 += 1;
+            state.update.clone()
+        }
+
+        fn readings(&self) -> Readings {
+            let mut state = self.state();
+            state.reads.1 += 1;
+            state.readings
+        }
+    }
+
+    /// The update machinery of a board on slot A with nothing going on and nothing to say.
+    fn idle_update() -> update::View {
+        update::View {
+            slot: Some(CardSlot::A),
+            boot_files: None,
+            state: "idle",
+            received: 0,
+            length: 0,
+            trial: None,
+            last: None,
+        }
+    }
+
+    /// An update being received on a board that runs slot A: `received` of `length` bytes.
+    fn receiving_update(received: u64, length: u64) -> update::View {
+        update::View {
+            state: "receiving",
+            received,
+            length,
+            ..idle_update()
+        }
+    }
+
+    /// The trial of a build on slot B, which a rollback would leave for slot A, with `min_left` seconds to its
+    /// minimum time and these things still waited for.
+    fn trial_update(min_left: u64, waiting_for: Vec<update::Waiting>) -> update::View {
+        update::View {
+            slot: Some(CardSlot::B),
+            state: "trial",
+            trial: Some(update::TrialView {
+                build: 1_794_480_000,
+                from: CardSlot::A,
+                secs: 10,
+                min_left_secs: min_left,
+                waiting_for,
+            }),
+            ..idle_update()
+        }
+    }
+
+    /// A board on `slot` whose last trial ended this way.
+    fn ended_update(slot: CardSlot, kind: update::OutcomeKind) -> update::View {
+        let build = 1_794_480_000;
+        update::View {
+            slot: Some(slot),
+            last: Some(match kind {
+                update::OutcomeKind::Confirmed => update::Outcome::confirmed(build),
+                update::OutcomeKind::RolledBack => update::Outcome::rolled_back(build, "no clock"),
+            }),
+            ..idle_update()
+        }
+    }
+
+    /// A source whose snapshot a test changes while the panel runs.
+    #[derive(Clone)]
+    struct Scripted(Arc<Mutex<Snapshot>>);
+
+    impl Scripted {
+        fn new(snapshot: Snapshot) -> Self {
+            Self(Arc::new(Mutex::new(snapshot)))
+        }
+
+        fn set(&self, change: impl FnOnce(&mut Snapshot)) {
+            change(&mut self.0.lock().unwrap());
+        }
+    }
+
+    impl Source for Scripted {
+        fn snapshot(&self) -> Snapshot {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn recent(&self, _n: usize) -> Vec<LogEntry> {
+            Vec::new()
+        }
+    }
+
     /// A panel with every hand a test reaches it by: what it is shown, what its key controls, the feed
-    /// of names, the devices and the alerts.
+    /// of names, the devices, the alerts and the owner's names.
     struct Rig {
         panel: Panel<Recorder>,
         frames: Frames,
@@ -1607,6 +2574,11 @@ mod tests {
         lane: Arc<LaneFeed>,
         devices: FakeDevices,
         alerts: FakeAlerts,
+        names: FakeNames,
+        system: FakeSystem,
+        /// The real lock and night hours, on a clock the test moves (`clock`, in seconds).
+        lock: Arc<PanelState>,
+        clock: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl Rig {
@@ -1617,23 +2589,46 @@ mod tests {
             rig
         }
 
-        /// A rig whose panel is at HOME, where a boot begins, with the house for its devices.
+        /// A rig whose panel is at HOME with the house for its devices, without the boot's beginning.
         fn home(source: Arc<dyn Source>) -> Self {
+            Self::built(source, false)
+        }
+
+        /// A rig whose panel comes up as the board's does, with STARTING first (`Panel::boot`).
+        fn booting(source: Arc<dyn Source>) -> Self {
+            Self::built(source, true)
+        }
+
+        fn built(source: Arc<dyn Source>, boot: bool) -> Self {
             let (surface, frames) = recorder();
             let (control, lane) = (FakeControl::default(), LaneFeed::new());
             let (devices, alerts) = (FakeDevices::with(house()), FakeAlerts::default());
-            let panel = Panel::new(
-                surface,
-                Deps {
-                    source,
-                    control: Arc::new(control.clone()),
-                    calibration: Calibration::NOMINAL,
-                    calibrate: false,
-                    lane: lane.clone(),
-                    alerts: Arc::new(alerts.clone()),
-                    devices: Arc::new(devices.clone()),
-                },
-            );
+            let names = FakeNames::with_day();
+            let system = FakeSystem::default();
+            let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+            let lock = Arc::new(PanelState::new(None, None, {
+                let clock = clock.clone();
+                Arc::new(move || clock.load(std::sync::atomic::Ordering::Relaxed))
+            }));
+            let deps = Deps {
+                source,
+                control: Arc::new(control.clone()),
+                calibration: Calibration::NOMINAL,
+                calibrate: false,
+                lane: lane.clone(),
+                alerts: Arc::new(alerts.clone()),
+                devices: Arc::new(devices.clone()),
+                names: Arc::new(names.clone()),
+                system: Arc::new(system.clone()),
+                lock: lock.clone(),
+            };
+            let mut panel = if boot {
+                Panel::boot(surface, deps)
+            } else {
+                Panel::new(surface, deps)
+            };
+            // The board's uptime when the panel began is the host's, which no test can know: say it is none.
+            panel.boot_ms = 0;
             // What the new panel did to the watch is the tests' own (`a_new_panel_lets_go_...`).
             devices.state().watches.clear();
             Self {
@@ -1643,6 +2638,10 @@ mod tests {
                 lane,
                 devices,
                 alerts,
+                names,
+                system,
+                lock,
+                clock,
             }
         }
 
@@ -2187,8 +3186,8 @@ mod tests {
         let (mut panel, frames, control) = panel();
         panel.turn(0, UNIX).unwrap();
         panel.touch(&tap(1_000, 30, ON_SWITCH));
-        // Away from the key a tap does nothing.
-        panel.touch(&tap(2_000, 200, ELSEWHERE));
+        // Away from the key a tap does nothing: the Drain's lane of names is no door (the field is NAMES').
+        panel.touch(&tap_on(2_000, 300, 40));
         panel.turn(2_500, UNIX).unwrap();
         assert!(control.calls().is_empty());
         assert_eq!(frames.count(), 1);
@@ -2309,6 +3308,7 @@ mod tests {
             signal_dbm: Some(-63),
             ap: None,
             freq_mhz: None,
+            joined_secs: None,
         }
     }
 
@@ -2841,6 +3841,7 @@ mod tests {
     const HOME_DEVICES: (u16, u16) = (237, 130);
     const HOME_ALERTS: (u16, u16) = (394, 130);
     const HOME_GATE: (u16, u16) = (80, 246);
+    const HOME_NAMES: (u16, u16) = (237, 246);
     const LANE_HOME: (u16, u16) = (50, 30);
     /// The first place of the wall of devices, and the third.
     const WALL_FIRST: (u16, u16) = (63, 115);
@@ -2856,10 +3857,17 @@ mod tests {
         (rig.panel.nav.root(), rig.panel.nav.top())
     }
 
-    /// Taps through the screens until every kind of intent of the first phase has been carried out: the
-    /// gate opened and shut, a device's ads blocked, let through, and an edit that is refused, a device's
-    /// own gate opened and shut, an alert dismissed. The rig is at HOME with `house()`, one alert, and the
-    /// panel's thread at `*now`.
+    /// The first pipe of NAMES and of YOUR LIST, the second, and NAMES' door to YOUR LIST.
+    const PIPE_FIRST: (u16, u16) = (100, 150);
+    const PIPE_SECOND: (u16, u16) = (100, 200);
+    const LIST_DOOR: (u16, u16) = (300, 100);
+    /// The name line of an alert's slip, which opens NAME for a threat.
+    const SLIP_NAME: (u16, u16) = (200, 190);
+
+    /// Taps through the screens until every kind of intent has been carried out: the gate opened and shut,
+    /// a device's ads blocked, let through, and an edit that is refused, a device's own gate opened and shut,
+    /// an alert dismissed, a name allowed, refused and both taken back. An alert arrives on the way, from the
+    /// device's screen. The rig is at HOME with `house()`, the day's names, and the panel's thread at `*now`.
     fn walk_through_every_intent(rig: &mut Rig, now: &mut u64) {
         let desk = hw(12);
         let until = *now + 300;
@@ -2948,14 +3956,101 @@ mod tests {
         let until = *now + FRAME_MS;
         rig.drive(now, until);
 
-        // An alert: from HOME, its screen, and its dismissal.
+        // An alert comes while the desk's screen shows: its slip opens by itself over whatever shows, and its
+        // device, which the wall holds, is what SEE DEVICE opens (over the slip).
+        let sam = Ipv4Addr::new(192, 0, 2, 23);
+        rig.alerts.raise(threat_alert(7));
+        let until = *now + 1_300;
+        rig.drive(now, until);
+        assert_eq!(at_screen(rig), (Section::Alerts, Some(&Opened::Alert(7))));
+        assert_eq!(
+            rig.panel.world.top_alert().and_then(|row| row.device),
+            Some(hw(23))
+        );
+        rig.tap_at(now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(
+            at_screen(rig),
+            (Section::Alerts, Some(&Opened::Device(hw(23))))
+        );
+        assert_eq!(
+            rig.devices.state().watching,
+            Some(sam),
+            "its names are watched"
+        );
         rig.tap_at(now, LANE_HOME.0, LANE_HOME.1);
         assert_eq!(at_screen(rig), (Section::Home, None));
+        // The alert waits: HOME's tile opens the log and its entry the slip, whose name line opens NAME. A
+        // threat has no key to allow it. DISMISS acks the alert and goes back to the log.
         rig.tap_at(now, HOME_ALERTS.0, HOME_ALERTS.1);
+        assert_eq!(at_screen(rig), (Section::Alerts, None), "the log");
+        rig.tap_at(now, LOG_NEWEST.0, LOG_NEWEST.1);
+        assert_eq!(at_screen(rig), (Section::Alerts, Some(&Opened::Alert(7))));
+        rig.tap_at(now, SLIP_NAME.0, SLIP_NAME.1);
+        let threat = Opened::Name("secure-login-verify.example".to_owned());
+        assert_eq!(at_screen(rig), (Section::Alerts, Some(&threat)));
+        rig.tap_at(now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(
+            at_screen(rig),
+            (Section::Alerts, Some(&threat)),
+            "never allowed"
+        );
+        rig.tap_at(now, FLOOR_LEFT.0, FLOOR_LEFT.1);
         assert_eq!(at_screen(rig), (Section::Alerts, Some(&Opened::Alert(7))));
         rig.tap_at(now, FLOOR_LEFT.0, FLOOR_LEFT.1);
+        assert_eq!(
+            at_screen(rig),
+            (Section::Alerts, None),
+            "DISMISS goes back to the log"
+        );
+        rig.tap_at(now, LANE_HOME.0, LANE_HOME.1);
         assert_eq!(at_screen(rig), (Section::Home, None));
         assert_eq!(rig.alerts.acks(), [7]);
+        assert!(rig.names.edits().is_empty());
+
+        // NAMES: the day's most refused. ALLOW NAME on the first; REFUSE NAME on the second, which no list
+        // holds; then YOUR LIST takes both back, the newest first.
+        rig.names
+            .state()
+            .lists
+            .retain(|(name, _)| name != "tracker.example.com");
+        rig.tap_at(now, HOME_NAMES.0, HOME_NAMES.1);
+        assert_eq!(at_screen(rig), (Section::Names, None));
+        rig.tap_at(now, PIPE_FIRST.0, PIPE_FIRST.1);
+        assert_eq!(
+            at_screen(rig),
+            (
+                Section::Names,
+                Some(&Opened::Name("ads.example.net".to_owned()))
+            )
+        );
+        rig.tap_at(now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.names.edits(), ["allow ads.example.net"]);
+        assert_eq!(at_screen(rig), (Section::Names, None));
+        rig.tap_at(now, PIPE_SECOND.0, PIPE_SECOND.1);
+        rig.tap_at(now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(
+            rig.names.edits(),
+            ["allow ads.example.net", "refuse tracker.example.com"]
+        );
+        // What was edited is read at once: the valve of the first pipe is open now.
+        assert!(rig.panel.world.top_names[0].open);
+        assert!(!rig.panel.world.top_names[1].open);
+        rig.tap_at(now, LIST_DOOR.0, LIST_DOOR.1);
+        assert_eq!(at_screen(rig), (Section::Names, Some(&Opened::Yours)));
+        assert_eq!(rig.panel.world.owner_total, 2);
+        rig.tap_at(now, PIPE_FIRST.0, PIPE_FIRST.1);
+        rig.tap_at(now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(
+            rig.names.edits().last().unwrap(),
+            "forget tracker.example.com"
+        );
+        assert_eq!(at_screen(rig), (Section::Names, Some(&Opened::Yours)));
+        rig.tap_at(now, PIPE_FIRST.0, PIPE_FIRST.1);
+        rig.tap_at(now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.names.edits().last().unwrap(), "forget ads.example.net");
+        assert_eq!(rig.panel.world.owner_total, 0);
+        rig.tap_at(now, LANE_HOME.0, LANE_HOME.1);
+        assert_eq!(at_screen(rig), (Section::Home, None));
 
         // An edit that the inventory refuses, because the device is gone from it between the panel's last
         // look and the tap: nothing changes, and the panel says so without saying whom.
@@ -2981,6 +4076,8 @@ mod tests {
     /// HOME's LIVE tile, and the lane's words between `HOME` and the clock.
     const HOME_LIVE: (u16, u16) = (80, 130);
     const LANE_WORDS: (u16, u16) = (200, 30);
+    /// The log's newest entry, which it prints last, at the bottom.
+    const LOG_NEWEST: (u16, u16) = (200, 240);
 
     /// The frame that `screens` paints for where the panel is and what its world holds.
     fn painted(panel: &Panel<Recorder>) -> Vec<u8> {
@@ -3024,7 +4121,10 @@ mod tests {
         assert_eq!(world.uptime_days, Some(0));
         assert_eq!(world.newcomer, Newcomer::Blocked);
         assert_eq!(world.blocking, None);
-        assert_eq!((world.alerts_waiting, world.top_alert.is_none()), (0, true));
+        assert_eq!(
+            (world.alerts_waiting, world.top_alert().is_none()),
+            (0, true)
+        );
         // The wall is the labelled devices in their order, then the others, then the router.
         let names: Vec<&str> = world.devices.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(
@@ -3126,15 +4226,32 @@ mod tests {
         );
         assert_eq!((after.1, after.2), (before.1, before.2));
 
-        // ALERT, GATE and SYSTEM read no device at all.
+        // ALERTS and an ALERT name their devices: the inventory every two seconds, never who asked and never a
+        // device's names. An alert that arrives opens its slip.
         rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
         rig.alerts.raise(threat_alert(3));
         rig.run_for(&mut now, 1_500);
-        rig.tap_at(&mut now, HOME_ALERTS.0, HOME_ALERTS.1);
         assert!(matches!(at_screen(&rig).1, Some(Opened::Alert(3))));
         let before = rig.devices.reads();
+        rig.run_for(&mut now, 10_000);
+        let after = rig.devices.reads();
+        assert!(
+            (5..=6).contains(&(after.0 - before.0)),
+            "{before:?} {after:?}"
+        );
+        assert_eq!((after.1, after.2), (before.1, before.2));
+        // DISMISS goes back to the log: the same.
+        rig.tap_at(&mut now, FLOOR_LEFT.0, FLOOR_LEFT.1);
+        assert_eq!(at_screen(&rig), (Section::Alerts, None));
+        let before = rig.devices.reads();
         rig.run_for(&mut now, 6_000);
-        assert_eq!(rig.devices.reads(), before);
+        let after = rig.devices.reads();
+        assert!(
+            (3..=4).contains(&(after.0 - before.0)),
+            "{before:?} {after:?}"
+        );
+        assert_eq!((after.1, after.2), (before.1, before.2));
+        // GATE and SYSTEM read no device at all.
         rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
         rig.tap_at(&mut now, HOME_GATE.0, HOME_GATE.1);
         assert_eq!(rig.panel.nav.root(), Section::Gate);
@@ -3147,6 +4264,172 @@ mod tests {
         let before = rig.devices.reads();
         rig.run_for(&mut now, 6_000);
         assert_eq!(rig.devices.reads(), before);
+        assert_eq!(rig.names.reads(), 0, "no screen of these reads a name");
+    }
+
+    #[test]
+    fn the_names_are_read_only_while_their_screens_show_and_every_five_seconds() {
+        let mut rig = Rig::home(Arc::new(Fixed(reference_snapshot())));
+        let mut now = 0;
+        // HOME, LIVE, the wall, the log and SYSTEM read no name at all.
+        rig.drive(&mut now, 300);
+        for door in [HOME_DEVICES, HOME_ALERTS] {
+            rig.tap_at(&mut now, door.0, door.1);
+            rig.run_for(&mut now, 3_000);
+            rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
+        }
+        rig.tap_at(&mut now, 80, 130);
+        assert_eq!(rig.panel.nav.root(), Section::Live);
+        rig.run_for(&mut now, 3_000);
+        rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
+        assert_eq!(rig.names.reads(), 0);
+        assert!(rig.panel.world.top_names.is_empty());
+
+        // NAMES: read at once, then every five seconds; the pipes and the list's length are the world's.
+        let tops = |rig: &Rig| rig.names.state().reads[0];
+        rig.tap_at(&mut now, HOME_NAMES.0, HOME_NAMES.1);
+        assert_eq!(at_screen(&rig), (Section::Names, None));
+        assert_eq!(tops(&rig), 1, "read at once on arriving");
+        let names: Vec<(&str, u32)> = rig
+            .panel
+            .world
+            .top_names
+            .iter()
+            .map(|row| (row.name.as_str(), row.count))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("ads.example.net", 1_204),
+                ("tracker.example.com", 612),
+                ("metrics.example.org", 31)
+            ]
+        );
+        assert_eq!(rig.panel.world.owner_total, 0);
+        let from = now;
+        rig.drive(&mut now, from + 10_000 - 1);
+        assert_eq!(tops(&rig), 3, "two more in ten seconds");
+        // The facts of a name are read for NAME alone: the lists and the owner's entry, at once.
+        assert_eq!(rig.names.state().reads[4], 0);
+        rig.tap_at(&mut now, PIPE_FIRST.0, PIPE_FIRST.1);
+        assert_eq!(rig.names.state().reads[4], 1);
+        let facts = rig.panel.world.name_facts.clone().unwrap();
+        assert_eq!(facts.name, "ads.example.net");
+        assert_eq!(
+            (facts.class, facts.owner, facts.count),
+            (qb_panel::os::world::NameClass::Ads, None, Some(1_204))
+        );
+        // Back to NAMES: the name's facts are gone from the world; YOUR LIST reads nothing extra at once.
+        rig.tap_at(&mut now, FLOOR_LEFT.0, FLOOR_LEFT.1);
+        assert_eq!(at_screen(&rig), (Section::Names, None));
+        assert!(rig.panel.world.name_facts.is_none());
+        let reads = rig.names.reads();
+        rig.tap_at(&mut now, LIST_DOOR.0, LIST_DOOR.1);
+        assert_eq!(at_screen(&rig), (Section::Names, Some(&Opened::Yours)));
+        assert_eq!(rig.names.reads(), reads, "the same screens' read serves");
+        // HOME: reads stop, and what was read goes.
+        rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
+        let reads = rig.names.reads();
+        rig.run_for(&mut now, 12_000);
+        assert_eq!(rig.names.reads(), reads);
+        assert!(rig.panel.world.top_names.is_empty());
+        assert_eq!(rig.panel.world.owner_total, 0);
+    }
+
+    #[test]
+    fn the_idle_log_has_when_the_last_entry_was_filed_and_when_the_watch_opened() {
+        let word = |moment: Option<Moment>| moment.map(Moment::word);
+        let mut rig = Rig::home(Arc::new(Fixed(reference_snapshot())));
+        // The board had been up an hour when the panel began.
+        rig.panel.boot_ms = 3_600_000;
+        let mut now = 0;
+        rig.drive(&mut now, 300);
+        assert_eq!(
+            word(rig.panel.world.last_entry),
+            None,
+            "none was ever filed"
+        );
+        assert_eq!(
+            word(rig.panel.world.watch_opened).as_deref(),
+            Some("FRI 09:20"),
+            "the clock less the uptime"
+        );
+        // An alert that was filed and dismissed is still the last entry: when it last happened.
+        rig.alerts.raise(threat_alert(7));
+        rig.alerts.api_ack(7);
+        let until = now + 1_300;
+        rig.drive(&mut now, until);
+        assert_eq!(
+            word(rig.panel.world.last_entry).as_deref(),
+            Some("FRI 10:19")
+        );
+        // The opening is taken once: the clock running on (or being stepped) does not move it.
+        rig.panel.turn(now + 5_000, UNIX + 3_600).unwrap();
+        assert_eq!(
+            word(rig.panel.world.watch_opened).as_deref(),
+            Some("FRI 09:20")
+        );
+        // The local day and hour are the zone's: an hour behind UTC the opening is 08:20.
+        let mut zoned = Rig::home(Arc::new(Fixed(Snapshot {
+            utc_offset_secs: -3_600,
+            ..reference_snapshot()
+        })));
+        zoned.panel.boot_ms = 3_600_000;
+        let mut at = 0;
+        zoned.drive(&mut at, 300);
+        assert_eq!(
+            word(zoned.panel.world.watch_opened).as_deref(),
+            Some("FRI 08:20")
+        );
+        // With the clock not set the watch has no opening, and nothing is made up.
+        let mut rig = Rig::home(Arc::new(Nothing));
+        let mut now = 0;
+        rig.drive(&mut now, 300);
+        assert_eq!(rig.panel.world.watch_opened, None);
+    }
+
+    #[test]
+    fn the_logs_cursor_blinks_four_frames_on_and_four_off_and_is_the_only_thing_written() {
+        let mut rig = Rig::home(Arc::new(Fixed(reference_snapshot())));
+        let mut now = 0;
+        rig.drive(&mut now, 300);
+        assert!(!rig.panel.world.cursor_on, "HOME has no cursor");
+        rig.tap_at(&mut now, HOME_ALERTS.0, HOME_ALERTS.1);
+        assert_eq!(at_screen(&rig), (Section::Alerts, None));
+        let mut states = Vec::new();
+        for _ in 0..40 {
+            rig.turn(now);
+            states.push(rig.panel.world.cursor_on);
+            now += FRAME_MS;
+        }
+        // Runs of four, whichever the first one is (the counter was running before the log came).
+        let mut runs: Vec<usize> = Vec::new();
+        for (n, state) in states.iter().enumerate() {
+            if n > 0 && states[n - 1] == *state {
+                *runs.last_mut().unwrap() += 1;
+            } else {
+                runs.push(1);
+            }
+        }
+        assert!(
+            runs[1..runs.len() - 1].iter().all(|&run| run == 4),
+            "{states:?}"
+        );
+        // At rest nothing else moves: every write is the cursor's few rows, one every four frames.
+        let writes = rig.run_for(&mut now, 20_000);
+        assert!(
+            writes
+                .iter()
+                .all(|write| write.rows.is_some_and(|rows| rows <= 20)),
+            "{writes:?}"
+        );
+        assert!((38..=42).contains(&writes.len()), "{} writes", writes.len());
+        // Leaving the log takes the cursor with it, and no other screen has one.
+        rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
+        let until = now + 2_000;
+        let after = rig.drive(&mut now, until);
+        assert!(!rig.panel.world.cursor_on);
+        assert!(after.is_empty(), "{after:?}");
     }
 
     #[test]
@@ -3525,89 +4808,136 @@ mod tests {
     }
 
     #[test]
-    fn an_alert_lights_home_and_its_tile_and_the_lanes_words_open_it_and_dismiss_acks_it() {
+    fn a_new_alert_opens_its_slip_by_itself_waits_once_left_and_dismiss_acks_it() {
         let mut rig = Rig::home(Arc::new(Fixed(reference_snapshot())));
         let mut now = 0;
         rig.drive(&mut now, 300);
-        // With none waiting the tile is inert.
+        // With none waiting the tile opens the log, which says so.
         rig.tap_at(&mut now, HOME_ALERTS.0, HOME_ALERTS.1);
-        assert_eq!(at_screen(&rig), (Section::Home, None));
+        assert_eq!(at_screen(&rig), (Section::Alerts, None));
         assert_eq!(rig.panel.world.alerts_waiting, 0);
+        rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
+        assert_eq!(at_screen(&rig), (Section::Home, None));
 
+        // Two come in one second: the high one opens, and the newer, lesser one waits in the log.
         rig.alerts.raise(threat_alert(7));
         rig.alerts.raise(PanelAlert {
             severity: Severity::Info,
             ..threat_alert(8)
         });
         let until = now + 1_300;
-        let writes = rig.drive(&mut now, until);
-        // Both wait; the high one is the one to open; the tile and the lane say so, with no screen of its own.
-        assert_eq!(rig.panel.world.alerts_waiting, 2);
-        assert_eq!(
-            rig.panel.world.top_alert.as_ref().map(|alert| alert.id),
-            Some(7)
-        );
-        assert!(rig.panel.world.alert_newest.is_some());
-        assert_eq!(at_screen(&rig), (Section::Home, None));
-        // The tile that turned white and the lane's words are written in bands, none of them over 80 rows.
-        assert!(!writes.is_empty());
-        assert!(
-            writes
-                .iter()
-                .all(|write| write.rows.is_none_or(|rows| rows <= 80)),
-            "{writes:?}"
-        );
-        assert!(rig.frames.last() == painted(&rig.panel));
-
-        // The lane's words open it too.
-        rig.tap_at(&mut now, LANE_WORDS.0, LANE_WORDS.1);
+        rig.drive(&mut now, until);
         assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(7))));
-        let row = rig.panel.world.top_alert.clone().unwrap();
+        let world = &rig.panel.world;
+        assert_eq!(world.alerts_waiting, 2);
+        let ids: Vec<u64> = world.alerts.iter().map(|row| row.id).collect();
+        assert_eq!(ids, [8, 7], "the log holds the newest first");
+        assert!(world.alert_newest.is_some());
+        // The slip is made of what the store carries and what the wall names.
+        let row = world.alert(7).cloned().unwrap();
         assert_eq!(row.title, "THREAT BLOCKED");
         assert_eq!(row.lines[0], "secure-login-verify.example");
-        // Sam's phone is on the wall that HOME read: its name, not its address.
         assert_eq!(row.lines[1], "Sam's phone asked 3 times by 10:19");
-        assert!(rig.frames.last() == painted(&rig.panel));
-        // Dismissed: acked in the store, back at HOME, and the other waits.
-        rig.tap_at(&mut now, FLOOR_LEFT.0, FLOOR_LEFT.1);
-        assert_eq!(rig.alerts.acks(), [7]);
-        assert_eq!(at_screen(&rig), (Section::Home, None));
-        assert_eq!(rig.panel.world.alerts_waiting, 1);
+        assert!(row.high);
         assert_eq!(
-            rig.panel.world.top_alert.as_ref().map(|alert| alert.id),
-            Some(8)
+            (row.stamp, row.who.as_str(), row.device),
+            (AlertStamp::Refused, "Sam's phone", Some(hw(23)))
         );
+        assert_eq!(row.name.as_deref(), Some("secure-login-verify.example"));
+        assert_eq!(row.at.map(When::word).as_deref(), Some("10:19"));
+        assert!(rig.frames.last() == painted(&rig.panel));
+        // It is shown once: going back leaves both waiting, with the tile and the lane to say so.
+        rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
+        let until = now + 2_000;
+        rig.drive(&mut now, until);
+        assert_eq!(at_screen(&rig), (Section::Home, None));
+        assert_eq!(rig.panel.world.alerts_waiting, 2);
+        assert_eq!(rig.panel.world.top_alert().map(|alert| alert.id), Some(8));
+
+        // The lane's words open the log, and the newest entry, which it prints last, the slip.
+        rig.tap_at(&mut now, LANE_WORDS.0, LANE_WORDS.1);
+        assert_eq!(at_screen(&rig), (Section::Alerts, None));
+        rig.tap_at(&mut now, LOG_NEWEST.0, LOG_NEWEST.1);
+        assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(8))));
+        // Dismissed: acked in the store, back at the log, which is of what waits now.
+        rig.tap_at(&mut now, FLOOR_LEFT.0, FLOOR_LEFT.1);
+        assert_eq!(rig.alerts.acks(), [8]);
+        assert_eq!(at_screen(&rig), (Section::Alerts, None));
+        assert_eq!(rig.panel.world.alerts_waiting, 1);
+        assert_eq!(rig.panel.world.top_alert().map(|alert| alert.id), Some(7));
+        assert!(rig.frames.last() == painted(&rig.panel));
     }
 
     #[test]
-    fn the_alert_screen_goes_home_when_its_alert_is_no_longer_waiting_or_is_not_the_top() {
+    fn an_alert_screen_goes_back_to_the_log_when_the_desktop_acks_its_alert_and_a_newer_one_opens_over_it()
+     {
         let mut rig = Rig::home(Arc::new(Fixed(reference_snapshot())));
-        rig.alerts.raise(threat_alert(7));
         let mut now = 0;
+        rig.alerts.raise(threat_alert(7));
         rig.drive(&mut now, 1_300);
-        rig.tap_at(&mut now, HOME_ALERTS.0, HOME_ALERTS.1);
         assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(7))));
-        // The desktop acked it: within a second the screen is gone.
+        // The desktop acked it: within a second the screen is gone, and the log is where the panel is.
         rig.alerts.api_ack(7);
         let until = now + 1_300;
         rig.drive(&mut now, until);
-        assert_eq!(at_screen(&rig), (Section::Home, None));
+        assert_eq!(at_screen(&rig), (Section::Alerts, None));
         assert_eq!(rig.panel.world.alerts_waiting, 0);
         assert!(rig.frames.last() == painted(&rig.panel));
         assert!(rig.alerts.acks().is_empty(), "the panel acked nothing");
 
-        // A newer high alert comes while one is open: the world holds only the top, and the screen
-        // that was about the other goes HOME, where the tile says there is one waiting.
+        // A newer alert comes while a slip is open: it is a new one, and its slip opens.
         rig.alerts.raise(threat_alert(9));
         let until = now + 1_300;
         rig.drive(&mut now, until);
-        rig.tap_at(&mut now, HOME_ALERTS.0, HOME_ALERTS.1);
         assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(9))));
         rig.alerts.raise(threat_alert(10));
         let until = now + 1_300;
         rig.drive(&mut now, until);
-        assert_eq!(at_screen(&rig), (Section::Home, None));
+        assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(10))));
         assert_eq!(rig.panel.world.alerts_waiting, 2);
+        // The one that was opened is acked on the desktop: back at the log, with the other one in it.
+        rig.alerts.api_ack(10);
+        let until = now + 1_300;
+        rig.drive(&mut now, until);
+        assert_eq!(at_screen(&rig), (Section::Alerts, None));
+        let ids: Vec<u64> = rig.panel.world.alerts.iter().map(|row| row.id).collect();
+        assert_eq!(ids, [9]);
+        assert!(rig.alerts.acks().is_empty());
+    }
+
+    #[test]
+    fn an_alert_that_arrives_opens_its_slip_from_every_screen_but_not_over_a_state_of_the_whole_system()
+     {
+        // From LIVE, HOME, the wall and NAMES alike; the minute without a touch starts over.
+        let mut rig = Rig::new(Arc::new(Fixed(reference_snapshot())));
+        let mut now = 0;
+        rig.drive(&mut now, 300);
+        assert_eq!(rig.panel.nav.root(), Section::Live);
+        rig.alerts.raise(threat_alert(3));
+        let until = now + 1_300;
+        rig.drive(&mut now, until);
+        assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(3))));
+        // It was drawn whole, with its device named from the wall, which LIVE had not read.
+        assert_eq!(rig.panel.world.alert(3).unwrap().who, "Sam's phone");
+        assert!(rig.frames.last() == painted(&rig.panel));
+        rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
+        rig.tap_at(&mut now, HOME_NAMES.0, HOME_NAMES.1);
+        assert_eq!(at_screen(&rig), (Section::Names, None));
+        rig.alerts.raise(threat_alert(4));
+        let until = now + 1_300;
+        rig.drive(&mut now, until);
+        assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(4))));
+        // Not over the PIN pad, a state of the whole system: the alert is new when it ends.
+        rig.panel.nav.set_whole(Some(Whole::Pin));
+        rig.alerts.raise(threat_alert(5));
+        let until = now + 1_300;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        assert_eq!(rig.panel.nav.top(), Some(&Opened::Alert(4)));
+        rig.panel.nav.set_whole(None);
+        let until = now + 1_300;
+        rig.drive(&mut now, until);
+        assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(5))));
     }
 
     #[test]
@@ -3759,6 +5089,893 @@ mod tests {
         assert!(!rig.panel.world.any_asking());
     }
 
+    // ------------------------------------------------------------------------------------------ phase 3
+
+    /// The PIN the tests set, and a wrong one.
+    const PIN: [u8; 4] = [2, 4, 6, 8];
+    const WRONG_PIN: [u8; 4] = [1, 3, 5, 7];
+
+    /// The hash of `digits` as `cargo xtask hash-pin` makes it: the four ASCII digits, 10,000 rounds.
+    fn pin_hash(digits: [u8; 4]) -> crate::api::password::PasswordHash {
+        crate::api::password::PasswordHash::with_rounds(
+            &digits.map(|digit| b'0' + digit),
+            [5; 16],
+            crate::api::password::PIN_ROUNDS,
+        )
+    }
+
+    /// The middle of the PIN pad's key for `digit`.
+    fn pad_digit(digit: u8) -> (u16, u16) {
+        let index = if digit == 0 {
+            10
+        } else {
+            usize::from(digit) - 1
+        };
+        let key = qb_panel::os::screens::whole::pad_rect(index);
+        (key.x + key.w / 2, key.y + key.h / 2)
+    }
+
+    /// A Wi-Fi link that is joined, on 5 GHz at -54 dBm, up since the monotonic second `joined`.
+    fn linked(joined: u64) -> Option<WifiStatus> {
+        Some(WifiStatus {
+            associated: true,
+            signal_dbm: Some(-54),
+            ap: None,
+            freq_mhz: Some(5_180),
+            joined_secs: Some(joined),
+        })
+    }
+
+    /// Everything STARTING waits for, known: the link, the clock, 212K names and a query answered.
+    fn started() -> Snapshot {
+        Snapshot {
+            wifi: linked(0),
+            list_names: Some(212_000),
+            ..reference_snapshot()
+        }
+    }
+
+    impl Rig {
+        /// Turns the lock on with `PIN`, as the configuration's `pin_hash` does.
+        fn set_pin(&self) {
+            self.lock
+                .lock()
+                .set_hash(Some(pin_hash(PIN)), PinSource::Config);
+        }
+
+        /// Types four digits on the pad, a tap each.
+        fn type_pin(&mut self, now: &mut u64, digits: [u8; 4]) {
+            for digit in digits {
+                let (x, y) = pad_digit(digit);
+                self.tap_at(now, x, y);
+            }
+        }
+
+        /// Lets `secs` seconds pass on the lock's clock.
+        fn lock_clock_ahead(&self, secs: u64) {
+            self.clock
+                .fetch_add(secs, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        /// Puts the panel on SYSTEM with `screen` opened over it.
+        fn on_system(&mut self, screen: Opened) {
+            self.panel.nav.go(Section::System);
+            self.panel.nav.open(screen);
+        }
+    }
+
+    #[test]
+    fn a_boot_runs_starting_ticking_its_lines_and_goes_home_three_seconds_after_the_last() {
+        use qb_panel::os::screens::whole::{StartingView, Step};
+
+        let source = Scripted::new(Snapshot::default());
+        let mut rig = Rig::booting(Arc::new(source.clone()));
+        let mut now = 0;
+        rig.turn(0);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+        assert_eq!(rig.frames.count(), 1);
+        assert!(rig.frames.last() == painted(&rig.panel));
+        let steps = |rig: &Rig| StartingView::of(&rig.panel.world).steps;
+        // The panel is on; the Wi-Fi is what it waits for.
+        assert_eq!(
+            steps(&rig),
+            [
+                Step::Done,
+                Step::Now,
+                Step::Waiting,
+                Step::Waiting,
+                Step::Waiting
+            ]
+        );
+        // A tap is no key of STARTING's.
+        rig.tap_at(&mut now, HOME_DEVICES.0, HOME_DEVICES.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+
+        source.set(|snapshot| snapshot.wifi = linked(0));
+        rig.drive(&mut now, 5_000);
+        assert_eq!(
+            steps(&rig),
+            [
+                Step::Done,
+                Step::Done,
+                Step::Now,
+                Step::Waiting,
+                Step::Waiting
+            ]
+        );
+        // The clock and the lists are in, and DNS has not answered yet.
+        source.set(|snapshot| {
+            snapshot.clock_set = true;
+            snapshot.list_names = Some(212_000);
+        });
+        rig.drive(&mut now, 8_000);
+        assert_eq!(
+            steps(&rig),
+            [Step::Done, Step::Done, Step::Done, Step::Done, Step::Now]
+        );
+        // The slot is filled and a query was answered: all five are done at 10 s, and HOME comes 3 s later.
+        rig.drive(&mut now, 9_875);
+        assert_eq!(now, 10_000);
+        source.set(|snapshot| *snapshot = started());
+        rig.drive(&mut now, 12_875);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+        assert_eq!(steps(&rig), [Step::Done; 5]);
+        let writes = rig.drive(&mut now, 13_125);
+        assert!(rig.panel.nav.is_home());
+        // The change is one write of the whole screen, at the frame 3 s after the last line, drawn from what HOME
+        // reads: the wall is there already.
+        assert_eq!(writes.iter().map(|w| w.at).collect::<Vec<_>>(), [13_000]);
+        assert_eq!(rig.panel.world.devices.len(), 6);
+        rig.drive(&mut now, 15_000);
+        assert!(rig.frames.last() == painted(&rig.panel));
+        // It stays at HOME.
+        rig.drive(&mut now, 40_000);
+        assert!(rig.panel.nav.is_home());
+    }
+
+    #[test]
+    fn a_quiet_boot_with_empty_lists_leaves_starting_without_the_cap() {
+        use qb_panel::os::screens::whole::{StartingView, Step};
+
+        // No list is configured and no client has asked anything yet: the lists hold no name, and no query was
+        // answered. The slot is filled, and an upstream has answered once.
+        let quiet = Snapshot {
+            wifi: linked(0),
+            clock_set: true,
+            list_names: Some(0),
+            upstream_ms: Some(12),
+            today: Some(qb_dns::Counts::default()),
+            ..Snapshot::default()
+        };
+        let mut rig = Rig::booting(Arc::new(Fixed(quiet.clone())));
+        let mut now = 0;
+        rig.drive(&mut now, 2_875);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+        assert_eq!(StartingView::of(&rig.panel.world).steps, [Step::Done; 5]);
+        // Done at the first frame, HOME 3 s later: nowhere near 90 s.
+        rig.drive(&mut now, 3_125);
+        assert!(rig.panel.nav.is_home());
+
+        // Without an answer from any upstream it is still waiting, and the 90 s are the cap.
+        let mut rig = Rig::booting(Arc::new(Fixed(Snapshot {
+            upstream_ms: None,
+            ..quiet.clone()
+        })));
+        let mut now = 0;
+        rig.drive(&mut now, 10_000);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+        assert_eq!(
+            StartingView::of(&rig.panel.world).steps,
+            [Step::Done, Step::Done, Step::Done, Step::Done, Step::Now]
+        );
+        // An upstream that answers ends it, with the lists still empty and no query asked.
+        let source = Scripted::new(Snapshot {
+            upstream_ms: None,
+            ..quiet
+        });
+        let mut rig = Rig::booting(Arc::new(source.clone()));
+        let mut now = 0;
+        rig.drive(&mut now, 20_000);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+        source.set(|snapshot| snapshot.upstream_ms = Some(9));
+        rig.drive(&mut now, 24_000);
+        assert!(rig.panel.nav.is_home());
+
+        // A slot that is not filled has no `today`: an upstream's answer is not DNS answering.
+        let mut rig = Rig::booting(Arc::new(Fixed(Snapshot {
+            today: None,
+            upstream_ms: Some(9),
+            wifi: linked(0),
+            clock_set: true,
+            list_names: Some(0),
+            ..Snapshot::default()
+        })));
+        let mut now = 0;
+        rig.drive(&mut now, 10_000);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+        assert!(!rig.panel.world.dns_answering);
+    }
+
+    #[test]
+    fn starting_ends_at_ninety_seconds_with_a_line_not_done() {
+        let mut rig = Rig::booting(Arc::new(Nothing));
+        let mut now = 0;
+        rig.drive(&mut now, 89_875);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+        rig.drive(&mut now, 90_125);
+        assert!(rig.panel.nav.is_home());
+        assert!(!rig.panel.world.dns_answering);
+    }
+
+    #[test]
+    fn a_panel_made_without_the_boot_begins_at_home() {
+        let mut rig = Rig::home(Arc::new(Nothing));
+        rig.turn(0);
+        assert!(rig.panel.nav.is_home());
+        assert!(rig.frames.last() == painted(&rig.panel));
+    }
+
+    #[test]
+    fn a_trial_boot_shows_the_trial_once_starting_is_done_and_the_confirm_once() {
+        let mut rig = Rig::booting(Arc::new(Fixed(started())));
+        let trial = |left| trial_update(left, vec![update::Waiting::Wifi, update::Waiting::Time]);
+        rig.system.set_update(trial(107));
+        let mut now = 0;
+        rig.drive(&mut now, 2_875);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Starting));
+        // STARTING is done at the frame 3 s in, and the trial is what comes after it, not HOME.
+        rig.drive(&mut now, 3_125);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Update));
+        let trial_read = |left_secs, waiting_for| UpdateRead {
+            phase: UpdatePhase::Trial {
+                left_secs,
+                waiting_for,
+            },
+            before: WorldSlot::A,
+            after: WorldSlot::B,
+        };
+        assert_eq!(
+            rig.panel.world.update,
+            Some(trial_read(107, Some(WorldWaiting::Wifi)))
+        );
+        assert!(rig.panel.world.update_busy);
+        assert!(rig.frames.last() == painted(&rig.panel));
+
+        // The countdown steps with the machinery's own view, and each step is a small write.
+        rig.system.set_update(trial(106));
+        let writes = rig.drive(&mut now, 4_875);
+        assert_eq!(
+            rig.panel.world.update,
+            Some(trial_read(106, Some(WorldWaiting::Wifi)))
+        );
+        assert!(!writes.is_empty());
+        assert!(
+            writes
+                .iter()
+                .all(|write| write.rows.is_some_and(|rows| rows <= BAND_ROWS_MAX)),
+            "{writes:?}"
+        );
+        // The minimum time is up and the trial waits for the clock: its word.
+        rig.system
+            .set_update(trial_update(0, vec![update::Waiting::Clock]));
+        rig.drive(&mut now, 6_000);
+        assert_eq!(
+            rig.panel.world.update,
+            Some(trial_read(0, Some(WorldWaiting::Clock)))
+        );
+
+        // The build confirms: the machinery is idle again and says so. It shows once; a tap goes HOME.
+        rig.system
+            .set_update(ended_update(CardSlot::B, update::OutcomeKind::Confirmed));
+        rig.drive(&mut now, 7_500);
+        let confirmed = UpdateRead {
+            phase: UpdatePhase::Confirmed,
+            before: WorldSlot::A,
+            after: WorldSlot::B,
+        };
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Update));
+        assert_eq!(rig.panel.world.update, Some(confirmed));
+        assert!(!rig.panel.world.update_busy);
+        assert_eq!(rig.panel.world.machine.last_update, LastUpdate::Confirmed);
+        rig.tap_at(&mut now, 240, 160);
+        assert!(rig.panel.nav.is_home());
+        rig.drive(&mut now, 120_000);
+        assert!(rig.panel.nav.is_home(), "it is not shown twice");
+        assert_eq!(rig.panel.world.update, None);
+    }
+
+    #[test]
+    fn a_finished_update_that_nobody_taps_goes_home_after_thirty_seconds() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        rig.system
+            .set_update(ended_update(CardSlot::A, update::OutcomeKind::RolledBack));
+        let mut now = 0;
+        rig.drive(&mut now, 2_000);
+        // A rollback: the slot that runs is the one the update left, and the right box is the one that failed.
+        assert_eq!(
+            rig.panel.world.update,
+            Some(UpdateRead {
+                phase: UpdatePhase::RolledBack,
+                before: WorldSlot::A,
+                after: WorldSlot::B,
+            })
+        );
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Update));
+        assert_eq!(rig.panel.world.machine.last_update, LastUpdate::RolledBack);
+        assert_eq!(
+            rig.panel.world.machine.last_restart,
+            "an update that rolled back"
+        );
+        // It was first read in the first frame, and it goes at the frame 30 s on.
+        rig.drive(&mut now, 29_875);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Update));
+        rig.drive(&mut now, 30_125);
+        assert!(rig.panel.nav.is_home());
+        rig.drive(&mut now, 90_000);
+        assert!(rig.panel.nav.is_home());
+    }
+
+    #[test]
+    fn an_update_being_received_covers_the_screen_and_lets_go_when_it_comes_to_nothing() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        assert!(rig.panel.nav.is_home());
+        rig.system.set_update(receiving_update(50, 100));
+        rig.drive(&mut now, 2_875);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Update));
+        assert_eq!(
+            rig.panel.world.update.map(|update| update.phase.received()),
+            Some((50, 0.5))
+        );
+        assert!(rig.panel.world.update_busy);
+        // The number moves and the screen follows, in writes inside a screen.
+        rig.system.set_update(receiving_update(75, 100));
+        let writes = rig.drive(&mut now, 4_000);
+        assert!(!writes.is_empty());
+        assert!(
+            writes
+                .iter()
+                .all(|write| write.rows.unwrap() <= BAND_ROWS_MAX)
+        );
+        // The receiver gave up: nothing is going on and nothing ended, so HOME is back.
+        rig.system.set_update(idle_update());
+        rig.drive(&mut now, 5_500);
+        assert!(rig.panel.nav.is_home());
+        assert!(!rig.panel.world.update_busy);
+    }
+
+    #[test]
+    fn the_pin_pad_asks_for_a_strong_key_with_the_lock_on_and_a_right_pin_carries_it_out() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        rig.set_pin();
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        assert!(rig.panel.world.lock_on);
+        assert_eq!(rig.panel.world.lock_source, LockSource::Config);
+        // The living room TV (blocked): its state key, the question, `ALLOW ADS`, which is strong.
+        rig.tap_at(&mut now, HOME_DEVICES.0, HOME_DEVICES.1);
+        rig.tap_at(&mut now, WALL_THIRD.0, WALL_THIRD.1);
+        rig.tap_at(&mut now, FLOOR_LEFT.0, FLOOR_LEFT.1);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        assert!(rig.devices.state().edits.is_empty());
+        assert!(rig.frames.last() == painted(&rig.panel));
+
+        // Two wrong PINs: `WRONG PIN` each time, the digits gone, nothing done.
+        for _ in 0..2 {
+            rig.type_pin(&mut now, WRONG_PIN);
+            assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+            let pad = rig.panel.nav.pin().unwrap();
+            assert!(pad.wrong() && pad.is_empty());
+            assert_eq!(rig.panel.world.pin_wait_secs, 0);
+        }
+        // The third makes it wait half a minute, and the pad takes no digit while it does.
+        rig.type_pin(&mut now, WRONG_PIN);
+        assert_eq!(rig.panel.world.pin_wait_secs, 30);
+        assert_eq!(rig.panel.nav.pin().unwrap().wait_secs(&rig.panel.world), 30);
+        let (x, y) = pad_digit(2);
+        rig.tap_at(&mut now, x, y);
+        assert!(rig.panel.nav.pin().unwrap().is_empty());
+        // Even the right PIN is not checked in the wait: no digit is taken.
+        rig.lock_clock_ahead(29);
+        rig.run_for(&mut now, 500);
+        assert_eq!(rig.panel.world.pin_wait_secs, 1);
+        rig.type_pin(&mut now, PIN);
+        assert!(rig.devices.state().edits.is_empty());
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        // After the wait the right PIN closes the pad, goes back from the question, and the action is done.
+        rig.lock_clock_ahead(2);
+        rig.run_for(&mut now, 500);
+        assert_eq!(rig.panel.world.pin_wait_secs, 0);
+        rig.type_pin(&mut now, PIN);
+        assert_eq!(rig.panel.nav.whole(), None);
+        assert_eq!(rig.devices.state().edits, ["ads 31 true"]);
+        assert_eq!(
+            at_screen(&rig),
+            (Section::Devices, Some(&Opened::Device(hw(31))))
+        );
+        // The count started again: one wrong PIN is not a wait. (`RESTART` is the next strong key.)
+        rig.on_system(Opened::Uptime);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        rig.type_pin(&mut now, WRONG_PIN);
+        assert_eq!(rig.panel.world.pin_wait_secs, 0);
+        assert!(rig.panel.nav.pin().unwrap().wrong());
+        // `CANCEL` goes back with the action not done.
+        let cancel = qb_panel::os::screens::whole::pad_rect(9);
+        rig.tap_at(&mut now, cancel.x + 10, cancel.y + 10);
+        assert_eq!(rig.panel.nav.whole(), None);
+        assert_eq!(rig.devices.state().edits, ["ads 31 true"]);
+        assert!(rig.system.acts().is_empty());
+    }
+
+    #[test]
+    fn a_pin_pad_left_alone_goes_back_with_the_action_not_done() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        rig.set_pin();
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        rig.tap_at(&mut now, HOME_DEVICES.0, HOME_DEVICES.1);
+        rig.tap_at(&mut now, WALL_THIRD.0, WALL_THIRD.1);
+        rig.tap_at(&mut now, FLOOR_LEFT.0, FLOOR_LEFT.1);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        let (x, y) = pad_digit(2);
+        rig.tap_at(&mut now, x, y);
+        let until = now + nav::IDLE_MS + 1_000;
+        rig.drive(&mut now, until);
+        // The pad is gone and the screen it came from is back, with the action not done and a minute of its own.
+        assert_eq!(rig.panel.nav.whole(), None);
+        assert_eq!(
+            rig.panel.nav.top(),
+            Some(&Opened::Confirm {
+                mac: hw(31),
+                pass: true
+            })
+        );
+        assert!(rig.devices.state().edits.is_empty());
+        let until = now + nav::IDLE_MS - 5_000;
+        rig.drive(&mut now, until);
+        assert!(!rig.panel.nav.is_home());
+        let until = now + 10_000;
+        rig.drive(&mut now, until);
+        assert!(rig.panel.nav.is_home());
+        assert!(rig.devices.state().edits.is_empty());
+    }
+
+    #[test]
+    fn a_pin_set_on_the_panel_guards_the_strong_keys_and_the_lock_can_be_turned_off_with_it() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        assert!(!rig.panel.world.lock_on);
+        // SET A PIN, four digits: the pad closes, the lock is on and says it was set here.
+        rig.on_system(Opened::Lock);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        rig.type_pin(&mut now, PIN);
+        assert_eq!(rig.panel.nav.whole(), None);
+        assert_eq!(
+            rig.lock.lock_view(),
+            lock::LockView {
+                on: true,
+                source: Some(PinSource::Panel)
+            }
+        );
+        assert!(rig.panel.world.lock_on);
+        assert_eq!(rig.panel.world.lock_source, LockSource::Panel);
+        assert_eq!(rig.lock.verify(Zeroizing::new(PIN)), Check::Right);
+        // `TURN OFF` is strong: a wrong PIN leaves the lock on, the right one turns it off.
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        rig.type_pin(&mut now, WRONG_PIN);
+        assert!(rig.lock.lock_view().on);
+        rig.type_pin(&mut now, PIN);
+        assert!(!rig.lock.lock_view().on);
+        assert!(!rig.panel.world.lock_on);
+        // Off, the strong keys do not ask: the restart goes straight out.
+        rig.on_system(Opened::Uptime);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.system.acts(), ["restart"]);
+        assert_eq!(rig.panel.nav.whole(), None);
+    }
+
+    #[test]
+    fn restart_and_rejoin_reach_the_board_and_a_restart_asks_for_the_pin_when_the_lock_is_on() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        rig.on_system(Opened::Uptime);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.system.acts(), ["restart"]);
+
+        // With the lock on, the restart waits for a right PIN.
+        rig.set_pin();
+        rig.run_for(&mut now, 1_000);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        assert_eq!(rig.system.acts(), ["restart"]);
+        rig.type_pin(&mut now, PIN);
+        assert_eq!(rig.system.acts(), ["restart", "restart"]);
+        assert_eq!(rig.panel.nav.whole(), None);
+
+        // The rejoin never asks: it is asked of the board, and the link says JOINING until it is back.
+        rig.system.state().acts.clear();
+        rig.on_system(Opened::Wifi);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.system.acts(), ["rejoin"]);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Joining);
+        // Still joining while the old link is what the snapshot says, and while it is down.
+        rig.run_for(&mut now, 2_000);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Joining);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(
+            rig.system.acts(),
+            ["rejoin"],
+            "the key is inert while joining"
+        );
+    }
+
+    #[test]
+    fn a_rejoin_is_over_when_the_link_has_joined_again_and_a_second_one_must_wait() {
+        let source = Scripted::new(Snapshot {
+            wifi: linked(100),
+            ..started()
+        });
+        let mut rig = Rig::home(Arc::new(source.clone()));
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        rig.on_system(Opened::Wifi);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Joining);
+        // The link goes down: no dash is lit, and the word says so.
+        source.set(|snapshot| snapshot.wifi = None);
+        rig.run_for(&mut now, 2_000);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Joining);
+        // It comes back with a newer join second.
+        source.set(|snapshot| snapshot.wifi = linked(130));
+        rig.run_for(&mut now, 1_000);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Idle);
+        // The control refuses another so soon: the key says WAIT, for as long as it said, then it is a key again.
+        rig.system.state().rejoin = Err(RejoinWait(45));
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.system.acts(), ["rejoin", "rejoin"]);
+        assert!(matches!(rig.panel.world.rejoin, Rejoin::Wait(secs) if (44..=45).contains(&secs)));
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.system.acts().len(), 2, "inert while it waits");
+        rig.run_for(&mut now, 46_000);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Idle);
+    }
+
+    #[test]
+    fn a_rejoin_whose_link_never_changes_stops_saying_joining() {
+        let mut rig = Rig::home(Arc::new(Fixed(Snapshot {
+            wifi: linked(100),
+            ..started()
+        })));
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        rig.on_system(Opened::Wifi);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Joining);
+        let until = now + REJOIN_SHOWN_MS - 2_000;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Joining);
+        let until = now + 4_000;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.world.rejoin, Rejoin::Idle);
+    }
+
+    #[test]
+    fn the_boards_readings_are_read_every_five_seconds_only_while_system_up_or_wifi_show() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        let mut now = 0;
+        // HOME, DEVICES and NAMES never read them; the update view is asked every second whatever shows.
+        rig.drive(&mut now, 6_000);
+        let (updates, readings) = rig.system.reads();
+        assert_eq!(readings, 0);
+        assert!((6..=8).contains(&updates), "{updates}");
+        rig.tap_at(&mut now, HOME_DEVICES.0, HOME_DEVICES.1);
+        rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
+        rig.tap_at(&mut now, HOME_NAMES.0, HOME_NAMES.1);
+        assert_eq!(rig.system.reads().1, 0);
+
+        // SYSTEM reads at once, and then every five seconds.
+        rig.panel.nav.go(Section::System);
+        let start = now;
+        rig.drive(&mut now, start + 100);
+        assert_eq!(rig.system.reads().1, 1);
+        let machine = rig.panel.world.machine.clone();
+        assert_eq!(
+            (
+                machine.load_hundredths,
+                machine.memory_pct,
+                machine.temp_c,
+                machine.uptime_hours
+            ),
+            (Some(21), Some(38), Some(47), Some(4))
+        );
+        assert_eq!(rig.panel.world.uptime_days, Some(12));
+        assert_eq!(machine.slot, Some(WorldSlot::A));
+        rig.drive(&mut now, start + 4_500);
+        assert_eq!(rig.system.reads().1, 1);
+        rig.drive(&mut now, start + 5_300);
+        assert_eq!(rig.system.reads().1, 2);
+        // UP and WI-FI are the same reading: one that is up goes on with SYSTEM's cadence, and one that comes up
+        // after a screen that reads nothing reads at once.
+        rig.panel.nav.open(Opened::Uptime);
+        rig.drive(&mut now, start + 5_800);
+        assert_eq!(rig.system.reads().1, 2);
+        rig.panel.nav.go(Section::System);
+        rig.panel.nav.open(Opened::Version);
+        rig.drive(&mut now, start + 6_300);
+        assert_eq!(rig.panel.world.machine.load_hundredths, None);
+        rig.drive(&mut now, start + 20_000);
+        assert_eq!(rig.system.reads().1, 2);
+        rig.panel.nav.go(Section::System);
+        rig.panel.nav.open(Opened::Wifi);
+        rig.drive(&mut now, start + 20_300);
+        assert_eq!(rig.system.reads().1, 3);
+        assert_eq!(rig.panel.world.machine.load_hundredths, Some(21));
+        // The lock and ABOUT read nothing.
+        for screen in [Opened::Lock, Opened::About, Opened::NightHours] {
+            rig.panel.nav.go(Section::System);
+            rig.panel.nav.open(screen);
+            rig.drive(&mut now, start + 30_000);
+        }
+        assert_eq!(rig.system.reads().1, 3);
+    }
+
+    #[test]
+    fn the_reads_of_the_screens_that_show_the_board_are_those_and_no_others() {
+        let reads = |nav: &Nav| Reads::of(nav).system;
+        let mut nav = Nav::at(Section::System);
+        assert!(reads(&nav));
+        for (screen, expected) in [
+            (Opened::Uptime, true),
+            (Opened::Wifi, true),
+            (Opened::Version, false),
+            (Opened::NightHours, false),
+            (Opened::Lock, false),
+            (Opened::About, false),
+        ] {
+            nav.go(Section::System);
+            nav.open(screen.clone());
+            assert_eq!(reads(&nav), expected, "{screen:?}");
+        }
+        for section in [
+            Section::Home,
+            Section::Live,
+            Section::Devices,
+            Section::Alerts,
+            Section::Names,
+            Section::Gate,
+        ] {
+            assert!(!reads(&Nav::at(section)), "{section:?}");
+        }
+        // A state of the whole system reads nothing of its screens.
+        let mut nav = Nav::at(Section::System);
+        nav.set_whole(Some(Whole::Update));
+        assert_eq!(Reads::of(&nav), Reads::default());
+    }
+
+    #[test]
+    fn the_world_says_what_the_link_and_the_build_and_the_machine_are() {
+        let source = Scripted::new(Snapshot {
+            wifi: linked(8 * 86_400),
+            upstream_ms: Some(9),
+            ..started()
+        });
+        let mut rig = Rig::home(Arc::new(source.clone()));
+        // The board has run twenty days: the link joined on the eighth.
+        rig.panel.boot_ms = 20 * 86_400_000;
+        rig.turn(0);
+        let world = &rig.panel.world;
+        assert_eq!(world.link.band, Some(qb_panel::os::world::Band::Ghz5));
+        assert_eq!(world.link.signal_dbm, Some(-54));
+        assert_eq!(world.link.linked_days, Some(12));
+        assert_eq!(world.link.upstream_ms, Some(9));
+        assert_eq!(world.machine.built, view::date_of(crate::BUILD_EPOCH));
+        assert_eq!(world.machine.slot, Some(WorldSlot::A));
+        assert_eq!(world.machine.last_update, LastUpdate::None);
+        assert_eq!(world.machine.last_restart, "");
+        assert!(world.dns_answering);
+        assert!(!world.update_busy);
+        assert_eq!(world.update, None);
+        // A link that is down has no band, no signal and no days.
+        source.set(|snapshot| snapshot.wifi = None);
+        let mut now = 125;
+        rig.drive(&mut now, 1_200);
+        assert_eq!(rig.panel.world.link, qb_panel::os::world::Link::default());
+    }
+
+    #[test]
+    fn the_lock_and_the_night_hours_are_read_from_the_lock_each_second_and_a_tap_sees_its_latest() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        rig.lock.set_night(Some((23, 7)));
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        assert_eq!(rig.panel.world.night, Some((23, 7)));
+        assert!(!rig.panel.world.lock_on);
+        // The desktop pushes a PIN between two reads: the next tap is decided by it.
+        rig.lock
+            .lock()
+            .set_hash(Some(pin_hash(PIN)), PinSource::Api);
+        rig.on_system(Opened::Uptime);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        assert!(rig.system.acts().is_empty());
+        assert_eq!(rig.panel.world.lock_source, LockSource::Api);
+    }
+
+    /// A rig at HOME whose night is 10:00 to 11:00, in which the clock of these tests (10:20) is.
+    fn night_rig() -> Rig {
+        let rig = Rig::home(Arc::new(Fixed(started())));
+        rig.lock.set_night(Some((10, 11)));
+        rig
+    }
+
+    #[test]
+    fn in_the_night_hours_a_minute_alone_puts_the_panel_to_sleep_and_a_touch_wakes_it_to_home() {
+        let mut rig = night_rig();
+        let mut now = 0;
+        rig.drive(&mut now, 59_875);
+        assert!(rig.panel.nav.is_home());
+        // The minute without a touch is up at 60 s: the dark clock is one write of the whole screen.
+        let writes = rig.drive(&mut now, 60_125);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        assert_eq!(writes.iter().map(|w| w.at).collect::<Vec<_>>(), [60_000]);
+        assert!(rig.frames.last() == painted(&rig.panel));
+        // A touch wakes it: HOME, whole.
+        rig.tap_at(&mut now, 240, 160);
+        assert!(rig.panel.nav.is_home());
+        assert!(rig.frames.last() == painted(&rig.panel));
+        // A minute after the touch it sleeps again, not before.
+        let woke = now;
+        rig.drive(&mut now, woke + 55_000);
+        assert!(rig.panel.nav.is_home());
+        rig.drive(&mut now, woke + 62_000);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+    }
+
+    #[test]
+    fn an_alert_does_not_wake_the_night_screen_and_waits_for_the_touch_that_does() {
+        let mut rig = night_rig();
+        let mut now = 0;
+        rig.drive(&mut now, 61_000);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        let before = rig.frames.count();
+        rig.alerts.raise(threat_alert(30));
+        let until = now + 3_000;
+        rig.drive(&mut now, until);
+        // It is counted (the caption says `1 ON THE LOG`), and the screen was not touched.
+        assert_eq!(rig.panel.world.alerts_waiting, 1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        assert_eq!(rig.panel.nav.top(), None);
+        assert!(rig.frames.count() >= before);
+        // A touch wakes the panel, and the slip of the alert that came in the night is what it opens.
+        rig.tap_at(&mut now, 240, 160);
+        let until = now + 500;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), None);
+        assert_eq!(rig.panel.nav.top(), Some(&Opened::Alert(30)));
+    }
+
+    #[test]
+    fn the_night_lifts_in_the_morning_and_sleep_now_stays_until_a_touch() {
+        let mut rig = night_rig();
+        let mut now = 0;
+        rig.drive(&mut now, 61_000);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        // 11:10: the hours are over. The next second's reading of the clock lifts it to HOME.
+        let morning = UNIX + 3_000;
+        for _ in 0..16 {
+            rig.panel.turn(now, morning).unwrap();
+            now += FRAME_MS;
+        }
+        assert!(rig.panel.nav.is_home());
+        // `SLEEP NOW` outside the hours (NIGHT HOURS' left key): asleep until a touch, and a minute later still
+        // awake, since it is no night.
+        rig.on_system(Opened::NightHours);
+        rig.tap_at(&mut now, FLOOR_LEFT.0, FLOOR_LEFT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        for _ in 0..16 {
+            rig.panel.turn(now, morning).unwrap();
+            now += FRAME_MS;
+        }
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        let late = now + 70_000;
+        while now < late {
+            rig.panel.turn(now, morning).unwrap();
+            now += FRAME_MS;
+        }
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        rig.tap_at(&mut now, 240, 160);
+        assert!(rig.panel.nav.is_home());
+        let late = now + 70_000;
+        while now < late {
+            rig.panel.turn(now, morning).unwrap();
+            now += FRAME_MS;
+        }
+        assert!(
+            rig.panel.nav.is_home(),
+            "outside the hours it sleeps no more"
+        );
+    }
+
+    #[test]
+    fn the_night_hours_the_owner_sets_go_to_the_lock_and_equal_hours_are_no_night() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        rig.turn(0);
+        rig.panel.carry_out(Intent::NightHours { from: 22, to: 6 });
+        assert_eq!(rig.lock.night(), Some((22, 6)));
+        assert_eq!(rig.panel.world.night, Some((22, 6)));
+        rig.panel.carry_out(Intent::NightHours { from: 5, to: 5 });
+        assert_eq!(rig.lock.night(), None);
+        assert_eq!(rig.panel.world.night, None);
+    }
+
+    #[test]
+    fn an_update_does_not_light_the_night_screen_and_shows_when_the_panel_wakes() {
+        let mut rig = night_rig();
+        let mut now = 0;
+        rig.drive(&mut now, 61_000);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        let before = rig.frames.count();
+        // An update that is received, and one that ends: the night screen stays dark through both.
+        rig.system.set_update(receiving_update(1, 100));
+        let until = now + 2_000;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        assert_eq!(rig.frames.count(), before, "nothing was drawn");
+        rig.system.set_update(idle_update());
+        let until = now + 2_000;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        rig.system
+            .set_update(ended_update(CardSlot::B, update::OutcomeKind::Confirmed));
+        let until = now + 2_000;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        assert_eq!(rig.frames.count(), before, "nothing was drawn");
+        // A touch wakes the panel, and the outcome that came in the night is what it shows, once.
+        rig.tap_at(&mut now, 240, 160);
+        let until = now + 500;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Update));
+        assert!(rig.panel.world.update.is_some());
+
+        // An update that is still received when the panel wakes is shown the same way.
+        let mut rig = night_rig();
+        let mut now = 0;
+        rig.drive(&mut now, 61_000);
+        rig.system.set_update(receiving_update(1, 100));
+        let until = now + 2_000;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Night));
+        rig.tap_at(&mut now, 240, 160);
+        let until = now + 500;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Update));
+    }
+
+    #[test]
+    fn an_update_waits_for_a_pad_which_is_the_owners_for_a_minute() {
+        // A pad is the owner's, for a minute: an update waits for it.
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        rig.set_pin();
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        rig.on_system(Opened::Uptime);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+        rig.system.set_update(receiving_update(1, 100));
+        let until = now + 2_000;
+        rig.drive(&mut now, until);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
+    }
+
     /// A logger that keeps what is logged, for the one test that installs it.
     struct Capture(Mutex<Vec<String>>);
 
@@ -3780,9 +5997,19 @@ mod tests {
     #[test]
     fn taps_reach_the_fakes_for_every_kind_of_intent() {
         let mut rig = Rig::home(Arc::new(Fixed(reference_snapshot())));
-        rig.alerts.raise(threat_alert(7));
         let mut now = 0;
         walk_through_every_intent(&mut rig, &mut now);
+        // The names' edits are the owner's list's, and each says what kind it was in the log (see
+        // `the_panel_never_logs_a_name`).
+        assert_eq!(
+            rig.names.edits(),
+            [
+                "allow ads.example.net",
+                "refuse tracker.example.com",
+                "forget tracker.example.com",
+                "forget ads.example.net"
+            ]
+        );
     }
 
     #[test]
@@ -3825,9 +6052,8 @@ mod tests {
         rig.refuse("ads.example.org");
         rig.lane.observe("example.org", false, 5, |_| false);
         rig.refuse(&long);
-        // Devices with labels, hostnames and addresses, one that asks, one whose names are watched, and
-        // an alert about a name and a device.
-        rig.alerts.raise(threat_alert(7));
+        // Devices with labels, hostnames and addresses, one that asks, one whose names are watched; the walk
+        // brings an alert about a name and a device, and the owner's names.
         rig.devices.state().asking = vec![Ipv4Addr::new(192, 0, 2, 23)];
         rig.devices.state().watched = vec![LaneWatched {
             name: "tracker.example".to_owned(),
@@ -3846,8 +6072,92 @@ mod tests {
         rig.control.set_left(None);
         let until = now + 1_000;
         rig.drive(&mut now, until);
+        // Alerts about a device, by its hardware address, and a pattern: their slips and their log are
+        // drawn, and no line says what they carry. The owner's edits that the list refuses, or that have
+        // nothing to take back, say why or that, and not for which name.
+        for (id, kind, subject) in [
+            (20, "new_device", "02:00:00:00:00:d8"),
+            (21, "arp_spoof", "02:00:00:00:00:17"),
+            (22, "dga", "x7k2q9.example.org"),
+        ] {
+            rig.alerts.raise(PanelAlert {
+                kind: kind.to_owned(),
+                subject: subject.to_owned(),
+                ..threat_alert(id)
+            });
+            let until = now + 1_300;
+            rig.drive(&mut now, until);
+        }
+        assert_eq!(rig.panel.world.alerts_waiting, 3);
+        rig.panel.carry_out(Intent::Name {
+            name: "secure-login-verify.example".to_owned(),
+            verdict: Verdict::Allow,
+        });
+        rig.panel.carry_out(Intent::Name {
+            name: "nothing.example.org".to_owned(),
+            verdict: Verdict::ClearAllow,
+        });
+
+        // The lock, with a PIN from the configuration: `RESTART` asks, three wrong PINs and a wait, the right PIN
+        // after it; then the PIN set on the panel, the lock turned off, the night hours, sleep, and the rejoin
+        // that is done and the one that is refused. None says a digit or the hash.
+        rig.set_pin();
+        rig.panel.nav.go(Section::System);
+        rig.panel.nav.open(Opened::Uptime);
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        for _ in 0..3 {
+            rig.type_pin(&mut now, WRONG_PIN);
+        }
+        // A digit typed in the wait is not taken, and a check asked for in it is not made.
+        rig.panel
+            .carry_out(Intent::Verify(qb_panel::os::PinDigits::new(PIN)));
+        rig.lock_clock_ahead(31);
+        let until = now + 300;
+        rig.drive(&mut now, until);
+        rig.type_pin(&mut now, PIN);
+        rig.panel
+            .carry_out(Intent::SetPin(qb_panel::os::PinDigits::new([9, 1, 6, 3])));
+        rig.panel.carry_out(Intent::ClearPin);
+        rig.panel.carry_out(Intent::NightHours { from: 22, to: 6 });
+        rig.panel.carry_out(Intent::SleepNow);
+        rig.panel.carry_out(Intent::Rejoin);
+        rig.system.state().rejoin = Err(RejoinWait(45));
+        rig.panel.carry_out(Intent::Rejoin);
+        rig.system.state().restart = Err(RestartRefused::Updating);
+        rig.panel.carry_out(Intent::Restart);
+        rig.system.state().restart = Err(RestartRefused::NotReady);
+        rig.panel.carry_out(Intent::Restart);
 
         let lines = CAPTURE.0.lock().unwrap().clone();
+        for line in [
+            "WARN panel: wrong PIN (1 in a row)",
+            "WARN panel: wrong PIN (3 in a row)",
+            "INFO panel: PIN not checked: the lock is waiting",
+            "INFO panel: PIN accepted",
+            "INFO panel: restart asked",
+            "INFO panel: restart refused: an update is under way",
+            "WARN panel: restart refused: not ready",
+            "INFO panel: the PIN was set on the panel (until the next restart)",
+            "INFO panel: the lock was turned off",
+            "INFO panel: night hours set",
+            "INFO panel: sleeping until a touch",
+            "INFO panel: Wi-Fi rejoin asked",
+            "INFO panel: Wi-Fi rejoin refused for now",
+        ] {
+            assert!(lines.iter().any(|seen| seen == line), "{line}: {lines:?}");
+        }
+        // Not one of the PINs the test typed or set, and no piece of the hash that holds one.
+        let hash = pin_hash(PIN).to_text();
+        let pieces: Vec<&str> = hash.split('$').filter(|piece| piece.len() >= 6).collect();
+        assert!(!pieces.is_empty());
+        for line in &lines {
+            for secret in ["2468", "1357", "9163", "pbkdf2"]
+                .into_iter()
+                .chain(pieces.iter().copied())
+            {
+                assert!(!line.contains(secret), "{line}");
+            }
+        }
         for line in [
             "INFO panel: gate opened for 1800 s",
             "INFO panel: gate shut",
@@ -3858,6 +6168,12 @@ mod tests {
             "INFO panel: alert dismissed",
             "WARN panel: device ads edit refused: unknown",
             "INFO panel: gate: the pause ended",
+            "INFO panel: name allowed",
+            "INFO panel: name refused",
+            "INFO panel: refusal taken back",
+            "INFO panel: allow taken back",
+            "WARN panel: name edit refused: threat",
+            "INFO panel: no entry of its own to take back",
         ] {
             assert!(lines.iter().any(|seen| seen == line), "{line}: {lines:?}");
         }
@@ -3876,6 +6192,9 @@ mod tests {
                 "printer",
                 "secure-login",
                 "doubleclick",
+                "metrics",
+                "x7k2",
+                "nothing",
             ] {
                 assert!(!line.contains(secret), "{line}");
             }
@@ -4143,12 +6462,12 @@ mod tests {
         ];
         let mut fullest = still_world(Still::Alert);
         let long = "M".repeat(40);
-        fullest.top_alert = Some(qb_panel::os::world::AlertRow::new(
+        fullest.alerts = vec![qb_panel::os::world::AlertRow::new(
             9,
             true,
             &"W".repeat(24),
             &[&long, &long, &long],
-        ));
+        )];
         for page in 0..3 {
             let mut nav = Nav::at(Section::Devices);
             nav.apply(Change::DevicesPage(page));
